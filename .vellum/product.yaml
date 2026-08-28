@@ -14,8 +14,8 @@ intent:
 pin:
   kind: submodule
   path: spec
-  version: spec-v3
-  commit: 94d8e2594ec5f37d30ab6b8fcb5aa52e6e578c1e
+  version: spec-v4
+  commit: c4307abe2e4893ae461c5eb189b039280f478700
 
 # This repo's entry in the intent repo's .vellum/workspace.yaml.
 product:

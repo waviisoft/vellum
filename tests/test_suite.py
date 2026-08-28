@@ -40,7 +40,8 @@ TWO_WITHOUT_IDS = "\n".join(
 
 
 class TestBlockSplitting(unittest.TestCase):
-    """The spec tree puts two Features in one fence; Gherkin allows one per document."""
+    """The spec bans two Features in one fence (spec-v4); the splitter stays so
+    lint reports the banned shape (GH009) and extraction survives it."""
 
     def test_single_feature_is_one_document(self):
         self.assertEqual(len(split_documents(ONE)), 1)

@@ -32,18 +32,24 @@ scenario, `GH003` id claimed by two scenarios. Two more are unrelated to ids: `G
 runs; and `GH008`, any feature declaring a `Background:`. `GH003` is checked in
 `_check_unique_ids()` at the `lint_tree()` level, **not** per file, because ids
 are unique across the whole intent repo — putting that check back inside
-`_check_gherkin()` would silently stop catching the cross-file case.
+`_check_gherkin()` would silently stop catching the cross-file case. `GH009` is
+a second `Feature:` in one fence, banned since spec-v4
+(`spec/decisions/2026-08-28-one-feature-per-fence.md`); one finding per extra
+Feature, located by `extra_feature_lines()` in `src/vellum/gherkin_blocks.py`.
 
 ## Landmines
 
-**A fenced gherkin block may hold more than one `Feature:`.**
-`spec/features/certification-and-releases.md` does, at spec-v1. Gherkin allows
-one Feature per document and the official parser raises
-`CompositeParserException` on the second one. `split_documents()` in
-`src/vellum/gherkin_blocks.py` cuts a block at column-zero `Feature:` lines and
-parses each piece separately. If you ever call `Parser().parse()` directly on a
-fence body, you will reintroduce this bug. It is covered by
-`TestBlockSplitting` in `tests/test_suite.py`.
+**A fence with two `Feature:` blocks fails lint but must still parse.** The
+spec bans the shape since spec-v4 (`GH009`), yet `split_documents()` in
+`src/vellum/gherkin_blocks.py` still cuts a block at column-zero `Feature:`
+lines and parses each piece separately — deliberately. It is what lets lint
+report the ban at the real line instead of surfacing the Cucumber parser's
+raw `CompositeParserException`, and what keeps `vellum suite extract`
+describing every scenario in a non-conforming tree (lint fails it; extract
+skips nothing). Do not "simplify" it away now that conforming trees never
+split, and never call `Parser().parse()` directly on a fence body. Covered by
+`TestBlockSplitting` in `tests/test_suite.py` and `TestMultiFeatureFences` in
+`tests/test_lint.py`.
 
 **`<spec-dir>` is two different things.** `resolve_spec_root()` in
 `src/vellum/specfile.py` accepts either the spec tree itself or the intent repo

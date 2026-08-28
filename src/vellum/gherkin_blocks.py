@@ -1,10 +1,12 @@
 """Parsing the fenced ``gherkin`` blocks embedded in spec files.
 
-Gherkin allows one ``Feature:`` per document, but the spec tree puts more than
-one in a single fence (``features/certification-and-releases.md`` at spec-v1).
-``split_documents`` therefore cuts a block at top-level ``Feature:`` lines and
-hands each piece to the official Cucumber parser separately, so a block "parses"
-when every document inside it does.
+Gherkin allows one ``Feature:`` per document, and the spec requires each fence
+to hold exactly one (``spec/features/scenarios-and-harness.md``, since
+spec-v4). ``split_documents`` still cuts a block at top-level ``Feature:``
+lines and hands each piece to the official Cucumber parser separately: lint
+reports the banned shape with real line numbers (GH009) instead of the
+parser's raw error, and extraction keeps describing every scenario in the
+block rather than dying at the second Feature.
 """
 
 from __future__ import annotations
@@ -108,6 +110,16 @@ def split_documents(body: str) -> list[tuple[int, str]]:
         end = cuts[idx + 1] if idx + 1 < len(cuts) else len(lines)
         docs.append((start, "\n".join(lines[start:end])))
     return docs
+
+
+def extra_feature_lines(body: str) -> list[int]:
+    """0-based line offsets of every top-level ``Feature:`` after the first.
+
+    Each entry is a violation of the one-Feature-per-fence rule; lint turns
+    them into GH009 findings at their real spec-file lines.
+    """
+    lines = body.split("\n")
+    return [i for i, ln in enumerate(lines) if _FEATURE_RE.match(ln)][1:]
 
 
 def _steps(raw: list[dict]) -> list[Step]:

@@ -202,6 +202,27 @@ class TestBackgrounds(unittest.TestCase):
         self.assertEqual({f.code for f in self.findings}, {"GH008"})
 
 
+class TestMultiFeatureFences(unittest.TestCase):
+    """One Feature per fence (spec/decisions/2026-08-28-one-feature-per-fence.md)."""
+
+    def setUp(self):
+        self.findings = lint_tree(FIXTURES / "bad-multi-feature")
+
+    def test_a_second_feature_fails_the_run(self):
+        found = [f for f in self.findings if f.code == "GH009"]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(run_cli(["lint", str(FIXTURES / "bad-multi-feature")])[0], 1)
+
+    def test_the_finding_points_at_the_second_feature_not_the_fence(self):
+        found = next(f for f in self.findings if f.code == "GH009")
+        self.assertEqual(found.line, 18)
+
+    def test_the_scenarios_themselves_are_not_faulted(self):
+        # The extra Feature is the defect; the scenarios in both documents
+        # are well-formed and still extract.
+        self.assertEqual({f.code for f in self.findings}, {"GH009"})
+
+
 class TestPinnedSpecTree(unittest.TestCase):
     """The definition of done: the pinned spec-v1 tree lints clean."""
 

@@ -15,6 +15,7 @@ from vellum.gherkin_blocks import (
     ID_TAG_PREFIX,
     GherkinParseError,
     Scenario,
+    extra_feature_lines,
     parse_block,
 )
 from vellum.links import find_references, heading_anchors, resolve
@@ -136,6 +137,20 @@ def _check_gherkin(sf: SpecFile) -> tuple[list[Finding], list[Scenario]]:
     for fence in sf.fences:
         if fence.info != "gherkin":
             continue
+        # A fence holds exactly one Gherkin document, so a stock Cucumber
+        # runner can read it unmodified; the extra Feature is the defect,
+        # not the scenarios under it.
+        for offset in extra_feature_lines(fence.body):
+            findings.append(
+                Finding(
+                    sf.relpath,
+                    fence.body_line + offset,
+                    "GH009",
+                    "fence declares a second Feature; each gherkin fence "
+                    "holds exactly one Gherkin document, so split it into "
+                    "one fence per Feature",
+                )
+            )
         try:
             block = parse_block(fence.body, fence.body_line)
         except GherkinParseError as exc:

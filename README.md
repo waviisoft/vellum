@@ -9,7 +9,7 @@ here as a read-only submodule at `./spec`.
 
 The submodule commit **is** the pin: it names the spec version this code
 implements, so conformance is a property of the checkout. Currently pinned to
-`spec-v3` (`94d8e25`).
+`spec-v4` (`c4307ab`).
 
 This is the v0.1 milestone — the hand-built loop. It proves spec CI, scenario
 extraction and the ledger format. The agent reviews, the planner, the harness
