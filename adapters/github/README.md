@@ -10,6 +10,11 @@ cp adapters/github/spec-ci.yml       ../vellum-intent/.github/workflows/
 cp adapters/github/on-spec-merge.yml ../vellum-intent/.github/workflows/
 ```
 
+Keep the two sides byte-identical. These files are the upstream copy and the
+intent repo's `.github/workflows/` holds what actually runs, so a plain `diff`
+between them is the whole drift check — if it reports anything, one side has
+been edited in place and the other has not.
+
 | File | Trigger | Does |
 |---|---|---|
 | `spec-ci.yml` | `pull_request` touching `spec/**` | `vellum lint` + `vellum suite extract`, uploads `suite.json`, summarises the scenarios the PR would mint. Three agent reviews and the backpressure check are stubs. |
@@ -43,8 +48,18 @@ intent repo root exercises the issue-filing path end to end.
   sequence is `max(spec-v*) + 1`, and a missing tag silently re-dates every
   scenario introduced at it.
 
-- Both workflows `pip install` the CLI from this repo's `main`
-  (`env.VELLUM_REF`). Point it at a tag once this repo cuts one.
+- The intent repo needs a **`VELLUM_TOKEN`** secret holding a token that can
+  read `waviisoft/vellum`. This repo is private, so the intent repo's own job
+  token cannot read it. Both workflows check the secret first and fail with an
+  explicit message when it is missing, rather than failing later and less
+  legibly inside pip.
+- Both workflows check this repo out at `env.VELLUM_REF` (`main`) and
+  `pip install` that path. Point it at a tag once this repo cuts one. They
+  check the CLI out rather than installing from its git URL because a pip VCS
+  install runs `git submodule update --init --recursive`, which tries to clone
+  the private `spec` submodule without credentials and fails. The CLI does not
+  need the spec pin to build, and `actions/checkout` takes no submodules by
+  default.
 - `on-spec-merge.yml` needs `contents: write` (to push the tag and the ledger
   commit) and `issues: write` (to file work items). Branch protection on `main`
   must allow the workflow token to push, or the ledger commit step fails.
