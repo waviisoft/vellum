@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -45,6 +46,43 @@ def pinned_version() -> int:
 
     pin = yaml.safe_load((REPO_ROOT / ".vellum" / "product.yaml").read_text())["pin"]
     return int(str(pin["version"]).removeprefix("spec-v"))
+
+
+#: An ``@id:`` tag alone on its line, which is how a scenario carries its id.
+#: Prose mentioning ``@id:`` inline (the identity decision does) is not a tag.
+ID_TAG_LINE_RE = re.compile(r"^\s*@id:[a-z0-9]+(?:-[a-z0-9]+)*\s*$", re.MULTILINE)
+
+PINNED_SPEC = REPO_ROOT / "spec"
+
+
+def pinned_spec_is_checked_out() -> bool:
+    return (PINNED_SPEC / "spec" / "index.md").is_file()
+
+
+def _pinned_spec_files() -> list[Path]:
+    return sorted((PINNED_SPEC / "spec").rglob("*.md"))
+
+
+def pinned_scenario_count() -> int:
+    """Scenarios in the pinned tree, counted from its ``@id:`` tags.
+
+    An oracle for extraction that is independent of the extractor and updates
+    itself: a count hard-coded here would fail on every wave whose spec adds a
+    scenario, which is the same noise as hard-coding the pinned version.
+    """
+    return sum(
+        len(ID_TAG_LINE_RE.findall(f.read_text(encoding="utf-8")))
+        for f in _pinned_spec_files()
+    )
+
+
+def pinned_gherkin_file_count() -> int:
+    """Files in the pinned tree carrying at least one gherkin fence."""
+    return sum(
+        1
+        for f in _pinned_spec_files()
+        if "```gherkin" in f.read_text(encoding="utf-8")
+    )
 
 
 def git(repo: Path, *args: str) -> str:

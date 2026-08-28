@@ -7,9 +7,12 @@ from pathlib import Path
 
 from support import (
     FIXTURES,
-    REPO_ROOT,
+    PINNED_SPEC,
     commit_area,
     make_spec_repo,
+    pinned_gherkin_file_count,
+    pinned_scenario_count,
+    pinned_spec_is_checked_out,
     pinned_version,
     write_area,
 )
@@ -40,7 +43,9 @@ TWO_WITHOUT_IDS = "\n".join(
 
 
 class TestBlockSplitting(unittest.TestCase):
-    """The spec tree puts two Features in one fence; Gherkin allows one per document."""
+    """The spec bans two Features in one fence (spec-v4). The splitter stays: it
+    reads the older tags the version chain walks, and it is what lets lint name
+    the second Feature (GH009) rather than echo the parser's error."""
 
     def test_single_feature_is_one_document(self):
         self.assertEqual(len(split_documents(ONE)), 1)
@@ -322,19 +327,47 @@ class TestVersionDerivation(unittest.TestCase):
 
 
 class TestPinnedSpecTree(unittest.TestCase):
-    """The definition of done: every scenario in the pinned tree, at version 1."""
+    """The definition of done: every scenario in the pinned tree, correctly dated.
+
+    Nothing here hard-codes a count. A count is a fact about the pinned tree,
+    so it goes stale on the next wave whose spec adds a scenario, exactly the
+    way a hard-coded version goes stale on the next pin advance — and a test
+    that fails on every advance is noise that trains people to ignore red. The
+    oracles in ``support`` read the tree instead.
+    """
 
     def setUp(self):
-        if not (REPO_ROOT / "spec" / "spec" / "index.md").is_file():
+        if not pinned_spec_is_checked_out():
             self.skipTest("spec submodule is not checked out")
-        self.suite = to_dict(extract(REPO_ROOT / "spec"))
+        self.suite = to_dict(extract(PINNED_SPEC))
 
-    def test_all_nineteen_scenarios_are_extracted(self):
-        self.assertEqual(self.suite["scenario_count"], 19)
+    def test_every_tagged_scenario_in_the_tree_is_extracted(self):
+        # Asserted non-zero first: an oracle that silently found nothing would
+        # otherwise agree with an extractor that silently found nothing.
+        self.assertGreater(pinned_scenario_count(), 0)
+        self.assertEqual(self.suite["scenario_count"], pinned_scenario_count())
 
-    def test_every_scenario_is_version_one(self):
-        # spec-v2 only added @id: tags, a presentation change.
-        self.assertEqual({s["version"] for s in self.suite["scenarios"]}, {1})
+    def test_no_scenario_is_dated_past_the_pin(self):
+        versions = {s["version"] for s in self.suite["scenarios"]}
+        self.assertLessEqual(max(versions), pinned_version())
+        # The spec-v1 tree is still at version 1: spec-v2 only added @id: tags
+        # and spec-v4 only re-fenced a block, both presentation changes that
+        # the fingerprint deliberately ignores.
+        self.assertEqual(min(versions), 1)
+
+    def test_re_fencing_a_block_did_not_re_date_the_scenarios_in_it(self):
+        # spec-v4 split certification-and-releases.md into two fences, and the
+        # decision behind it claims that "splitting a fence moves no version
+        # and re-dates no scenario". This is that claim, asserted. It is also
+        # the guard on the splitter: reading those older tags is the only
+        # reason the three scenarios here are still dated 1 rather than 4, and
+        # the failure if it goes is silent — right count, nothing pending.
+        refenced = {
+            s["version"]
+            for s in self.suite["scenarios"]
+            if s["file"] == "features/certification-and-releases.md"
+        }
+        self.assertEqual(refenced, {1})
 
     def test_the_suite_is_extracted_at_the_pinned_version(self):
         self.assertEqual(self.suite["spec_version"], pinned_version())
@@ -343,12 +376,16 @@ class TestPinnedSpecTree(unittest.TestCase):
     def test_every_scenario_has_a_unique_id_and_a_ledger_ref(self):
         ids = [s["id"] for s in self.suite["scenarios"]]
         self.assertTrue(all(ids))
-        self.assertEqual(len(set(ids)), 19)
+        self.assertEqual(len(set(ids)), self.suite["scenario_count"])
         for s in self.suite["scenarios"]:
             self.assertEqual(s["ref"], f"scenario:{s['id']}")
 
     def test_every_spec_file_with_a_gherkin_block_is_represented(self):
-        self.assertEqual(len({s["file"] for s in self.suite["scenarios"]}), 11)
+        self.assertGreater(pinned_gherkin_file_count(), 0)
+        self.assertEqual(
+            len({s["file"] for s in self.suite["scenarios"]}),
+            pinned_gherkin_file_count(),
+        )
 
     def test_suite_is_json_serialisable(self):
         json.loads(json.dumps(self.suite))

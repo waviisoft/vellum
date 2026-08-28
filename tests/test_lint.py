@@ -4,10 +4,18 @@ import contextlib
 import io
 import unittest
 
-from support import FIXTURES, REPO_ROOT
+from support import (
+    FIXTURES,
+    PINNED_SPEC,
+    REPO_ROOT,
+    pinned_scenario_count,
+    pinned_spec_is_checked_out,
+)
 from vellum.cli import main
+from vellum.gherkin_blocks import parse_block
 from vellum.lint import lint_tree
-from vellum.specfile import SpecTreeError, resolve_spec_root
+from vellum.specfile import SpecTreeError, iter_spec_files, resolve_spec_root
+from vellum.suite import scenarios_in
 
 
 def run_cli(argv):
@@ -19,6 +27,12 @@ def run_cli(argv):
 
 def codes(name):
     return sorted(f.code for f in lint_tree(FIXTURES / name))
+
+
+def scenarios_in_tree(spec_dir):
+    """Every scenario extraction finds in a tree, defects and all."""
+    root = resolve_spec_root(spec_dir)
+    return [sc for sf in iter_spec_files(root) for sc in scenarios_in(sf.relpath, sf.text)]
 
 
 class TestCleanTree(unittest.TestCase):
@@ -169,11 +183,6 @@ class TestScenarioIds(unittest.TestCase):
         one = next(f for f in self.by_code("GH003") if f.file == "features/one.md")
         self.assertIn("features/two.md", one.message)
 
-    def test_a_scenario_outline_with_no_examples_is_reported(self):
-        found = [f for f in self.findings if f.code == "GH007"]
-        self.assertEqual(len(found), 1)
-        self.assertIn("never runs", found[0].message)
-
     def test_the_run_fails(self):
         self.assertEqual(run_cli(["lint", str(FIXTURES / "bad-ids")])[0], 1)
 
@@ -202,21 +211,160 @@ class TestBackgrounds(unittest.TestCase):
         self.assertEqual({f.code for f in self.findings}, {"GH008"})
 
 
-class TestPinnedSpecTree(unittest.TestCase):
-    """The definition of done: the pinned spec-v1 tree lints clean."""
+class TestUnrunnableScenarios(unittest.TestCase):
+    """A scenario that parses and can never run fails lint
+    (spec/decisions/2026-08-28-runnable-scenarios.md, spec-v5).
+
+    The class is "declared but unrunnable", defined by construct — so it is
+    neither one construct nor one keyword. Both members the decision names are
+    here (an outline with no Examples section at all, and one whose Examples
+    table has a header and no data rows), each in one of the two spellings
+    Gherkin's English dialect gives the construct, plus a template with a row,
+    which runs and must be left alone.
+    """
 
     def setUp(self):
-        if not (REPO_ROOT / "spec" / "spec" / "index.md").is_file():
+        self.findings = lint_tree(FIXTURES / "bad-unrunnable")
+
+    def test_every_outline_that_cannot_run_fails_the_run(self):
+        found = [f for f in self.findings if f.code == "GH007"]
+        self.assertEqual(len(found), 3)
+        for f in found:
+            self.assertIn("never runs", f.message)
+        self.assertEqual(run_cli(["lint", str(FIXTURES / "bad-unrunnable")])[0], 1)
+
+    def test_an_examples_table_with_a_header_and_no_rows_is_not_coverage(self):
+        # The header alone parses into an Examples node, so a truthiness check
+        # on `examples` would pass this and the outline would still never run.
+        found = [f for f in self.findings if f.line == 26]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].code, "GH007")
+
+    def test_a_scenario_template_is_an_outline_under_its_other_keyword(self):
+        # `Scenario Template` is a synonym for `Scenario Outline`, not a second
+        # construct. Matching the literal keyword missed it, so an unrunnable
+        # template drew zero findings and extracted as coverage. The finding
+        # names the keyword actually written.
+        found = [f for f in self.findings if f.line == 37]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].code, "GH007")
+        self.assertIn("scenario template '", found[0].message)
+
+    def test_a_template_with_a_row_runs_and_is_not_faulted(self):
+        # The rule fires on unrunnability, not on the keyword; a template that
+        # can execute is sound. Guards the synonym against over-reach.
+        self.assertEqual([f for f in self.findings if f.line == 48], [])
+
+    def test_nothing_else_is_faulted(self):
+        self.assertEqual({f.code for f in self.findings}, {"GH007"})
+
+
+class TestMultiFeatureFences(unittest.TestCase):
+    """One Feature per fence (spec/decisions/2026-08-28-one-feature-per-fence.md)."""
+
+    def setUp(self):
+        self.findings = lint_tree(FIXTURES / "bad-multi-feature")
+
+    def gh009(self):
+        return [f for f in self.findings if f.code == "GH009"]
+
+    def test_a_second_feature_fails_the_run(self):
+        found = next(f for f in self.gh009() if f.file == "features/two-in-one.md")
+        self.assertIn("Second concern", found.message)
+        self.assertIn("First concern", found.message)
+        self.assertEqual(run_cli(["lint", str(FIXTURES / "bad-multi-feature")])[0], 1)
+
+    def test_the_finding_points_at_the_second_feature_not_the_fence(self):
+        found = next(f for f in self.gh009() if f.file == "features/two-in-one.md")
+        self.assertEqual(found.line, 21)
+
+    def test_a_second_feature_the_parser_absorbs_as_prose_is_still_found(self):
+        # The parser refuses a second Feature: only where it reaches one as a
+        # declaration. Reached where free text is legal it swallows the line —
+        # into a Feature's description, or a Scenario's — and the block parses
+        # one Feature short with no error at all. Trusting a clean whole-body
+        # parse on its own therefore misses the rule entirely here.
+        found = [f for f in self.gh009() if f.file == "features/absorbed.md"]
+        self.assertEqual([f.line for f in found], [22, 37])
+        self.assertIn("Swallowed by a description", found[0].message)
+        self.assertIn("Swallowed by a scenario description", found[1].message)
+
+    def test_an_absorbed_feature_does_not_steal_the_next_features_scenarios(self):
+        # Left absorbed, the second Feature's scenarios re-parent onto the
+        # first and suite.json reports the wrong feature for each of them.
+        under = {
+            sc.id: sc.feature
+            for sc in scenarios_in_tree(FIXTURES / "bad-multi-feature")
+        }
+        self.assertEqual(
+            under["absorbed-into-feature-description"], "Swallowed by a description"
+        )
+        self.assertEqual(
+            under["absorbed-into-scenario-description"],
+            "Swallowed by a scenario description",
+        )
+
+    def test_the_scenarios_themselves_are_not_faulted(self):
+        # The extra Feature is the defect; the scenarios in both documents are
+        # well-formed and both still extract. The one GH004 is intrinsic to the
+        # fixture: a Scenario description exists only on a step-less scenario,
+        # which is the only way to build the absorbed-into-a-scenario case.
+        self.assertEqual({f.code for f in self.findings}, {"GH009", "GH004"})
+        self.assertEqual(
+            {f.code for f in self.findings if f.file == "features/two-in-one.md"},
+            {"GH009"},
+        )
+        ids = {sc.id for sc in scenarios_in_tree(FIXTURES / "bad-multi-feature")}
+        self.assertEqual(
+            ids,
+            {
+                "two-in-one-first",
+                "two-in-one-second",
+                "absorbed-host-scenario",
+                "absorbed-into-feature-description",
+                "absorbed-into-scenario-description",
+            },
+        )
+
+    def test_a_block_the_stock_parser_reads_whole_is_never_split(self):
+        # Indentation is not significant to Gherkin, so a step line beginning
+        # "Feature:" really is a second Feature and GH009 is right to fault it.
+        # Inside a docstring it is not: the text is literal, one Feature, and
+        # the stock parser reads the block. Cutting at column-zero "Feature:"
+        # lines before parsing used to split this sound block down the middle
+        # and report the unterminated docstring as GH001. The parser is asked
+        # to read the block whole first, so nothing is cut.
+        body = (
+            "Feature: Real\n"
+            "Scenario: Carries a docstring\n"
+            "Given a payload\n"
+            '"""\n'
+            "Feature: quoted, not declared\n"
+            '"""\n'
+            "Then it is accepted\n"
+        )
+        block = parse_block(body, 1)
+        self.assertEqual([f.name for f in block.features], ["Real"])
+        self.assertEqual(len(block.scenarios), 1)
+        self.assertEqual(len(block.scenarios[0].steps), 2)
+
+
+class TestPinnedSpecTree(unittest.TestCase):
+    """The definition of done: the tree at the pin lints clean."""
+
+    def setUp(self):
+        if not pinned_spec_is_checked_out():
             self.skipTest("spec submodule is not checked out")
 
     def test_pinned_spec_lints_clean(self):
-        self.assertEqual(lint_tree(REPO_ROOT / "spec"), [])
+        self.assertEqual(lint_tree(PINNED_SPEC), [])
 
     def test_every_scenario_in_the_pinned_spec_has_an_id(self):
         from vellum.suite import extract
 
-        entries = extract(REPO_ROOT / "spec").entries
-        self.assertEqual(len(entries), 19)
+        entries = extract(PINNED_SPEC).entries
+        self.assertGreater(pinned_scenario_count(), 0)
+        self.assertEqual(len(entries), pinned_scenario_count())
         self.assertTrue(all(e.scenario.id for e in entries))
 
 

@@ -23,6 +23,7 @@ notes live in `memory/areas/`; wave worklogs in `memory/waves/`.
 - [`memory/waves/spec-v1.md`](waves/spec-v1.md) — the hand-built loop.
 - [`memory/waves/spec-v2.md`](waves/spec-v2.md) — scenarios carry explicit stable ids.
 - [`memory/waves/spec-v3.md`](waves/spec-v3.md) — scenarios are self-contained; Backgrounds banned.
+- [`memory/waves/spec-v6.md`](waves/spec-v6.md) — one Feature per fence; runnable scenarios; the PO/PA/CA hierarchy.
 
 ## Technology choice, and why
 

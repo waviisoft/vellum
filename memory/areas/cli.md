@@ -10,7 +10,7 @@ names a file or symbol you can grep for.
 |---|---|
 | `src/vellum/cli.py` | `build_parser()`, `main()`. The only place argparse appears. |
 | `src/vellum/specfile.py` | `resolve_spec_root()`, `parse_spec_text()`, `find_fences()`, `iter_spec_files()`. |
-| `src/vellum/gherkin_blocks.py` | `split_documents()`, `parse_block()` -> `Block`, `_attach_id()`, `scenario_ref()`. |
+| `src/vellum/gherkin_blocks.py` | `_documents()`, `split_documents()`, `parse_block()` -> `Block`, `_attach_id()`, `scenario_ref()`. |
 | `src/vellum/links.py` | `find_references()`, `resolve()`, `heading_anchor()`, `heading_anchors()`. |
 | `src/vellum/lint.py` | `lint_tree()`, `Finding`, the `_check_*` functions. |
 | `src/vellum/suite.py` | `extract()`, `fingerprint()`, `version_history()`, `History`, `to_dict()`. |
@@ -27,23 +27,59 @@ scenario moving between files keeps its version. Ledger references take the
 form `scenario:<id>` (`scenario_ref()`).
 
 Lint enforces it: `GH005` missing tag, `GH006` malformed or duplicated-on-one-
-scenario, `GH003` id claimed by two scenarios. Two more are unrelated to ids: `GH007`, a
-`Scenario Outline` with no `Examples` rows, which parses cleanly and then never
-runs; and `GH008`, any feature declaring a `Background:`. `GH003` is checked in
+scenario, `GH003` id claimed by two scenarios. Three more are unrelated to ids:
+`GH007`, a `Scenario Outline` with no `Examples` rows, which parses cleanly and
+then never runs; `GH008`, any feature declaring a `Background:`; and `GH009`, a
+second `Feature:` in one fence. `GH003` is checked in
 `_check_unique_ids()` at the `lint_tree()` level, **not** per file, because ids
 are unique across the whole intent repo — putting that check back inside
 `_check_gherkin()` would silently stop catching the cross-file case.
 
 ## Landmines
 
-**A fenced gherkin block may hold more than one `Feature:`.**
-`spec/features/certification-and-releases.md` does, at spec-v1. Gherkin allows
-one Feature per document and the official parser raises
-`CompositeParserException` on the second one. `split_documents()` in
-`src/vellum/gherkin_blocks.py` cuts a block at column-zero `Feature:` lines and
-parses each piece separately. If you ever call `Parser().parse()` directly on a
-fence body, you will reintroduce this bug. It is covered by
-`TestBlockSplitting` in `tests/test_suite.py`.
+**The splitter is a fallback now, and deleting it still breaks the version
+chain.** Since spec-v4 a fence holds exactly one `Feature:`
+(`spec/decisions/2026-08-28-one-feature-per-fence.md`, `GH009`), so a
+conforming block goes to the official parser whole — `_documents()` in
+`src/vellum/gherkin_blocks.py` tries that first and only falls back to
+`split_documents()` when the parser refuses. Do not follow that through to
+deleting the splitter: `version_history()` reads every `spec-v*` tag, and
+`features/certification-and-releases.md` held two Features in one fence from
+spec-v1 to spec-v5. `scenarios_in()` swallows a parse error, so without the
+splitter that whole fence — all three scenarios, not just the second Feature's
+one — is invisible at every tag before spec-v4, and the three re-date from
+version 1 to version 4, the tag where the split made them readable again.
+Measured, not reasoned: stub `split_documents()` to raise and extract the
+pinned tree. The count stays 20, nothing raises, nothing is pending, and three
+scenarios quietly become three versions younger — which would arm scenarios the
+product already satisfies. `TestBlockSplitting` in `tests/test_suite.py` covers
+the splitter; `TestMultiFeatureFences` in `tests/test_lint.py` covers `GH009`.
+
+**A clean whole-fence parse does not mean one Feature.** The Cucumber parser
+refuses a second `Feature:` only where it reaches one *as a declaration*.
+Reached where free text is legal — a Feature's description, a Scenario's
+description, i.e. any point before the first step — it absorbs the line into
+that description as prose. The fence then parses with **no error at all**, one
+Feature short, the second Feature's scenarios re-parented onto the first and
+its name gone from `suite.json`. So `_documents()` trusts a whole parse only
+when the body holds at most one top-level `Feature:` line, and otherwise splits
+to find out. Do not simplify that back to "if it parses, it conforms": `GH009`
+then silently stops firing for exactly the fences an author is most likely to
+write by accident. `test_a_second_feature_the_parser_absorbs_as_prose_is_still_found`
+and `tests/fixtures/bad-multi-feature/features/absorbed.md` cover both
+absorption sites.
+
+**Ask the parser before cutting on `Feature:` lines.** `_FEATURE_RE` matches
+column zero, and Gherkin ignores indentation everywhere *except* inside a
+docstring, where the text is literal. So a docstring line reading `Feature: …`
+at column zero is one Feature to the parser and two to the splitter, and
+cutting first reported the resulting unterminated docstring as `GH001` against
+a block that parses. Parsing whole first is what makes that block clean, and it
+is also the honest test of the rule the spec actually states — a stock Cucumber
+parser reads the fence unmodified. Pinned by
+`test_a_block_the_stock_parser_reads_whole_is_never_split`. A step line
+beginning `Feature:` is *not* this case: indentation is not significant there,
+so it really is a second Feature and `GH009` is right to fault it.
 
 **`<spec-dir>` is two different things.** `resolve_spec_root()` in
 `src/vellum/specfile.py` accepts either the spec tree itself or the intent repo
@@ -94,10 +130,16 @@ a working implementation of a written decision.
 `test_background_steps_would_count_toward_the_fingerprint` pins it directly,
 since no fixture can carry a Background any more.
 
-**Never hard-code the pinned spec version in a test.** Use `pinned_version()`
-in `tests/support.py`, which reads `.vellum/product.yaml` — the same file the
-`conformance` job reads. A hard-coded version fails on every pin advance, which
-is noise that trains people to ignore red. This bit once, at spec-v2 -> spec-v3.
+**Never hard-code any fact about the pinned tree in a test** — not the version,
+not the scenario count, not the file count. Use `pinned_version()`,
+`pinned_scenario_count()` and `pinned_gherkin_file_count()` in
+`tests/support.py`: the first reads `.vellum/product.yaml`, the same file the
+`conformance` job reads; the other two read the tree itself, counting `@id:`
+tag lines and gherkin fences independently of the extractor they check. A
+hard-coded fact fails on every advance that touches it, which is noise that
+trains people to ignore red. The version bit at spec-v2 -> spec-v3; the counts
+bit at spec-v3 -> spec-v6, when spec-v5 added a twentieth scenario and four
+tests asserting `19` went red at once.
 
 **Renaming an id over unchanged content keeps the version.** A scenario whose
 id disappears and whose content reappears under a new id is dated by the
@@ -118,6 +160,24 @@ delimited by `)` and must not be stripped.
 `src/vellum/suite.py` walks `spec-v*` tags. A shallow clone has no tags, so
 every scenario comes back `pending` at version 1 — wrong, and silently so. Both
 workflows in `adapters/github/` set it.
+
+**A Gherkin keyword can have a synonym, and the parsed node will not tell you.**
+`GH007` matched the literal string `Scenario Outline`, so an unrunnable
+`Scenario Template` — the same construct under Gherkin's other English keyword —
+drew zero findings and extracted as coverage that pins nothing. There is no
+outline flag on the node to fall back to: `Scenario`, `Scenario Outline` and
+`Scenario Template` parse identically apart from `keyword`, and all three carry
+`examples == []` when no `Examples:` section is written, so the keyword string is
+the only signal there is. Match it against the parser's own dialect rather than
+against literals — `_OUTLINE_KEYWORDS` in `src/vellum/gherkin_blocks.py` is
+`Dialect.for_name("en").scenario_outline_keywords`, and `Scenario.is_outline` is
+what `GH007` now tests. That API is stable across the pinned range
+(`gherkin-official>=29,<43`; checked at both ends). Any future rule keyed on a
+keyword has the same hole waiting: `Example` is a synonym of `Scenario`, and
+`Rule:`, `Background:` and the step keywords all localise. `TestUnrunnableScenarios`
+in `tests/test_lint.py` covers both spellings and keeps a runnable template as a
+negative control, so the rule cannot regress into faulting the keyword instead of
+the unrunnability.
 
 ## Patterns worth keeping
 
