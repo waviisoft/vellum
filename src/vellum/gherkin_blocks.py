@@ -19,6 +19,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from gherkin.dialect import Dialect
 from gherkin.errors import CompositeParserException, ParserException
 from gherkin.parser import Parser
 from gherkin.token_scanner import TokenScanner
@@ -32,8 +33,22 @@ SCENARIO_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 #: ``Feature:`` at column zero starts a new document when a block has to be
 #: split. Localised keywords are out of scope for v0.1: the spec tree is English
 #: and lint would silently pass a block it had failed to split.
+#:
+#: Column zero is the entire scope, deliberately. An indented second
+#: ``Feature:`` is absorbed as description prose and so escapes GH009 — which
+#: costs nothing, because a stock parser reads that block identically. There is
+#: no runner divergence to catch there, only a line that reads oddly.
 _FEATURE_RE = re.compile(r"^Feature\s*:", re.MULTILINE)
 _TAG_LINE_RE = re.compile(r"^\s*@\S")
+
+#: The keywords that declare an outline, read from the parser's own English
+#: dialect rather than written out here. Gherkin accepts ``Scenario Template``
+#: as a synonym of ``Scenario Outline``, and a parsed scenario node records only
+#: which word was written — it carries no flag saying the node is an outline.
+#: Asking the dialect keeps this module's idea of the construct identical to the
+#: parser's, so a synonym cannot go unrecognised. English only, for the reason
+#: given above.
+_OUTLINE_KEYWORDS = frozenset(Dialect.for_name("en").scenario_outline_keywords)
 
 
 class GherkinParseError(Exception):
@@ -85,6 +100,11 @@ class Scenario:
     steps: list[Step] = field(default_factory=list)
     background_steps: list[Step] = field(default_factory=list)
     examples: list[dict] = field(default_factory=list)
+    #: True when ``keyword`` declares an outline. An outline with no Examples
+    #: section parses identically to a plain Scenario but for the keyword, so
+    #: this is the only thing separating them — and it is what GH007 tests,
+    #: the construct rather than one of its two spellings.
+    is_outline: bool = False
     #: The ``@id:`` slug, or None when the scenario declares none. Lint reports
     #: a missing id (GH005); extraction falls back to the fingerprint, which is
     #: how scenarios written before ids existed keep their version.
@@ -258,16 +278,18 @@ def parse_block(body: str, block_body_line: int) -> Block:
             node = child.get("scenario")
             if not node:
                 continue
+            keyword = node["keyword"].strip()
             scenarios.append(
                 Scenario(
                     feature=feature["name"],
                     name=node["name"],
-                    keyword=node["keyword"].strip(),
+                    keyword=keyword,
                     line=base + node["location"]["line"] - 1,
                     tags=[t["name"] for t in node.get("tags", [])],
                     steps=_steps(node.get("steps", [])),
                     background_steps=list(background),
                     examples=_examples(node.get("examples")),
+                    is_outline=keyword in _OUTLINE_KEYWORDS,
                 )
             )
     block.scenarios = [_attach_id(sc) for sc in scenarios]

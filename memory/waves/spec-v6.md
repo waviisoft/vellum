@@ -116,6 +116,66 @@ and lint may grow members of it (a `Rule:` with no scenarios is the example)
 without new spec sentences. Not taken up: nothing in the tree needs it, and a
 rule with no case to reject is a rule with no test.
 
+## After PA review — the outline's other keyword
+
+The PA review returned **MERGE WITH NITS** with one fix requested before merge,
+and it lands against the spec-v5 delta above: `GH007` matched the literal string
+`Scenario Outline`, but Gherkin's English dialect spells the same construct
+`Scenario Template` as well. Reproduced before touching anything — a template
+with no `Examples` rows drew zero findings, `vellum lint` exited 0, and
+extraction reported it as a scenario with `<n>` unresolved and `examples: []`.
+Coverage that pins nothing, which is the exact failure spec-v5 names.
+
+So the spec-v5 verification recorded above was incomplete where it claimed to be
+complete. No new spec sentence is needed to close it: `spec/features/spec-pipeline.md`
+says "a construct that parses but can never execute, such as a Scenario Outline
+with no Examples rows" — "such as" is an exemplar, and the decision says outright
+that the class is "declared but unrunnable", *not one construct*. A synonym of a
+member is already inside the sentence.
+
+**The fix asks the parser what an outline is rather than adding a second
+literal.** The obvious patch — `in ("Scenario Outline", "Scenario Template")` —
+re-arms the same trap for the next synonym. I checked whether the parsed node
+could answer instead, which would be better still, and it cannot: `Scenario`,
+`Scenario Outline` and `Scenario Template` produce nodes differing only in
+`keyword`, with no outline flag, and all three carry `examples == []` when no
+`Examples:` section is written — so an outline with no Examples is
+indistinguishable from a plain Scenario *except* by keyword. The keyword is
+therefore the only available signal, and the question is only what to compare it
+against. `_OUTLINE_KEYWORDS` in `src/vellum/gherkin_blocks.py` reads
+`Dialect.for_name("en").scenario_outline_keywords` from the parser itself, so
+this module's idea of the construct cannot drift from the parser's; the derived
+`Scenario.is_outline` is what `GH007` tests. Checked that the dialect API is
+present at both ends of the pinned range (`gherkin-official>=29,<43`): 29.0.0 and
+42.0.1 both answer `['Scenario Outline', 'Scenario Template']`. English only,
+matching `_FEATURE_RE`'s documented scope.
+
+**The finding names the keyword actually written**, via `sc.keyword.lower()`, so
+a template reports `scenario template '…'` and every pre-existing outline
+message stays byte-identical. Confirmed by diffing lint output over every
+fixture tree before and after: the only change anywhere is the one new finding.
+
+Two fixture blocks joined `tests/fixtures/bad-unrunnable/features/outlines.md`:
+the unrunnable template, and a template *with* a row as a negative control, so
+the rule is pinned to unrunnability rather than to the keyword. The file's
+opening prose was rewritten in place at the same line count, because
+`test_an_examples_table_with_a_header_and_no_rows_is_not_coverage` selects its
+finding by line number and a one-line shift would have silently re-pointed it.
+
+Both directions mutation-checked rather than assumed: restoring the literal
+match turns the synonym test and the count test red; dropping the `ex["rows"]`
+check turns the negative control and the count test red.
+
+**The optional nit taken too.** `_FEATURE_RE`'s comment now records that column
+zero is the entire scope deliberately — an indented second `Feature:` is
+absorbed as description prose and escapes `GH009`, which costs nothing because a
+stock parser reads that block identically. There is no runner divergence there
+to catch.
+
+Not mine, and untouched: the `Rule:`-nested-scenarios finding, spun out as
+waviisoft/vellum-intent#16 — the spec has to say whether `Rule:` is admitted at
+all before lint can have an opinion.
+
 ## The judgment call I was asked to make
 
 **Derived the pinned-tree counts instead of bumping `19` to `20`.** Four tests

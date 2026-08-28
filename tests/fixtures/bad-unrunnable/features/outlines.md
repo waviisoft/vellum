@@ -1,14 +1,14 @@
 ---
 id: outlines
-title: Outlines that never run
+title: Outlines and templates that never run
 since: spec-v1
 ---
 
-# Outlines that never run
+# Outlines and templates that never run
 
-Both blocks below parse cleanly and then never execute. They read as coverage
-in the extracted suite while pinning nothing, which is what
-`spec/decisions/2026-08-28-runnable-scenarios.md` has lint reject.
+The first three blocks below never execute; the last one runs. An unrunnable
+scenario reads as coverage in the extracted suite while pinning nothing, which
+is what `spec/decisions/2026-08-28-runnable-scenarios.md` has lint reject.
 
 ## Acceptance
 
@@ -29,4 +29,27 @@ Feature: A header and no rows
 
     Examples:
       | n |
+```
+
+```gherkin
+Feature: A template with no rows
+  @id:template-with-empty-examples
+  Scenario Template: Declares an Examples table with no data rows
+    Given <n>
+    Then it holds
+
+    Examples:
+      | n |
+```
+
+```gherkin
+Feature: A template that runs
+  @id:template-with-rows
+  Scenario Template: Has a row, so it runs
+    Given <n>
+    Then it holds
+
+    Examples:
+      | n |
+      | 1 |
 ```

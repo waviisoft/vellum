@@ -161,6 +161,24 @@ delimited by `)` and must not be stripped.
 every scenario comes back `pending` at version 1 — wrong, and silently so. Both
 workflows in `adapters/github/` set it.
 
+**A Gherkin keyword can have a synonym, and the parsed node will not tell you.**
+`GH007` matched the literal string `Scenario Outline`, so an unrunnable
+`Scenario Template` — the same construct under Gherkin's other English keyword —
+drew zero findings and extracted as coverage that pins nothing. There is no
+outline flag on the node to fall back to: `Scenario`, `Scenario Outline` and
+`Scenario Template` parse identically apart from `keyword`, and all three carry
+`examples == []` when no `Examples:` section is written, so the keyword string is
+the only signal there is. Match it against the parser's own dialect rather than
+against literals — `_OUTLINE_KEYWORDS` in `src/vellum/gherkin_blocks.py` is
+`Dialect.for_name("en").scenario_outline_keywords`, and `Scenario.is_outline` is
+what `GH007` now tests. That API is stable across the pinned range
+(`gherkin-official>=29,<43`; checked at both ends). Any future rule keyed on a
+keyword has the same hole waiting: `Example` is a synonym of `Scenario`, and
+`Rule:`, `Background:` and the step keywords all localise. `TestUnrunnableScenarios`
+in `tests/test_lint.py` covers both spellings and keeps a runnable template as a
+negative control, so the rule cannot regress into faulting the keyword instead of
+the unrunnability.
+
 ## Patterns worth keeping
 
 - **Findings, not exceptions.** `lint_tree()` returns a sorted list of

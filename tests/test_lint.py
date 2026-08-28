@@ -215,17 +215,20 @@ class TestUnrunnableScenarios(unittest.TestCase):
     """A scenario that parses and can never run fails lint
     (spec/decisions/2026-08-28-runnable-scenarios.md, spec-v5).
 
-    The class is "declared but unrunnable", not one construct. Both members the
-    decision names are here: an outline with no Examples section at all, and one
-    whose Examples table has a header and no data rows.
+    The class is "declared but unrunnable", defined by construct — so it is
+    neither one construct nor one keyword. Both members the decision names are
+    here (an outline with no Examples section at all, and one whose Examples
+    table has a header and no data rows), each in one of the two spellings
+    Gherkin's English dialect gives the construct, plus a template with a row,
+    which runs and must be left alone.
     """
 
     def setUp(self):
         self.findings = lint_tree(FIXTURES / "bad-unrunnable")
 
-    def test_both_kinds_of_empty_outline_fail_the_run(self):
+    def test_every_outline_that_cannot_run_fails_the_run(self):
         found = [f for f in self.findings if f.code == "GH007"]
-        self.assertEqual(len(found), 2)
+        self.assertEqual(len(found), 3)
         for f in found:
             self.assertIn("never runs", f.message)
         self.assertEqual(run_cli(["lint", str(FIXTURES / "bad-unrunnable")])[0], 1)
@@ -236,6 +239,21 @@ class TestUnrunnableScenarios(unittest.TestCase):
         found = [f for f in self.findings if f.line == 26]
         self.assertEqual(len(found), 1)
         self.assertEqual(found[0].code, "GH007")
+
+    def test_a_scenario_template_is_an_outline_under_its_other_keyword(self):
+        # `Scenario Template` is a synonym for `Scenario Outline`, not a second
+        # construct. Matching the literal keyword missed it, so an unrunnable
+        # template drew zero findings and extracted as coverage. The finding
+        # names the keyword actually written.
+        found = [f for f in self.findings if f.line == 37]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].code, "GH007")
+        self.assertIn("scenario template '", found[0].message)
+
+    def test_a_template_with_a_row_runs_and_is_not_faulted(self):
+        # The rule fires on unrunnability, not on the keyword; a template that
+        # can execute is sound. Guards the synonym against over-reach.
+        self.assertEqual([f for f in self.findings if f.line == 48], [])
 
     def test_nothing_else_is_faulted(self):
         self.assertEqual({f.code for f in self.findings}, {"GH007"})

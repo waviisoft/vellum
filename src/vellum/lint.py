@@ -187,17 +187,19 @@ def _check_gherkin(sf: SpecFile) -> tuple[list[Finding], list[Scenario]]:
                         sf.relpath, sc.line, "GH004", f"scenario '{sc.name}' has no steps"
                     )
                 )
-            # A Scenario Outline with no Examples parses cleanly and then never
-            # runs — a suite gap that looks like coverage.
-            if sc.keyword == "Scenario Outline" and not any(
-                ex["rows"] for ex in sc.examples
-            ):
+            # An outline with no Examples parses cleanly and then never runs —
+            # a suite gap that looks like coverage. spec-v5 defines the class by
+            # construct, not by keyword, so this asks whether the node is an
+            # outline: `Scenario Template` is the same construct under Gherkin's
+            # other English keyword and fails for the same reason. The finding
+            # names the keyword actually written.
+            if sc.is_outline and not any(ex["rows"] for ex in sc.examples):
                 findings.append(
                     Finding(
                         sf.relpath,
                         sc.line,
                         "GH007",
-                        f"scenario outline '{sc.name}' has no Examples rows, "
+                        f"{sc.keyword.lower()} '{sc.name}' has no Examples rows, "
                         f"so it never runs",
                     )
                 )
