@@ -84,6 +84,14 @@ def find_record(ledger_dir: str | Path, sha: str) -> Path | None:
     fuller or shorter sha than the caller has — is still found. Matching is by
     sha prefix in either direction, which is what makes ``vellum ledger advance
     --version 9c8b70a`` reach the record opened with the full forty.
+
+    Raises ``LedgerError`` when the abbreviation reaches more than one record.
+    An abbreviation is a convenience for a human typing, and the convenience
+    ends where it stops naming one version: picking the first match in filename
+    order would advance the state of *a* record, plausibly the wrong one, and
+    say nothing. The caller is told which records it reached and types more of
+    the sha. (An exact filename hit short-circuits above and is never
+    ambiguous.)
     """
     sha = str(sha).strip().lower()
     direct = record_path(ledger_dir, sha)
@@ -92,6 +100,7 @@ def find_record(ledger_dir: str | Path, sha: str) -> Path | None:
     directory = Path(ledger_dir)
     if not directory.is_dir():
         return None
+    matches: list[tuple[Path, str]] = []
     for path in sorted(directory.glob("*.yaml")):
         try:
             recorded = str(yaml.safe_load(path.read_text(encoding="utf-8"))["spec_version"])
@@ -101,8 +110,14 @@ def find_record(ledger_dir: str | Path, sha: str) -> Path | None:
         if not SHA_RE.match(recorded):
             continue
         if recorded.startswith(sha) or sha.startswith(recorded):
-            return path
-    return None
+            matches.append((path, recorded))
+    if len(matches) > 1:
+        candidates = ", ".join(f"{recorded} ({path.name})" for path, recorded in matches)
+        raise LedgerError(
+            f"{sha!r} is ambiguous: it matches {len(matches)} ledger records "
+            f"— {candidates}. Give more of the sha."
+        )
+    return matches[0][0] if matches else None
 
 
 def _now() -> str:

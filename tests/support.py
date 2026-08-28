@@ -65,12 +65,6 @@ def pinned_commit() -> str:
     return str(_pin()["commit"])
 
 
-def pinned_name() -> str | None:
-    """The pin's decorative name, if it has one. Never used to decide anything."""
-    name = _pin().get("name")
-    return str(name) if name else None
-
-
 #: An ``@id:`` tag alone on its line, which is how a scenario carries its id.
 #: Prose mentioning ``@id:`` inline (the identity decision does) is not a tag.
 ID_TAG_LINE_RE = re.compile(r"^\s*@id:[a-z0-9]+(?:-[a-z0-9]+)*\s*$", re.MULTILINE)

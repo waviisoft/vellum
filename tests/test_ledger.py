@@ -30,6 +30,10 @@ VERSION = "9c8b70a71089fc8fa6f585ff5f287bb740eff141"
 BASELINE = "1ce87cb5dd140bf2d9b125f9124d256fc4a19303"
 #: A version no record has been opened for.
 UNOPENED = "0123456789abcdef0123456789abcdef01234567"
+#: Invented, unlike the two above, and for one purpose: it shares VERSION's
+#: first seven characters — git's own abbreviation floor — so that
+#: `VERSION[:7]` names both records and neither more than the other.
+SIBLING = "9c8b70a9e3ff41c0d5b2a6748e0c1d93af5528b6"
 
 
 def run_cli(argv):
@@ -304,6 +308,41 @@ class TestShaKeying(LedgerCase):
     def test_a_different_version_does_not_collide(self):
         open_record(self.dir, VERSION)
         self.assertIsNone(find_record(self.dir, UNOPENED))
+
+    def test_an_ambiguous_abbreviation_is_refused_rather_than_guessed(self):
+        # Two records whose shas share the seven characters the caller typed.
+        # Returning the first in filename order would answer a question that
+        # has no single answer, and the caller would never learn that the
+        # record they reached was picked by `sorted()`.
+        open_record(self.dir, VERSION)
+        open_record(self.dir, SIBLING)
+        with self.assertRaises(LedgerError) as caught:
+            find_record(self.dir, VERSION[:7])
+        message = str(caught.exception)
+        # The candidates are named, because "be more specific" is not
+        # actionable unless you can see what you have to be specific against.
+        self.assertIn(VERSION, message)
+        self.assertIn(SIBLING, message)
+
+    def test_a_full_sha_still_resolves_when_a_sibling_shares_its_prefix(self):
+        # Ambiguity is a property of the abbreviation, not of the ledger: a sha
+        # that names its record exactly is unaffected by what sits beside it.
+        open_record(self.dir, VERSION)
+        open_record(self.dir, SIBLING)
+        self.assertEqual(find_record(self.dir, VERSION), record_path(self.dir, VERSION))
+        self.assertEqual(find_record(self.dir, SIBLING), record_path(self.dir, SIBLING))
+
+    def test_an_ambiguous_abbreviation_advances_neither_record(self):
+        # The CLI surfaces it as a failure, and — the point of raising rather
+        # than returning — both records are left exactly as they were.
+        open_record(self.dir, VERSION)
+        open_record(self.dir, SIBLING)
+        code, output = run_cli(["ledger", "advance", "--version", VERSION[:7],
+                                "--state", "shipped", "--ledger-dir", str(self.dir)])
+        self.assertEqual(code, 2)
+        self.assertIn("ambiguous", output)
+        self.assertEqual(load(record_path(self.dir, VERSION))["state"], "approved")
+        self.assertEqual(load(record_path(self.dir, SIBLING))["state"], "approved")
 
     def test_the_replay_guard_is_that_the_record_exists(self):
         # The whole idempotence story the minting workflow now relies on: no

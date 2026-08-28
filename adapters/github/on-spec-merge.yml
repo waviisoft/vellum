@@ -93,31 +93,62 @@ jobs:
       - name: Install the vellum CLI
         run: pip install --quiet ./vellum-cli
 
-      # The replay guard, entire: this commit either has a ledger record or it
-      # does not. `vellum ledger open` is itself idempotent, so re-running is
-      # harmless; this exists so the steps that are NOT idempotent (filing
-      # issues, pushing a commit) are skipped on a replay rather than repeated.
-      - name: Has this version already been recorded?
+      # Two questions, one gate: is this commit a spec version at all, and does
+      # it already have a ledger record? Everything below runs only on a `yes`.
+      #
+      # The replay half: this commit either has a record or it does not.
+      # `vellum ledger open` is itself idempotent, so re-running is harmless;
+      # the guard exists so the steps that are NOT idempotent (filing issues,
+      # pushing a commit) are skipped on a replay rather than repeated.
+      #
+      # The version half: `workflow_dispatch` reaches any commit, and only the
+      # `push` trigger carries a `paths: spec/**` filter. The likeliest hand-run
+      # is the one just after this job pushes its own ledger commit — a commit
+      # that touches `ledger/` and not `spec/`. That is not a spec version
+      # (spec/decisions/2026-08-28-versions-are-commits.md: the version is the
+      # commit whose diff touches spec/), and recording it would not merely add
+      # a stray file: the baseline step below reads `sed -n 2p` of this same
+      # rev-list, which is the previous spec version ONLY when line 1 is this
+      # commit. For a non-version, line 2 is the second-newest version, so the
+      # record would claim a baseline one version too old — wrong, silent, and
+      # written by automation, the ledger's only trusted writer.
+      #
+      # Hence the test: this sha is a version iff it is the newest spec-touching
+      # commit in its own first-parent history. `rev-list` rather than
+      # `diff-tree` because it is the command the baseline step already runs
+      # (so the guard asserts exactly that step's assumption), and because it
+      # needs no special-casing for merge commits — a PR merge commit, which is
+      # what a spec version usually IS, reports an empty diff under a plain
+      # `diff-tree --first-parent`.
+      - name: Is this a spec version, and is it already recorded?
         id: guard
+        env:
+          SHA: ${{ github.sha }}
         run: |
-          sha="${{ github.sha }}"
-          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
-          if [ -f "ledger/${sha}.yaml" ]; then
-            echo "recorded=yes" >> "$GITHUB_OUTPUT"
-            echo "::notice title=Already recorded::ledger/${sha}.yaml exists; this run is a replay"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+
+          if [ "$(git rev-list --first-parent -1 "$SHA" -- spec)" != "$SHA" ]; then
+            echo "proceed=no" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Not a spec version::${SHA} does not change spec/, so there is no version here to record. This run is a no-op."
+            exit 0
+          fi
+
+          if [ -f "ledger/${SHA}.yaml" ]; then
+            echo "proceed=no" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Already recorded::ledger/${SHA}.yaml exists; this run is a replay"
           else
-            echo "recorded=no" >> "$GITHUB_OUTPUT"
+            echo "proceed=yes" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Verify the spec still lints
-        if: steps.guard.outputs.recorded == 'no'
+        if: steps.guard.outputs.proceed == 'yes'
         run: vellum lint spec/
 
       # The previous spec version: the commit before this one whose diff
       # touches spec/. Ancestry, not arithmetic — there is no sequence to
       # decrement and nothing to be missing from.
       - name: Find the baseline version
-        if: steps.guard.outputs.recorded == 'no'
+        if: steps.guard.outputs.proceed == 'yes'
         id: baseline
         run: |
           previous="$(git rev-list --first-parent "${{ steps.guard.outputs.sha }}" -- spec | sed -n 2p)"
@@ -135,10 +166,23 @@ jobs:
       # =================================================================
       - name: Name the version (decoration)
         id: name
-        if: steps.guard.outputs.recorded == 'no'
+        if: steps.guard.outputs.proceed == 'yes'
         continue-on-error: true
+        env:
+          SHA: ${{ steps.guard.outputs.sha }}
+          # Through `env`, never `${{ }}` inside the script. A commit message is
+          # attacker-supplied text: anyone who can land a commit on main writes
+          # it, and `${{ }}` pastes it into the script *before* the shell parses
+          # the line, so a message containing a quote and a `;` runs as this
+          # step's own code. This runner holds `contents: write`, `issues:
+          # write` and a VELLUM_TOKEN checkout of the private product repo, and
+          # `continue-on-error` bounds only whether the step reddens the run —
+          # not what injected code can reach. As an `env` value it is data the
+          # shell reads out of the environment and never source it executes.
+          # (`LABEL` below is the same pattern.)
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
         run: |
-          count="$(git rev-list --first-parent --count "${{ steps.guard.outputs.sha }}" -- spec)"
+          count="$(git rev-list --first-parent --count "$SHA" -- spec)"
           tag="spec-v${count}"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
@@ -147,14 +191,14 @@ jobs:
           fi
           git config user.name  "vellum-orchestrator"
           git config user.email "orchestrator@vellum.invalid"
-          git tag -a "${tag}" -m "${tag}: ${{ github.event.head_commit.message }}"
+          git tag -a "${tag}" -m "${tag}: ${HEAD_COMMIT_MESSAGE}"
           git push origin "${tag}"
 
       # spec/features/ledger.md: one YAML record per spec version, keyed by the
       # version's commit sha, opened in state `approved`, written only by
       # automation.
       - name: Open the ledger record
-        if: steps.guard.outputs.recorded == 'no'
+        if: steps.guard.outputs.proceed == 'yes'
         run: |
           args=(--version "${{ steps.guard.outputs.sha }}" --ledger-dir ledger)
           if [ -n "${{ steps.baseline.outputs.commit }}" ]; then
@@ -166,7 +210,7 @@ jobs:
           vellum ledger open "${args[@]}"
 
       - name: Extract the suite at the new version
-        if: steps.guard.outputs.recorded == 'no'
+        if: steps.guard.outputs.proceed == 'yes'
         run: |
           vellum suite extract spec/ --output "ledger/suite-${{ steps.guard.outputs.sha }}.json"
 
@@ -188,7 +232,7 @@ jobs:
       # exercisable. With no workplan.yaml present, no issues are filed.
       # =================================================================
       - name: Plan the wave (STUB — writes nothing)
-        if: steps.guard.outputs.recorded == 'no'
+        if: steps.guard.outputs.proceed == 'yes'
         run: |
           echo "::warning title=Stub::planner is not implemented (v0.2)"
           echo "STUB: would write workplan.yaml for ${{ steps.guard.outputs.sha }}"
@@ -199,7 +243,7 @@ jobs:
       # number — which also makes a replay idempotent, because an existing
       # issue with the same title is reused rather than duplicated.
       - name: File work-item issues from workplan.yaml
-        if: steps.guard.outputs.recorded == 'no' && hashFiles('workplan.yaml') != ''
+        if: steps.guard.outputs.proceed == 'yes' && hashFiles('workplan.yaml') != ''
         env:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ steps.guard.outputs.sha }}
@@ -261,7 +305,7 @@ jobs:
           vellum ledger advance --version "$SHA" --state planning --ledger-dir ledger
 
       - name: Commit the ledger record
-        if: steps.guard.outputs.recorded == 'no'
+        if: steps.guard.outputs.proceed == 'yes'
         run: |
           git config user.name  "vellum-orchestrator"
           git config user.email "orchestrator@vellum.invalid"

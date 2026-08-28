@@ -281,3 +281,78 @@ commit a checkpoint before mutating anything. The real save was **checking the
 rule against the live intent tree and not only against its own fixtures** —
 the fixtures were passing at the time, because they had been generated when
 the rule existed.
+
+## Review round one — the PA's findings, applied
+
+The PA reviewed this PR blind-then-informed and returned **merge with nits**:
+one required fix and four hardenings, all taken here. What is worth carrying
+forward is not the list but the two things that were only found by running
+them.
+
+**The commit message was a shell injection.** `on-spec-merge.yml` built the tag
+annotation as `git tag -a "$tag" -m "${tag}: ${{ github.event.head_commit.message }}"`.
+`${{ }}` substitutes into the script *before* the shell parses it, so a commit
+message containing `"; …; echo "` executes as that step's own code — on a runner
+holding `contents: write`, `issues: write` and a `VELLUM_TOKEN` checkout of the
+private product repo. `continue-on-error` bounds whether the step reddens the
+run, not what injected code can reach; it is not containment. The message now
+arrives through `env:` and is read as `$HEAD_COMMIT_MESSAGE`, the pattern
+`LABEL` already used two steps down. Confirmed both directions: the old line
+creates the sentinel file, the new one stores the same hostile text verbatim as
+a tag message and executes nothing.
+
+The rest of the file was swept for the same shape. Every other `${{ }}` inside a
+`run:` is a sha from `github.sha` or from `git rev-list`, or the `spec-vN` tag
+built from a `--count` — GitHub-generated or git-generated, none of it
+attacker-supplied text. `spec-ci.yml` has no `${{ }}` in any `run:` at all. One
+neighbour, out of this PR's scope and left alone: `.github/workflows/ci.yml`
+interpolates `steps.pin.outputs.commit` into a `run:`, and that value is read
+out of `.vellum/product.yaml` rather than generated — a repo file, not an event
+field, so it takes a PR to this repo to influence, but it is the same shape and
+worth an `env:` next time that file is open.
+
+**`git diff-tree --first-parent` reports nothing for a merge commit.** The
+version guard was specified as "`git diff-tree --no-commit-id --name-only
+--first-parent "$sha" -- spec` non-empty". Applied literally it would have
+been worse than the bug it fixes: `diff-tree` on a merge produces a combined
+diff, which is empty unless a path conflicted, and `--first-parent` alone does
+not change that — so **every PR merge commit, which is exactly what a spec
+version is**, would have been classified a non-version and every real run
+silently no-opped. `-m` fixes it, and so does `--root` for the repo's first
+commit; both were needed and neither was in the recipe.
+
+The guard instead asks the question with the command the file already runs:
+this sha is a version iff `git rev-list --first-parent -1 "$sha" -- spec`
+equals the sha. That is the same rev-list the baseline step takes `sed -n 2p`
+of, which makes the coupling explicit — line 2 is the *previous* version only
+when line 1 is this commit. For a non-version, line 2 is the second-newest
+version, so the record the PA was worried about would not merely be a stray
+file: its `baseline` would point one version too far back, silently, written by
+the ledger's only trusted writer. The step's four cases were run against real
+git histories: spec merge commit, non-spec merge commit, root commit that
+created `spec/`, and a spec commit that already has a record.
+
+The moral, and it is the same one this wave keeps learning: **run the git
+command against a history shaped like the real one before writing it into a
+workflow.** A plausible invocation that returns nothing is indistinguishable
+from a correct one that finds nothing, and a guard that no-ops is silent by
+construction.
+
+**Three smaller ones.** `find_record()` returned the first match in filename
+order when an abbreviated sha reached more than one record; it now collects the
+matches and raises `LedgerError` naming them. The failure mode was not a bad
+error message — it was `vellum ledger advance` exiting **0** having advanced
+the state of a record the caller never named, which is what the new test
+asserts against. `spec-ci.yml` now exits non-zero on `shallow: true` rather
+than only noting it in the step summary, as product CI already does; the
+summary is written to `$GITHUB_STEP_SUMMARY` directly instead of by redirecting
+stdout, which leaves stdout free for the `::error` annotation. And
+`pinned_name()` in `tests/support.py` is gone — an unused reader of the pin's
+decorative name, which is precisely the thing nothing should be reading.
+
+Verification after the round: **147 tests OK** (144 plus three for the
+ambiguity), 11 skipped without an intent checkout and **147 OK, 0 skipped**
+with `VELLUM_INTENT_REPO` at the pin. Both workflow files parse as YAML. Suite
+extraction at the pin is **byte-identical** to what this branch produced before
+the round, and `vellum lint` is clean — the round touched the ledger, the
+workflows and the tests, and was checked not to have moved the extractor.
