@@ -40,6 +40,8 @@ class TestSpecRootDetection(unittest.TestCase):
     def test_intent_repo_root_resolves_to_its_spec_subdirectory(self):
         # A product repo mounts the whole intent repo at ./spec, so the tree is
         # one level down; `vellum lint spec/` must work either way.
+        if not (REPO_ROOT / "spec" / "spec" / "index.md").is_file():
+            self.skipTest("spec submodule is not checked out")
         root = resolve_spec_root(REPO_ROOT / "spec")
         self.assertEqual(root.name, "spec")
         self.assertTrue((root / "index.md").is_file())

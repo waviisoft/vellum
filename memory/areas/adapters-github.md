@@ -6,6 +6,19 @@ Two trees, easily confused:
   plus a `conformance` job asserting the pinned spec lints and that every
   scenario extracts at the version its tags say. That job is what makes "this
   checkout conforms to its pin" a checked property rather than a README claim.
+
+  **A workflow cannot clone the spec submodule with the default token.**
+  `GITHUB_TOKEN` is scoped to the repository the workflow runs in, and
+  `waviisoft/vellum-intent` is private, so `actions/checkout` with
+  `submodules: recursive` fails auth — all jobs die in about four seconds at
+  the first step, which reads like an infrastructure blip and is not one. This
+  is a structural consequence of decision D3: under split repos, a product
+  repo's CI needs a credential for the intent repo. So the `test` job takes no
+  submodule at all (the suite builds its own fixtures and throwaway git repos,
+  and the checks that need the real spec call `skipTest`), and `conformance`
+  checks the intent repo out explicitly with `secrets.SPEC_TOKEN`. Without that
+  secret the job reports "Conformance NOT VERIFIED" rather than passing as
+  though it had checked.
 - **`adapters/github/`** (below) is written *for the intent repo* and never
   runs here.
 

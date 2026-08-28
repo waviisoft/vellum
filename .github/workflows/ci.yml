@@ -1,5 +1,11 @@
 # CI for THIS repo (the product repo). Distinct from adapters/github/, which
 # holds workflows written for the intent repo and is not run here.
+#
+# The spec submodule points at a PRIVATE repo (waviisoft/vellum-intent), and a
+# workflow's default GITHUB_TOKEN is scoped to this repository alone — it
+# cannot clone it. So the tests run without the submodule (they are written to
+# skip the handful of checks that need it), and the conformance job checks the
+# intent repo out explicitly with a credential that can read it.
 
 name: ci
 
@@ -25,18 +31,10 @@ jobs:
         # The floor declared in pyproject.toml, and a current release.
         python: ['3.10', '3.12']
     steps:
+      # No submodule: the suite uses fixture trees and throwaway git repos it
+      # builds itself. The tests that assert against the pinned spec skip
+      # themselves when it is absent, and the conformance job covers them.
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          # The spec submodule's spec-v* tags are the version sequence that
-          # `vellum suite extract` walks; a shallow checkout has none of them
-          # and would silently date every scenario as new.
-          fetch-depth: 0
-
-      - name: Fetch the spec submodule's tags
-        run: |
-          git -C spec fetch --tags --force origin
-          git -C spec tag --list 'spec-v*'
 
       - uses: actions/setup-python@v5
         with:
@@ -51,71 +49,125 @@ jobs:
   conformance:
     name: The pinned spec lints and extracts correctly
     runs-on: ubuntu-latest
+    env:
+      # A token that can read the intent repo. `secrets` is not available in a
+      # step-level `if`, so it is lifted into the environment and tested there.
+      SPEC_TOKEN: ${{ secrets.SPEC_TOKEN }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Is a spec credential configured?
+        id: cred
+        run: |
+          if [ -n "$SPEC_TOKEN" ]; then
+            echo "available=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=no" >> "$GITHUB_OUTPUT"
+          fi
+
+      # =================================================================
+      # Without SPEC_TOKEN this job cannot read the pinned spec, so it
+      # reports that plainly instead of passing as though it had checked.
+      # =================================================================
+      - name: Conformance NOT VERIFIED (no SPEC_TOKEN)
+        if: steps.cred.outputs.available != 'yes'
+        run: |
+          echo "::warning title=Conformance not verified::SPEC_TOKEN is not set, so the pinned spec was not checked. See .github/workflows/ci.yml."
+          {
+            echo "### Conformance not verified"
+            echo
+            echo "\`SPEC_TOKEN\` is not configured, so this job could not read the"
+            echo "private intent repo and **did not check the pin**. The tests still ran."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Read the pin
+        if: steps.cred.outputs.available == 'yes'
+        id: pin
+        run: |
+          python - >> "$GITHUB_OUTPUT" <<'PY'
+          import pathlib, yaml
+          pin = yaml.safe_load(pathlib.Path(".vellum/product.yaml").read_text())["pin"]
+          print(f"version={pin['version']}")
+          print(f"commit={pin['commit']}")
+          PY
+
+      - name: Check out the pinned intent repo
+        if: steps.cred.outputs.available == 'yes'
+        uses: actions/checkout@v4
         with:
-          submodules: recursive
+          repository: waviisoft/vellum-intent
+          token: ${{ secrets.SPEC_TOKEN }}
+          path: spec
+          # Tags are the version sequence `vellum suite extract` walks; a
+          # shallow clone has none and would date every scenario as new.
           fetch-depth: 0
 
-      - name: Fetch the spec submodule's tags
-        run: git -C spec fetch --tags --force origin
+      - name: Move the spec to the pinned commit
+        if: steps.cred.outputs.available == 'yes'
+        run: |
+          git -C spec checkout --quiet "${{ steps.pin.outputs.commit }}"
+          git -C spec log --oneline -1
 
       - uses: actions/setup-python@v5
+        if: steps.cred.outputs.available == 'yes'
         with:
           python-version: '3.12'
 
       - name: Install
+        if: steps.cred.outputs.available == 'yes'
         run: pip install --quiet -e .
 
-      # The definition of done, asserted rather than asserted-about: the pinned
-      # spec lints clean, and every scenario in it extracts with the version
-      # the tags actually say. This is what makes "this checkout conforms to
-      # its pin" a checked property instead of a claim in the README.
       - name: vellum lint
+        if: steps.cred.outputs.available == 'yes'
         run: vellum lint spec/
 
       - name: vellum suite extract
+        if: steps.cred.outputs.available == 'yes'
         run: vellum suite extract spec/ --output suite.json
 
+      # The definition of done, asserted rather than asserted-about: every
+      # scenario extracts at the version the tags actually say, and the suite
+      # agrees with the pin recorded in .vellum/product.yaml. This is what
+      # makes "this checkout conforms to its pin" a checked property.
       - name: Check the suite against the pin
+        if: steps.cred.outputs.available == 'yes'
         run: |
           python - <<'PY'
-          import json, pathlib, sys, yaml
+          import json, sys
 
           suite = json.load(open("suite.json"))
-          pinned = yaml.safe_load(pathlib.Path(".vellum/product.yaml").read_text())["pin"]
-          expected = int(pinned["version"].removeprefix("spec-v"))
+          expected = int("${{ steps.pin.outputs.version }}".removeprefix("spec-v"))
 
           problems = []
           if suite["spec_version"] != expected:
               problems.append(
                   f"suite is at spec-v{suite['spec_version']}, "
-                  f"but .vellum/product.yaml pins {pinned['version']}"
+                  f"but .vellum/product.yaml pins spec-v{expected}"
               )
           if not suite["tagged"]:
-              problems.append("no spec-v* tags were visible; the submodule fetch is shallow")
-
-          missing = [s["file"] for s in suite["scenarios"] if not s["id"]]
+              problems.append("no spec-v* tags were visible; the checkout is shallow")
+          missing = sorted({s["file"] for s in suite["scenarios"] if not s["id"]})
           if missing:
-              problems.append(f"{len(missing)} scenario(s) without an @id: {sorted(set(missing))}")
-
+              problems.append(f"{len(missing)} file(s) with an id-less scenario: {missing}")
           ids = [s["id"] for s in suite["scenarios"]]
           if len(ids) != len(set(ids)):
               problems.append("duplicate scenario ids in the suite")
-
           pending = [s["id"] for s in suite["scenarios"] if s["pending"]]
           if pending:
-              problems.append(f"scenarios not carried by any tag: {pending}")
+              problems.append(f"scenarios carried by no tag: {pending}")
 
           for problem in problems:
               print(f"::error title=Conformance::{problem}")
-          print(f"{suite['scenario_count']} scenarios, "
-                f"versions {sorted({s['version'] for s in suite['scenarios']})}, "
-                f"pin {pinned['version']}")
+          print(
+              f"{suite['scenario_count']} scenarios, "
+              f"versions {sorted({s['version'] for s in suite['scenarios']})}, "
+              f"pin spec-v{expected}"
+          )
           sys.exit(1 if problems else 0)
           PY
 
       - uses: actions/upload-artifact@v4
+        if: steps.cred.outputs.available == 'yes'
         with:
           name: suite
           path: suite.json

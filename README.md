@@ -103,6 +103,19 @@ use `--ledger-dir` to point elsewhere.
 | `memory/` | Area notes, wave worklogs, and the map. Start at [`memory/map.md`](memory/map.md). |
 | `.vellum/product.yaml` | Backref to the intent repo and the pin. |
 
+## CI and the private spec
+
+`.github/workflows/ci.yml` runs the tests on 3.10 and 3.12 without the
+submodule — the suite builds its own fixtures, and the few checks that need the
+real spec skip themselves.
+
+The `conformance` job does need it, and the intent repo is private: a
+workflow's default `GITHUB_TOKEN` only reaches its own repository. Set a
+repository secret **`SPEC_TOKEN`** with read access to `waviisoft/vellum-intent`
+and the job checks the pinned spec out, lints it, and asserts every scenario
+extracts at the version the tags say. Without the secret it reports
+`Conformance NOT VERIFIED` rather than passing quietly.
+
 ## Acceptance criteria in the ledger
 
 Work items reference acceptance criteria by scenario id, never by file
