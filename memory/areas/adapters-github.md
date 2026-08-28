@@ -7,18 +7,27 @@ Two trees, easily confused:
   scenario extracts at the version its tags say. That job is what makes "this
   checkout conforms to its pin" a checked property rather than a README claim.
 
-  **A workflow cannot clone the spec submodule with the default token.**
-  `GITHUB_TOKEN` is scoped to the repository the workflow runs in, and
+  **CI has never actually executed in this repo.** Every run so far — three,
+  across three commits — completed in 4-8 seconds with `conclusion: failure`,
+  no logs (the log download 404s), no `steps` array, and `runner_id: 0` with an
+  empty `runner_name`. That is a run rejected before dispatch: no runner was
+  ever assigned. The workflow itself is `state: active` and parses. This is an
+  org-level Actions setting — billing/spending limit for private repos, or an
+  Actions policy — and nothing in the workflow file can fix it. Do not
+  "fix" ci.yml in response to it; check the org's Actions billing first.
+
+  **Design constraint, believed but NOT yet observed:** a workflow's default
+  `GITHUB_TOKEN` is scoped to the repository it runs in, and
   `waviisoft/vellum-intent` is private, so `actions/checkout` with
-  `submodules: recursive` fails auth — all jobs die in about four seconds at
-  the first step, which reads like an infrastructure blip and is not one. This
-  is a structural consequence of decision D3: under split repos, a product
-  repo's CI needs a credential for the intent repo. So the `test` job takes no
-  submodule at all (the suite builds its own fixtures and throwaway git repos,
-  and the checks that need the real spec call `skipTest`), and `conformance`
-  checks the intent repo out explicitly with `secrets.SPEC_TOKEN`. Without that
-  secret the job reports "Conformance NOT VERIFIED" rather than passing as
-  though it had checked.
+  `submodules: recursive` is expected to fail auth here. This is a documented
+  GitHub behaviour and a structural consequence of decision D3 — under split
+  repos a product repo's CI needs a credential for the intent repo — but it has
+  **not** been confirmed against this repo, because no job has ever reached its
+  first step. ci.yml is already built for it (`test` takes no submodule;
+  `conformance` uses `secrets.SPEC_TOKEN`), which is correct on its own merits.
+  Verify it the first time CI actually runs; until then treat it as reasoning,
+  not observation.
+
 - **`adapters/github/`** (below) is written *for the intent repo* and never
   runs here.
 

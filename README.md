@@ -116,6 +116,12 @@ and the job checks the pinned spec out, lints it, and asserts every scenario
 extracts at the version the tags say. Without the secret it reports
 `Conformance NOT VERIFIED` rather than passing quietly.
 
+**Actions is not currently running in this repo.** Every run so far has been
+rejected before a runner was assigned — no logs, no steps, `runner_id: 0` — which
+is an organisation-level Actions billing or policy setting, not a problem with
+the workflow. Until that is resolved, run the checks locally:
+`PYTHONPATH=tests .venv/bin/python -m unittest discover -s tests -t tests`.
+
 ## Acceptance criteria in the ledger
 
 Work items reference acceptance criteria by scenario id, never by file
