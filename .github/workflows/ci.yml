@@ -1,0 +1,121 @@
+# CI for THIS repo (the product repo). Distinct from adapters/github/, which
+# holds workflows written for the intent repo and is not run here.
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor declared in pyproject.toml, and a current release.
+        python: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          # The spec submodule's spec-v* tags are the version sequence that
+          # `vellum suite extract` walks; a shallow checkout has none of them
+          # and would silently date every scenario as new.
+          fetch-depth: 0
+
+      - name: Fetch the spec submodule's tags
+        run: |
+          git -C spec fetch --tags --force origin
+          git -C spec tag --list 'spec-v*'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install
+        run: pip install --quiet -e .
+
+      - name: Tests
+        run: PYTHONPATH=tests python -m unittest discover -s tests -t tests
+
+  conformance:
+    name: The pinned spec lints and extracts correctly
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Fetch the spec submodule's tags
+        run: git -C spec fetch --tags --force origin
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install
+        run: pip install --quiet -e .
+
+      # The definition of done, asserted rather than asserted-about: the pinned
+      # spec lints clean, and every scenario in it extracts with the version
+      # the tags actually say. This is what makes "this checkout conforms to
+      # its pin" a checked property instead of a claim in the README.
+      - name: vellum lint
+        run: vellum lint spec/
+
+      - name: vellum suite extract
+        run: vellum suite extract spec/ --output suite.json
+
+      - name: Check the suite against the pin
+        run: |
+          python - <<'PY'
+          import json, pathlib, sys, yaml
+
+          suite = json.load(open("suite.json"))
+          pinned = yaml.safe_load(pathlib.Path(".vellum/product.yaml").read_text())["pin"]
+          expected = int(pinned["version"].removeprefix("spec-v"))
+
+          problems = []
+          if suite["spec_version"] != expected:
+              problems.append(
+                  f"suite is at spec-v{suite['spec_version']}, "
+                  f"but .vellum/product.yaml pins {pinned['version']}"
+              )
+          if not suite["tagged"]:
+              problems.append("no spec-v* tags were visible; the submodule fetch is shallow")
+
+          missing = [s["file"] for s in suite["scenarios"] if not s["id"]]
+          if missing:
+              problems.append(f"{len(missing)} scenario(s) without an @id: {sorted(set(missing))}")
+
+          ids = [s["id"] for s in suite["scenarios"]]
+          if len(ids) != len(set(ids)):
+              problems.append("duplicate scenario ids in the suite")
+
+          pending = [s["id"] for s in suite["scenarios"] if s["pending"]]
+          if pending:
+              problems.append(f"scenarios not carried by any tag: {pending}")
+
+          for problem in problems:
+              print(f"::error title=Conformance::{problem}")
+          print(f"{suite['scenario_count']} scenarios, "
+                f"versions {sorted({s['version'] for s in suite['scenarios']})}, "
+                f"pin {pinned['version']}")
+          sys.exit(1 if problems else 0)
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: suite
+          path: suite.json

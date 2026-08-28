@@ -97,7 +97,8 @@ use `--ledger-dir` to point elsewhere.
 |---|---|
 | `spec/` | The intent repo, pinned. Read-only here. |
 | `src/vellum/` | The CLI. |
-| `tests/` | 99 tests plus fixture spec trees, including failing ones. |
+| `tests/` | 103 tests plus fixture spec trees, including failing ones. |
+| `.github/workflows/ci.yml` | CI for **this** repo: tests, plus a conformance check on the pin. |
 | `adapters/github/` | Workflows **for the intent repo** — see [`adapters/github/README.md`](adapters/github/README.md). |
 | `memory/` | Area notes, wave worklogs, and the map. Start at [`memory/map.md`](memory/map.md). |
 | `.vellum/product.yaml` | Backref to the intent repo and the pin. |

@@ -1,5 +1,14 @@
 # Area: the GitHub adapter
 
+Two trees, easily confused:
+
+- **`.github/workflows/ci.yml`** runs in *this* repo — tests on 3.10 and 3.12,
+  plus a `conformance` job asserting the pinned spec lints and that every
+  scenario extracts at the version its tags say. That job is what makes "this
+  checkout conforms to its pin" a checked property rather than a README claim.
+- **`adapters/github/`** (below) is written *for the intent repo* and never
+  runs here.
+
 `adapters/github/`. Two workflows written **for the intent repo**
 (`waviisoft/vellum-intent`) and kept here so they are reviewed next to the CLI
 they call. Nothing in this repo runs them; `adapters/github/README.md` has the
