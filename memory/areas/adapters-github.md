@@ -15,6 +15,15 @@ Two trees, easily confused:
   org-level Actions setting — billing/spending limit for private repos, or an
   Actions policy — and nothing in the workflow file can fix it. Do not
   "fix" ci.yml in response to it; check the org's Actions billing first.
+  A re-run of the same run (`run_attempt: 2`) failed identically in 3 seconds,
+  so it is not a transient runner shortage.
+
+  **Unconfirmed lead:** the repo has the Blacksmith (`[code]smith`) app
+  installed — it appends a footer to PR bodies — and Blacksmith supplies
+  Actions runners. If runner migration is enabled there it can rewrite or
+  intercept `runs-on: ubuntu-latest`, and an incomplete setup would produce
+  this exact signature. Not verified; org settings are not visible from here.
+  Worth checking alongside billing.
 
   **Design constraint, believed but NOT yet observed:** a workflow's default
   `GITHUB_TOKEN` is scoped to the repository it runs in, and
