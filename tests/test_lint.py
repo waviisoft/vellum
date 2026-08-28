@@ -4,10 +4,18 @@ import contextlib
 import io
 import unittest
 
-from support import FIXTURES, REPO_ROOT
+from support import (
+    FIXTURES,
+    PINNED_SPEC,
+    REPO_ROOT,
+    pinned_scenario_count,
+    pinned_spec_is_checked_out,
+)
 from vellum.cli import main
+from vellum.gherkin_blocks import parse_block
 from vellum.lint import lint_tree
-from vellum.specfile import SpecTreeError, resolve_spec_root
+from vellum.specfile import SpecTreeError, iter_spec_files, resolve_spec_root
+from vellum.suite import scenarios_in
 
 
 def run_cli(argv):
@@ -19,6 +27,12 @@ def run_cli(argv):
 
 def codes(name):
     return sorted(f.code for f in lint_tree(FIXTURES / name))
+
+
+def scenarios_in_tree(spec_dir):
+    """Every scenario extraction finds in a tree, defects and all."""
+    root = resolve_spec_root(spec_dir)
+    return [sc for sf in iter_spec_files(root) for sc in scenarios_in(sf.relpath, sf.text)]
 
 
 class TestCleanTree(unittest.TestCase):
@@ -169,11 +183,6 @@ class TestScenarioIds(unittest.TestCase):
         one = next(f for f in self.by_code("GH003") if f.file == "features/one.md")
         self.assertIn("features/two.md", one.message)
 
-    def test_a_scenario_outline_with_no_examples_is_reported(self):
-        found = [f for f in self.findings if f.code == "GH007"]
-        self.assertEqual(len(found), 1)
-        self.assertIn("never runs", found[0].message)
-
     def test_the_run_fails(self):
         self.assertEqual(run_cli(["lint", str(FIXTURES / "bad-ids")])[0], 1)
 
@@ -202,21 +211,98 @@ class TestBackgrounds(unittest.TestCase):
         self.assertEqual({f.code for f in self.findings}, {"GH008"})
 
 
-class TestPinnedSpecTree(unittest.TestCase):
-    """The definition of done: the pinned spec-v1 tree lints clean."""
+class TestUnrunnableScenarios(unittest.TestCase):
+    """A scenario that parses and can never run fails lint
+    (spec/decisions/2026-08-28-runnable-scenarios.md, spec-v5).
+
+    The class is "declared but unrunnable", not one construct. Both members the
+    decision names are here: an outline with no Examples section at all, and one
+    whose Examples table has a header and no data rows.
+    """
 
     def setUp(self):
-        if not (REPO_ROOT / "spec" / "spec" / "index.md").is_file():
+        self.findings = lint_tree(FIXTURES / "bad-unrunnable")
+
+    def test_both_kinds_of_empty_outline_fail_the_run(self):
+        found = [f for f in self.findings if f.code == "GH007"]
+        self.assertEqual(len(found), 2)
+        for f in found:
+            self.assertIn("never runs", f.message)
+        self.assertEqual(run_cli(["lint", str(FIXTURES / "bad-unrunnable")])[0], 1)
+
+    def test_an_examples_table_with_a_header_and_no_rows_is_not_coverage(self):
+        # The header alone parses into an Examples node, so a truthiness check
+        # on `examples` would pass this and the outline would still never run.
+        found = [f for f in self.findings if "no data rows" in f.message]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].code, "GH007")
+
+    def test_nothing_else_is_faulted(self):
+        self.assertEqual({f.code for f in self.findings}, {"GH007"})
+
+
+class TestMultiFeatureFences(unittest.TestCase):
+    """One Feature per fence (spec/decisions/2026-08-28-one-feature-per-fence.md)."""
+
+    def setUp(self):
+        self.findings = lint_tree(FIXTURES / "bad-multi-feature")
+
+    def test_a_second_feature_fails_the_run(self):
+        found = [f for f in self.findings if f.code == "GH009"]
+        self.assertEqual(len(found), 1)
+        self.assertIn("Second concern", found[0].message)
+        self.assertIn("First concern", found[0].message)
+        self.assertEqual(run_cli(["lint", str(FIXTURES / "bad-multi-feature")])[0], 1)
+
+    def test_the_finding_points_at_the_second_feature_not_the_fence(self):
+        found = next(f for f in self.findings if f.code == "GH009")
+        self.assertEqual(found.line, 21)
+
+    def test_the_scenarios_themselves_are_not_faulted(self):
+        # The extra Feature is the defect; the scenarios in both documents are
+        # well-formed, and both still extract.
+        self.assertEqual({f.code for f in self.findings}, {"GH009"})
+        ids = {sc.id for sc in scenarios_in_tree(FIXTURES / "bad-multi-feature")}
+        self.assertEqual(ids, {"two-in-one-first", "two-in-one-second"})
+
+    def test_a_block_the_stock_parser_reads_whole_is_never_split(self):
+        # Indentation is not significant to Gherkin, so a step line beginning
+        # "Feature:" really is a second Feature and GH009 is right to fault it.
+        # Inside a docstring it is not: the text is literal, one Feature, and
+        # the stock parser reads the block. Cutting at column-zero "Feature:"
+        # lines before parsing used to split this sound block down the middle
+        # and report the unterminated docstring as GH001. The parser is asked
+        # to read the block whole first, so nothing is cut.
+        body = (
+            "Feature: Real\n"
+            "Scenario: Carries a docstring\n"
+            "Given a payload\n"
+            '"""\n'
+            "Feature: quoted, not declared\n"
+            '"""\n'
+            "Then it is accepted\n"
+        )
+        block = parse_block(body, 1)
+        self.assertEqual([f.name for f in block.features], ["Real"])
+        self.assertEqual(len(block.scenarios), 1)
+        self.assertEqual(len(block.scenarios[0].steps), 2)
+
+
+class TestPinnedSpecTree(unittest.TestCase):
+    """The definition of done: the tree at the pin lints clean."""
+
+    def setUp(self):
+        if not pinned_spec_is_checked_out():
             self.skipTest("spec submodule is not checked out")
 
     def test_pinned_spec_lints_clean(self):
-        self.assertEqual(lint_tree(REPO_ROOT / "spec"), [])
+        self.assertEqual(lint_tree(PINNED_SPEC), [])
 
     def test_every_scenario_in_the_pinned_spec_has_an_id(self):
         from vellum.suite import extract
 
-        entries = extract(REPO_ROOT / "spec").entries
-        self.assertEqual(len(entries), 19)
+        entries = extract(PINNED_SPEC).entries
+        self.assertEqual(len(entries), pinned_scenario_count())
         self.assertTrue(all(e.scenario.id for e in entries))
 
 

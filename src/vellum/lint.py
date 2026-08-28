@@ -142,6 +142,20 @@ def _check_gherkin(sf: SpecFile) -> tuple[list[Finding], list[Scenario]]:
             findings.append(Finding(sf.relpath, exc.line, "GH001", exc.message))
             continue
         found = block.scenarios
+        # A fence holds exactly one Gherkin document, so a stock Cucumber
+        # runner reads it unmodified and drops nothing. The extra Feature is
+        # the defect; the scenarios under it are well-formed and still extract.
+        for extra in block.features[1:]:
+            findings.append(
+                Finding(
+                    sf.relpath,
+                    extra.line,
+                    "GH009",
+                    f"feature '{extra.name}' shares a fence with "
+                    f"'{block.features[0].name}'; each gherkin fence holds exactly "
+                    f"one Gherkin document, so give each Feature its own fence",
+                )
+            )
         # A scenario is a contract unit that travels alone: briefings quote it,
         # the ledger references scenario:<id>, question issues attach one.
         # A Background puts part of its meaning outside it.

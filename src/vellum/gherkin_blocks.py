@@ -1,10 +1,17 @@
 """Parsing the fenced ``gherkin`` blocks embedded in spec files.
 
-Gherkin allows one ``Feature:`` per document, but the spec tree puts more than
-one in a single fence (``features/certification-and-releases.md`` at spec-v1).
-``split_documents`` therefore cuts a block at top-level ``Feature:`` lines and
-hands each piece to the official Cucumber parser separately, so a block "parses"
-when every document inside it does.
+Gherkin allows one ``Feature:`` per document, and since spec-v4 the spec
+requires each fence to hold exactly one, so a stock Cucumber parser reads every
+block unmodified (``spec/features/scenarios-and-harness.md``). A conforming
+block is therefore handed to the official parser whole.
+
+Older tags are not conforming — ``features/certification-and-releases.md`` held
+two Features in one fence from spec-v1 to spec-v5 — and ``suite.py`` reads
+those trees to date scenarios. So ``split_documents`` stays as the fallback for
+a block the parser cannot read whole: it cuts at top-level ``Feature:`` lines
+and parses each piece separately, which is what lets lint name the extra
+Feature (GH009) instead of reporting the parser's raw error, and lets
+extraction keep describing every scenario in the block.
 """
 
 from __future__ import annotations
@@ -22,9 +29,9 @@ from gherkin.token_scanner import TokenScanner
 ID_TAG_PREFIX = "@id:"
 SCENARIO_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
-#: ``Feature:`` at column zero starts a new document. Localised keywords are out
-#: of scope for v0.1: the spec tree is English and lint would silently pass a
-#: block it had failed to split.
+#: ``Feature:`` at column zero starts a new document when a block has to be
+#: split. Localised keywords are out of scope for v0.1: the spec tree is English
+#: and lint would silently pass a block it had failed to split.
 _FEATURE_RE = re.compile(r"^Feature\s*:", re.MULTILINE)
 _TAG_LINE_RE = re.compile(r"^\s*@\S")
 
@@ -46,6 +53,15 @@ class Step:
     #: step above them. Fingerprints use this rather than the written keyword,
     #: so rewriting "And" as "Given" is not a behavioral change.
     keyword_type: str = ""
+
+
+@dataclass
+class Feature:
+    """A ``Feature:`` declaration. The second and later ones are GH009."""
+
+    name: str
+    #: 1-based line within the spec file.
+    line: int
 
 
 @dataclass
@@ -83,6 +99,9 @@ class Block:
 
     scenarios: list[Scenario] = field(default_factory=list)
     backgrounds: list[Background] = field(default_factory=list)
+    #: Every ``Feature:`` the block declares, in order. A conforming block has
+    #: exactly one; lint faults the rest (GH009).
+    features: list[Feature] = field(default_factory=list)
 
 
 def split_documents(body: str) -> list[tuple[int, str]]:
@@ -90,6 +109,9 @@ def split_documents(body: str) -> list[tuple[int, str]]:
 
     ``line_offset`` is 0-based from the first line of *body*. Tag lines
     immediately above a ``Feature:`` travel with it.
+
+    The cut is textual, so it is the fallback and not the first move: see
+    ``_documents``, which asks the parser to read the block whole first.
     """
     lines = body.split("\n")
     starts = [i for i, ln in enumerate(lines) if _FEATURE_RE.match(ln)]
@@ -146,23 +168,61 @@ def _examples(raw: list[dict]) -> list[dict]:
     return out
 
 
+def _parse_document(doc: str, base: int) -> dict:
+    """One Gherkin document through the official parser, errors relocated to *base*."""
+    try:
+        return Parser().parse(TokenScanner(doc))
+    except (CompositeParserException, ParserException) as exc:
+        raise GherkinParseError(_first_error(exc), _error_line(exc, base)) from exc
+
+
+def _documents(body: str, block_body_line: int) -> list[tuple[int, dict]]:
+    """Parse a fence, asking the stock parser to read it whole before splitting.
+
+    A conforming fence holds one Gherkin document, so the parser reads it
+    unmodified and nothing is cut — which is exactly the property
+    ``spec/features/scenarios-and-harness.md`` asks for, tested here directly
+    rather than approximated by counting ``Feature:`` lines. Only a body the
+    parser rejects falls back to ``split_documents``.
+
+    Asking the parser first also keeps the textual cut away from the one body it
+    misreads. Gherkin ignores indentation, so a *step* line beginning
+    ``Feature:`` really is a second Feature and the cut is right. Inside a
+    docstring it is not — the text is literal — and cutting there used to split
+    a sound block in half and report the resulting unterminated docstring as a
+    parse error against a block that parses.
+    """
+    try:
+        return [(0, _parse_document(body, block_body_line))]
+    except GherkinParseError:
+        pass
+    # Re-raises for a single document that simply does not parse, which is the
+    # unsplittable case and the error lint reports as GH001.
+    return [
+        (offset, _parse_document(doc, block_body_line + offset))
+        for offset, doc in split_documents(body)
+    ]
+
+
 def parse_block(body: str, block_body_line: int) -> Block:
-    """Everything one fenced block contains: its scenarios and any Backgrounds.
+    """Everything one fenced block contains: its Features, scenarios and Backgrounds.
 
     *block_body_line* is the 1-based spec-file line of the block's first line, so
     returned nodes and raised errors carry spec-file line numbers.
     """
     block = Block()
     scenarios = block.scenarios
-    for offset, doc in split_documents(body):
+    for offset, parsed in _documents(body, block_body_line):
         base = block_body_line + offset
-        try:
-            parsed = Parser().parse(TokenScanner(doc))
-        except (CompositeParserException, ParserException) as exc:
-            raise GherkinParseError(_first_error(exc), _error_line(exc, base)) from exc
         feature = parsed.get("feature")
         if not feature:
             continue
+        block.features.append(
+            Feature(
+                name=feature["name"],
+                line=base + feature["location"]["line"] - 1,
+            )
+        )
         background: list[Step] = []
         for child in feature.get("children", []):
             if "background" in child:

@@ -31,7 +31,9 @@ Feature: Session expiry
       | minutes | outcome  |
       | 29      | allowed  |
       | 31      | redirect |
+```
 
+```gherkin
 Feature: Sign-out
   @slow
   @id:auth-sign-out-clears-session
