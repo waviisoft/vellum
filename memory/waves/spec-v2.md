@@ -113,8 +113,12 @@ moves and the ledger records nothing — a behavioral change the traceability
 chain cannot see. That is a property of the system, not an implementation
 detail, so it was raised rather than chosen.
 
-Latent today: the tree has no `Background:` blocks at spec-v2, which is why it
-is cheap to settle now. v0.1 implements the conservative direction (a
+**Answered at spec-v3**, which banned Backgrounds outright rather than settling
+the fingerprint question — and recorded this wave's conservative reading as
+what must hold if the ban is ever lifted. See `memory/waves/spec-v3.md`.
+
+Latent when raised: the tree had no `Background:` blocks at spec-v2, which is
+why it was cheap to settle then. v0.1 implements the conservative direction (a
 Background edit bumps the affected scenarios, so nothing changes invisibly),
 isolated to one term in `fingerprint()` in `src/vellum/suite.py`.
 

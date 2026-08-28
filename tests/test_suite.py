@@ -5,8 +5,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from support import FIXTURES, REPO_ROOT, commit_area, make_spec_repo, write_area
-from vellum.gherkin_blocks import parse_block, split_documents
+from support import (
+    FIXTURES,
+    REPO_ROOT,
+    commit_area,
+    make_spec_repo,
+    pinned_version,
+    write_area,
+)
+from vellum.gherkin_blocks import Step, parse_block, split_documents
 from vellum.suite import extract, fingerprint, scenarios_in, to_dict
 
 ONE = """Feature: Login
@@ -49,14 +56,14 @@ class TestBlockSplitting(unittest.TestCase):
 
     def test_scenarios_from_both_features_are_collected(self):
         block = "Feature: A\n  Scenario: S\n    Given x\nFeature: B\n  Scenario: T\n    Given y"
-        self.assertEqual([s.feature for s in parse_block(block, 1)], ["A", "B"])
+        self.assertEqual([s.feature for s in parse_block(block, 1).scenarios], ["A", "B"])
 
 
 class TestScenarioIds(unittest.TestCase):
     """Identity is the @id: tag (spec/decisions/2026-08-28-scenario-identity.md)."""
 
     def parse(self, block):
-        return parse_block(block, 1)[0]
+        return parse_block(block, 1).scenarios[0]
 
     def test_id_is_read_from_the_tag(self):
         sc = self.parse("Feature: F\n  @id:the-slug\n  Scenario: S\n    Given x")
@@ -107,9 +114,9 @@ class TestScenarioCollection(unittest.TestCase):
     def test_two_features_in_one_block_are_both_present(self):
         self.assertIn("auth-sign-out-clears-session", self.by_id)
 
-    def test_background_steps_ride_with_each_scenario(self):
-        sc = self.by_id["auth-idle-session-expires"]
-        self.assertEqual([s["text"] for s in sc["background_steps"]], ["the reference environment"])
+    def test_no_scenario_carries_background_steps(self):
+        # Backgrounds are banned, so a conforming tree has none.
+        self.assertTrue(all(not s["background_steps"] for s in self.suite["scenarios"]))
 
     def test_scenario_outline_examples_are_captured(self):
         sc = self.by_id["auth-idle-threshold"]
@@ -172,6 +179,21 @@ class TestFingerprint(unittest.TestCase):
         tight = "Feature: F\n  @id:x\n  Scenario: S\n    Given a user"
         loose = "Feature: F\n  @id:x\n  Scenario: S\n    Given a    user"
         self.assertEqual(self.fp(tight), self.fp(loose))
+
+    def test_background_steps_would_count_toward_the_fingerprint(self):
+        # Backgrounds are banned, so this cannot arise in a conforming tree.
+        # The decision that banned them records what must hold if the ban is
+        # ever lifted — a Background edit bumps every scenario in the feature —
+        # and rejects the opposite reading outright. Pinned so a later
+        # relaxation cannot quietly implement the rejected one.
+        from vellum.suite import fingerprint
+
+        base = scenarios_in("a.md", wrap(ONE))[0]
+        with_background = scenarios_in("a.md", wrap(ONE))[0]
+        with_background.background_steps = [
+            Step(keyword="Given", text="the reference environment", keyword_type="Context")
+        ]
+        self.assertNotEqual(fingerprint(base), fingerprint(with_background))
 
     def test_changing_an_example_row_does_change_it(self):
         base = ("Feature: F\n  @id:x\n  Scenario Outline: S\n    Given <n>\n\n"
@@ -314,8 +336,8 @@ class TestPinnedSpecTree(unittest.TestCase):
         # spec-v2 only added @id: tags, a presentation change.
         self.assertEqual({s["version"] for s in self.suite["scenarios"]}, {1})
 
-    def test_the_suite_is_extracted_at_spec_v2(self):
-        self.assertEqual(self.suite["spec_version"], 2)
+    def test_the_suite_is_extracted_at_the_pinned_version(self):
+        self.assertEqual(self.suite["spec_version"], pinned_version())
         self.assertFalse(any(s["pending"] for s in self.suite["scenarios"]))
 
     def test_every_scenario_has_a_unique_id_and_a_ledger_ref(self):

@@ -9,7 +9,7 @@ here as a read-only submodule at `./spec`.
 
 The submodule commit **is** the pin: it names the spec version this code
 implements, so conformance is a property of the checkout. Currently pinned to
-`spec-v2` (`13afa40`).
+`spec-v3` (`94d8e25`).
 
 This is the v0.1 milestone — the hand-built loop. It proves spec CI, scenario
 extraction and the ledger format. The agent reviews, the planner, the harness
@@ -41,8 +41,10 @@ tree.
 
 Checks frontmatter against the schema (`decisions/` files carry a `date`,
 every other file a `since: spec-v<integer>`), resolves every cross-reference,
-parses every fenced `gherkin` block, and requires every scenario to carry
-exactly one well-formed `@id:<slug>` tag, unique across the whole intent repo. Prints one line per finding as
+parses every fenced `gherkin` block, requires every scenario to carry exactly
+one well-formed `@id:<slug>` tag unique across the whole intent repo, and
+rejects `Background:` blocks — scenarios are self-contained, so shared setup
+belongs in the harness as a compound step. Prints one line per finding as
 `path:line: CODE message` and exits non-zero if there are any, which is what
 lets spec CI block a merge the way a failing test does. Silent on success.
 `--json` emits findings as JSON.
@@ -97,7 +99,7 @@ use `--ledger-dir` to point elsewhere.
 |---|---|
 | `spec/` | The intent repo, pinned. Read-only here. |
 | `src/vellum/` | The CLI. |
-| `tests/` | 103 tests plus fixture spec trees, including failing ones. |
+| `tests/` | 107 tests plus fixture spec trees, including failing ones. |
 | `.github/workflows/ci.yml` | CI for **this** repo: tests, plus a conformance check on the pin. |
 | `adapters/github/` | Workflows **for the intent repo** — see [`adapters/github/README.md`](adapters/github/README.md). |
 | `memory/` | Area notes, wave worklogs, and the map. Start at [`memory/map.md`](memory/map.md). |

@@ -49,6 +49,16 @@ class Step:
 
 
 @dataclass
+class Background:
+    """A ``Background:`` block. Banned by the spec; lint reports it (GH008)."""
+
+    feature: str
+    #: 1-based line within the spec file.
+    line: int
+    steps: list[Step] = field(default_factory=list)
+
+
+@dataclass
 class Scenario:
     feature: str
     name: str
@@ -65,6 +75,14 @@ class Scenario:
     id: str | None = None
     #: Every ``@id:`` tag seen, so lint can report a scenario carrying two.
     id_tags: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Block:
+    """What one fenced ``gherkin`` block contains."""
+
+    scenarios: list[Scenario] = field(default_factory=list)
+    backgrounds: list[Background] = field(default_factory=list)
 
 
 def split_documents(body: str) -> list[tuple[int, str]]:
@@ -128,13 +146,14 @@ def _examples(raw: list[dict]) -> list[dict]:
     return out
 
 
-def parse_block(body: str, block_body_line: int) -> list[Scenario]:
-    """Every scenario in one fenced block.
+def parse_block(body: str, block_body_line: int) -> Block:
+    """Everything one fenced block contains: its scenarios and any Backgrounds.
 
     *block_body_line* is the 1-based spec-file line of the block's first line, so
-    returned scenarios and raised errors carry spec-file line numbers.
+    returned nodes and raised errors carry spec-file line numbers.
     """
-    scenarios: list[Scenario] = []
+    block = Block()
+    scenarios = block.scenarios
     for offset, doc in split_documents(body):
         base = block_body_line + offset
         try:
@@ -147,7 +166,15 @@ def parse_block(body: str, block_body_line: int) -> list[Scenario]:
         background: list[Step] = []
         for child in feature.get("children", []):
             if "background" in child:
-                background = _steps(child["background"].get("steps", []))
+                node = child["background"]
+                background = _steps(node.get("steps", []))
+                block.backgrounds.append(
+                    Background(
+                        feature=feature["name"],
+                        line=base + node["location"]["line"] - 1,
+                        steps=list(background),
+                    )
+                )
                 continue
             node = child.get("scenario")
             if not node:
@@ -164,7 +191,8 @@ def parse_block(body: str, block_body_line: int) -> list[Scenario]:
                     examples=_examples(node.get("examples")),
                 )
             )
-    return [_attach_id(sc) for sc in scenarios]
+    block.scenarios = [_attach_id(sc) for sc in scenarios]
+    return block
 
 
 def _attach_id(sc: Scenario) -> Scenario:

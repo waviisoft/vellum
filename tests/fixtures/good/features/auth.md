@@ -14,12 +14,10 @@ since: spec-v1
 
 ```gherkin
 Feature: Session expiry
-  Background:
-    Given the reference environment
-
   @id:auth-idle-session-expires
   Scenario: Idle session expires
-    Given a signed-in user idle for 31 minutes
+    Given the reference environment
+    And a signed-in user idle for 31 minutes
     When they request any authenticated page
     Then they are redirected to sign-in
 

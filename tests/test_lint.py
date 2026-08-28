@@ -181,6 +181,27 @@ class TestScenarioIds(unittest.TestCase):
         self.assertEqual(lint_tree(FIXTURES / "good"), [])
 
 
+class TestBackgrounds(unittest.TestCase):
+    """Backgrounds are banned (spec/decisions/2026-08-28-no-backgrounds.md)."""
+
+    def setUp(self):
+        self.findings = lint_tree(FIXTURES / "bad-backgrounds")
+
+    def test_a_background_fails_the_run(self):
+        found = [f for f in self.findings if f.code == "GH008"]
+        self.assertEqual(len(found), 1)
+        self.assertIn("Sign-in", found[0].message)
+        self.assertEqual(run_cli(["lint", str(FIXTURES / "bad-backgrounds")])[0], 1)
+
+    def test_the_finding_points_at_the_background_not_the_fence(self):
+        background = next(f for f in self.findings if f.code == "GH008")
+        self.assertEqual(background.line, 13)
+
+    def test_the_scenarios_themselves_are_not_faulted(self):
+        # The Background is the defect; the scenarios under it are well-formed.
+        self.assertEqual({f.code for f in self.findings}, {"GH008"})
+
+
 class TestPinnedSpecTree(unittest.TestCase):
     """The definition of done: the pinned spec-v1 tree lints clean."""
 
