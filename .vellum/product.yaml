@@ -1,0 +1,32 @@
+# Backref from this product repo to the intent repo that governs it.
+# One intent repo governs one or more product repos; each product repo answers
+# to exactly one intent repo (spec/features/repo-topology.md).
+
+intent:
+  repo: waviisoft/vellum-intent
+  url: https://github.com/waviisoft/vellum-intent
+
+# The pin states conformance. ./spec is the intent repo mounted as a git
+# submodule; the gitlink commit recorded in this repo's tree IS the pin, and
+# advancing it is the closing commit of a wave (spec/features/repo-topology.md).
+# `version` below is the human-readable name of that commit and is checked
+# against it by `vellum lint`'s caller in CI, not by the CLI itself.
+pin:
+  kind: submodule
+  path: spec
+  version: spec-v2
+  commit: 13afa40ab01f3f93c81bb33cbb4e9cd645caf9e7
+
+# This repo's entry in the intent repo's .vellum/workspace.yaml.
+product:
+  name: core
+  trees: [src, memory]
+
+# Trees an implementer may write in this repo. harness/, the ledger, and the
+# scenario blocks under spec/ are out of bounds (spec/behaviors/write-boundaries.md);
+# spec/ is a read-only submodule here, so that boundary is a checkout fact.
+write_boundaries:
+  implementer: [src, tests, memory, adapters, README.md]
+
+# The spec-first guard and the certification runner arrive in v0.2
+# (docs/design.md section 10); nothing in this repo enforces them yet.

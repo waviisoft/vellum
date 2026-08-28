@@ -1,0 +1,212 @@
+# On spec merge — runs in the INTENT repo when a spec change lands on main.
+#
+# This file lives in the product repo for review and is copied to
+# .github/workflows/on-spec-merge.yml in waviisoft/vellum-intent. See
+# adapters/github/README.md.
+#
+# Runners are Blacksmith (`blacksmith-2vcpu-ubuntu-2204`), matching this
+# organisation's setup — `ubuntu-latest` is never assigned a runner here. If
+# the intent repo does not have the Blacksmith app installed, change this
+# back to `ubuntu-latest` before copying the file over.
+#
+# Implements spec/features/spec-pipeline.md: "On merge, automation assigns the
+# next spec version (bare integer), tags the merge commit, and opens a ledger
+# record in state `approved`." Then, per spec/features/orchestration.md, the
+# planner's work plan is committed to the record and filed as issues.
+
+name: on-spec-merge
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'spec/**'
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Why this is being run by hand'
+        required: false
+
+permissions:
+  contents: write
+  issues: write
+
+# The reconciler is idempotent (decision D11), but minting a version is not
+# something to run twice at once.
+concurrency:
+  group: on-spec-merge
+  cancel-in-progress: false
+
+env:
+  VELLUM_REF: main
+
+jobs:
+  mint:
+    name: Mint the version, open the ledger record, file work items
+    runs-on: blacksmith-2vcpu-ubuntu-2204
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          # Tags are the version sequence; a shallow clone cannot compute the next one.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the vellum CLI
+        run: pip install --quiet "vellum @ git+https://github.com/waviisoft/vellum@${VELLUM_REF}"
+
+      # Versions are bare monotonic integers (decision D6): the next one is
+      # max(existing) + 1, with no semantic arithmetic.
+      - name: Compute the next version
+        id: version
+        run: |
+          git fetch --tags --force --quiet
+          latest="$(git tag --list 'spec-v*' \
+            | sed -n 's/^spec-v\([0-9]\{1,\}\)$/\1/p' \
+            | sort -n | tail -1)"
+          next=$(( ${latest:-0} + 1 ))
+          echo "latest=${latest:-0}" >> "$GITHUB_OUTPUT"
+          echo "next=${next}" >> "$GITHUB_OUTPUT"
+          echo "tag=spec-v${next}" >> "$GITHUB_OUTPUT"
+
+      # Idempotence: if this commit already carries a spec-v* tag, the run has
+      # happened before and must not mint a second version for it.
+      - name: Skip if this commit is already tagged
+        id: guard
+        run: |
+          existing="$(git tag --points-at HEAD --list 'spec-v*' | head -1)"
+          if [ -n "$existing" ]; then
+            echo "already=${existing}" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Already minted::${existing} already tags $(git rev-parse --short HEAD)"
+          fi
+
+      - name: Verify the spec still lints before minting
+        if: steps.guard.outputs.already == ''
+        run: vellum lint spec/
+
+      - name: Tag the merge commit
+        if: steps.guard.outputs.already == ''
+        run: |
+          git config user.name  "vellum-orchestrator"
+          git config user.email "orchestrator@vellum.invalid"
+          git tag -a "${{ steps.version.outputs.tag }}" \
+            -m "${{ steps.version.outputs.tag }}: ${{ github.event.head_commit.message }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+
+      # spec/features/ledger.md: one YAML record per spec version, opened in
+      # state `approved`, written only by automation.
+      - name: Open the ledger record
+        if: steps.guard.outputs.already == ''
+        run: |
+          vellum ledger open \
+            --version "${{ steps.version.outputs.next }}" \
+            --baseline "${{ steps.version.outputs.latest }}" \
+            --ledger-dir ledger
+
+      - name: Extract the suite at the new version
+        if: steps.guard.outputs.already == ''
+        run: vellum suite extract spec/ --output ledger/suite-${{ steps.version.outputs.tag }}.json
+
+      # =================================================================
+      # ==============  STUB — NOT IMPLEMENTED (v0.2)  ==================
+      # The planner (.vellum/agents/planner.md) reads the spec delta from the
+      # conformed baseline to the new version and writes workplan.yaml:
+      #
+      #   work_items:
+      #     - title: "Session expiry per features/auth.md"
+      #       repo: core
+      #       satisfies: [scenario:auth-idle-session-expires]
+      #
+      # Acceptance criteria are referenced by scenario id, never by file
+      # position (spec/features/ledger.md); the ids come from suite.json.
+      #
+      # Until the planner runs, a workplan.yaml committed by hand at the repo
+      # root is picked up by the next step, so the rest of this job is real and
+      # exercisable. With no workplan.yaml present, no issues are filed.
+      # =================================================================
+      - name: Plan the wave (STUB — writes nothing)
+        if: steps.guard.outputs.already == ''
+        run: |
+          echo "::warning title=Stub::planner is not implemented (v0.2)"
+          echo "STUB: would write workplan.yaml for ${{ steps.version.outputs.tag }}"
+
+      # spec/features/orchestration.md: "The plan is committed to the ledger
+      # record, then filed as issues." Issue numbers are only known after
+      # filing, so the issue is created first and the record updated with its
+      # number — which also makes a replay idempotent, because an existing
+      # issue with the same title is reused rather than duplicated.
+      - name: File work-item issues from workplan.yaml
+        if: steps.guard.outputs.already == '' && hashFiles('workplan.yaml') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.next }}
+        run: |
+          python - <<'PY' > items.txt
+          import yaml
+          plan = yaml.safe_load(open("workplan.yaml")) or {}
+          items = plan.get("work_items", plan if isinstance(plan, list) else [])
+          for item in items:
+              print("\t".join([
+                  item.get("title", ""),
+                  item.get("repo", ""),
+                  ",".join(item.get("satisfies") or []),
+              ]))
+          PY
+
+          while IFS=$'\t' read -r title repo satisfies; do
+            [ -n "$title" ] || continue
+            full="${TAG}: ${title}"
+
+            existing="$(gh issue list --state all --search "\"${full}\" in:title" \
+              --json number,title --jq ".[] | select(.title == \"${full}\") | .number" | head -1)"
+
+            if [ -n "$existing" ]; then
+              number="$existing"
+              echo "::notice title=Reusing issue::#${number} already files '${full}'"
+            else
+              number="$(gh issue create \
+                --title "${full}" \
+                --label "work-item" \
+                --body "$(printf 'Work item for **%s**, targeting product repo `%s`.\n\n## Spec slices satisfied\n\n%s\n\n---\nFiled by `on-spec-merge`. The ledger record is `ledger/%s.yaml`.\n' \
+                    "$TAG" "$repo" "$(echo "$satisfies" | tr ',' '\n' | sed 's/^/- `/;s/$/`/')" "$TAG")" \
+                | sed 's#.*/##')"
+              echo "::notice title=Filed issue::#${number} ${full}"
+            fi
+
+            satisfies_args=""
+            if [ -n "$satisfies" ]; then
+              IFS=',' read -ra slices <<< "$satisfies"
+              for slice in "${slices[@]}"; do
+                satisfies_args="${satisfies_args} --satisfies ${slice}"
+              done
+            fi
+
+            # shellcheck disable=SC2086
+            vellum ledger advance \
+              --version "$VERSION" \
+              --item "$number" \
+              --title "$title" \
+              --repo "$repo" \
+              ${satisfies_args} \
+              --ledger-dir ledger
+          done < items.txt
+
+          vellum ledger advance --version "$VERSION" --state planning --ledger-dir ledger
+
+      - name: Commit the ledger record
+        if: steps.guard.outputs.already == ''
+        run: |
+          git config user.name  "vellum-orchestrator"
+          git config user.email "orchestrator@vellum.invalid"
+          git add ledger/
+          if git diff --cached --quiet; then
+            echo "::notice title=No ledger change::nothing to commit"
+          else
+            git commit -m "ledger: open ${{ steps.version.outputs.tag }}"
+            git push origin HEAD:main
+          fi
