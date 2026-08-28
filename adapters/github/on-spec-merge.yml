@@ -4,6 +4,11 @@
 # .github/workflows/on-spec-merge.yml in waviisoft/vellum-intent. See
 # adapters/github/README.md.
 #
+# Runners are Blacksmith (`blacksmith-2vcpu-ubuntu-2204`), matching this
+# organisation's setup — `ubuntu-latest` is never assigned a runner here. If
+# the intent repo does not have the Blacksmith app installed, change this
+# back to `ubuntu-latest` before copying the file over.
+#
 # Implements spec/features/spec-pipeline.md: "On merge, automation assigns the
 # next spec version (bare integer), tags the merge commit, and opens a ledger
 # record in state `approved`." Then, per spec/features/orchestration.md, the
@@ -38,7 +43,7 @@ env:
 jobs:
   mint:
     name: Mint the version, open the ledger record, file work items
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2204
     steps:
       - name: Check out main
         uses: actions/checkout@v4

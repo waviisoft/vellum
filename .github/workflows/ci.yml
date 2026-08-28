@@ -1,6 +1,14 @@
 # CI for THIS repo (the product repo). Distinct from adapters/github/, which
 # holds workflows written for the intent repo and is not run here.
 #
+# Runners: this organisation schedules Actions on Blacksmith, not on
+# GitHub-hosted runners. `runs-on: ubuntu-latest` is never assigned a runner
+# here — the job is accepted and then fails in a few seconds with no logs, no
+# steps and runner_id 0, which reads like an infrastructure blip and is not
+# one. Use a `blacksmith-<vcpu>vcpu-ubuntu-<release>` label. Sizes run 2-32
+# vCPU; 2 is right for this repo, whose slowest job is a few seconds of
+# unittest.
+#
 # The spec submodule points at a PRIVATE repo (waviisoft/vellum-intent), and a
 # workflow's default GITHUB_TOKEN is scoped to this repository alone — it
 # cannot clone it. So the tests run without the submodule (they are written to
@@ -24,7 +32,7 @@ concurrency:
 jobs:
   test:
     name: Tests (Python ${{ matrix.python }})
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2204
     strategy:
       fail-fast: false
       matrix:
@@ -48,7 +56,7 @@ jobs:
 
   conformance:
     name: The pinned spec lints and extracts correctly
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2204
     env:
       # A token that can read the intent repo. `secrets` is not available in a
       # step-level `if`, so it is lifted into the environment and tested there.

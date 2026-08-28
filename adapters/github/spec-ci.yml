@@ -4,6 +4,11 @@
 # .github/workflows/spec-ci.yml in waviisoft/vellum-intent. See
 # adapters/github/README.md.
 #
+# Runners are Blacksmith (`blacksmith-2vcpu-ubuntu-2204`), matching this
+# organisation's setup — `ubuntu-latest` is never assigned a runner here. If
+# the intent repo does not have the Blacksmith app installed, change these
+# back to `ubuntu-latest` before copying this file over.
+#
 # Implements spec/features/spec-pipeline.md: "Spec CI runs on every spec PR:
 # lint ..., coherence review (agent), coverage review (agent), and an impact
 # report (agent)." Only lint and extraction are real in v0.1; the three agent
@@ -31,7 +36,7 @@ env:
 jobs:
   lint:
     name: Lint and extract the suite
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2204
     steps:
       - name: Check out the spec
         uses: actions/checkout@v4
@@ -91,7 +96,7 @@ jobs:
   # =====================================================================
   agent-review:
     name: Agent review (STUB)
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2204
     needs: lint
     permissions:
       contents: read
@@ -142,7 +147,7 @@ jobs:
   # =====================================================================
   backpressure:
     name: Backpressure check (STUB)
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2204
     steps:
       - name: Divergence cap (STUB — always passes)
         run: |
