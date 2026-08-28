@@ -77,10 +77,8 @@ landmine in `memory/areas/adapters-github.md`.
 
 ## Judgment calls recorded (non-blocking)
 
-1. **Background steps are part of a scenario's fingerprint.** The decision says
-   "normalized steps"; a `Background:` block's steps execute as part of every
-   scenario in its feature, so changing one changes those scenarios' behavior.
-   Excluding them would let a Background rewrite pass unnoticed.
+1. **Background steps are part of a scenario's fingerprint** — implemented, but
+   *asked* rather than settled: see "Asked this wave" below.
 2. **Steps compare by keyword type, not written keyword** — see above.
 3. **Whitespace inside step text and example cells is collapsed** before
    hashing, so re-wrapping or re-indenting a step is not a change.
@@ -103,11 +101,28 @@ landmine in `memory/areas/adapters-github.md`.
    describes what is in the tree — the same split the spec-v1 wave chose for
    unparseable blocks.
 
-## Nothing asked this wave
+## Asked this wave
 
-No behavioral ambiguity survived the corpus. The decision file answers
-identity, matching, and reference format directly; the remaining choices above
-are mechanical and are recorded rather than raised, per the ambiguity ladder.
+**waviisoft/vellum-intent#4 — "Question: do Background steps count as a
+scenario's content?"** The decision defines "changed" as "normalized steps and
+example tables" without saying whose steps. A `Background:` block's steps run
+before every scenario in its feature, so the two readings diverge on a real
+event: under one, editing a Background bumps every scenario in the file; under
+the other, a spec author changes what the suite exercises while no version
+moves and the ledger records nothing — a behavioral change the traceability
+chain cannot see. That is a property of the system, not an implementation
+detail, so it was raised rather than chosen.
+
+Latent today: the tree has no `Background:` blocks at spec-v2, which is why it
+is cheap to settle now. v0.1 implements the conservative direction (a
+Background edit bumps the affected scenarios, so nothing changes invisibly),
+isolated to one term in `fingerprint()` in `src/vellum/suite.py`.
+
+The other choices this wave were mechanical and are recorded above rather than
+raised, per the ambiguity ladder. In particular an id renamed over unchanged
+content keeps its version, because the decision states the change rule
+explicitly and "identity is the id" governs matching, not what counts as a
+change — the corpus answers it.
 
 ## Resolved from the spec-v1 wave
 
