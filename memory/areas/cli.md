@@ -10,7 +10,7 @@ names a file or symbol you can grep for.
 |---|---|
 | `src/vellum/cli.py` | `build_parser()`, `main()`. The only place argparse appears. |
 | `src/vellum/specfile.py` | `resolve_spec_root()`, `parse_spec_text()`, `find_fences()`, `iter_spec_files()`. |
-| `src/vellum/gherkin_blocks.py` | `split_documents()`, `parse_block()`, `_attach_id()`, `scenario_ref()`. |
+| `src/vellum/gherkin_blocks.py` | `split_documents()`, `parse_block()` -> `Block`, `_attach_id()`, `scenario_ref()`. |
 | `src/vellum/links.py` | `find_references()`, `resolve()`, `heading_anchor()`, `heading_anchors()`. |
 | `src/vellum/lint.py` | `lint_tree()`, `Finding`, the `_check_*` functions. |
 | `src/vellum/suite.py` | `extract()`, `fingerprint()`, `version_history()`, `History`, `to_dict()`. |
@@ -27,9 +27,9 @@ scenario moving between files keeps its version. Ledger references take the
 form `scenario:<id>` (`scenario_ref()`).
 
 Lint enforces it: `GH005` missing tag, `GH006` malformed or duplicated-on-one-
-scenario, `GH003` id claimed by two scenarios. (`GH007` is unrelated to ids: a
+scenario, `GH003` id claimed by two scenarios. Two more are unrelated to ids: `GH007`, a
 `Scenario Outline` with no `Examples` rows, which parses cleanly and then never
-runs — a suite gap that reads as coverage.) `GH003` is checked in
+runs; and `GH008`, any feature declaring a `Background:`. `GH003` is checked in
 `_check_unique_ids()` at the `lint_tree()` level, **not** per file, because ids
 are unique across the whole intent repo — putting that check back inside
 `_check_gherkin()` would silently stop catching the cross-file case.
@@ -82,6 +82,22 @@ matched to an unclaimed scenario with the same fingerprint, which is the only
 reason the spec-v1 scenarios survived the introduction of ids at spec-v2 with
 their versions intact. `_Seen.consumed` stops two new scenarios inheriting from
 one old one. Covered by `test_giving_an_existing_scenario_an_id_keeps_its_version`.
+
+**`background_steps` is always empty, and that is deliberate.** Backgrounds are
+banned (`spec/decisions/2026-08-28-no-backgrounds.md`) and `GH008` rejects
+them, so the term in `fingerprint()` (`src/vellum/suite.py`) can never fire in
+a conforming tree. It is kept because that same decision records the semantic
+for any future relaxation — a Background's steps belong to every affected
+scenario's fingerprint, and the opposite reading is "rejected outright as a
+violation of invariant 4". Do not delete it as dead code; deleting it discards
+a working implementation of a written decision.
+`test_background_steps_would_count_toward_the_fingerprint` pins it directly,
+since no fixture can carry a Background any more.
+
+**Never hard-code the pinned spec version in a test.** Use `pinned_version()`
+in `tests/support.py`, which reads `.vellum/product.yaml` — the same file the
+`conformance` job reads. A hard-coded version fails on every pin advance, which
+is noise that trains people to ignore red. This bit once, at spec-v2 -> spec-v3.
 
 **Renaming an id over unchanged content keeps the version.** A scenario whose
 id disappears and whose content reappears under a new id is dated by the

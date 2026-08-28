@@ -35,6 +35,18 @@ since: spec-v1
 """
 
 
+def pinned_version() -> int:
+    """The spec version .vellum/product.yaml pins, as an integer.
+
+    Tests read the pin rather than hard-coding it: a test that hard-codes the
+    version fails every time the pin advances, which is noise, not a defect.
+    """
+    import yaml
+
+    pin = yaml.safe_load((REPO_ROOT / ".vellum" / "product.yaml").read_text())["pin"]
+    return int(str(pin["version"]).removeprefix("spec-v"))
+
+
 def git(repo: Path, *args: str) -> str:
     proc = subprocess.run(
         [

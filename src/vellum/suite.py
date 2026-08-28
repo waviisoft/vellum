@@ -98,7 +98,7 @@ def scenarios_in(relpath: str, text: str) -> list[Scenario]:
         if fence.info != "gherkin":
             continue
         try:
-            found.extend(parse_block(fence.body, fence.body_line))
+            found.extend(parse_block(fence.body, fence.body_line).scenarios)
         except GherkinParseError:
             continue
     return found
@@ -118,6 +118,14 @@ def fingerprint(sc: Scenario) -> str:
     not read as a behavioral change. Background steps are included because they
     execute as part of the scenario.
     """
+    # background_steps is always empty in a conforming tree — Backgrounds are
+    # banned (spec/decisions/2026-08-28-no-backgrounds.md) and lint rejects them
+    # (GH008). The term stays because that decision also records what must
+    # happen if the ban is ever lifted: a Background's steps are part of every
+    # affected scenario's fingerprint, so a Background edit bumps every scenario
+    # in the feature. The opposite reading is "rejected outright as a violation
+    # of invariant 4", so this is the recorded semantic, kept implemented rather
+    # than deleted and re-derived.
     payload = {
         "steps": [_normalized(s) for s in (*sc.background_steps, *sc.steps)],
         "examples": [

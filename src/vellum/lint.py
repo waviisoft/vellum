@@ -137,10 +137,25 @@ def _check_gherkin(sf: SpecFile) -> tuple[list[Finding], list[Scenario]]:
         if fence.info != "gherkin":
             continue
         try:
-            found = parse_block(fence.body, fence.body_line)
+            block = parse_block(fence.body, fence.body_line)
         except GherkinParseError as exc:
             findings.append(Finding(sf.relpath, exc.line, "GH001", exc.message))
             continue
+        found = block.scenarios
+        # A scenario is a contract unit that travels alone: briefings quote it,
+        # the ledger references scenario:<id>, question issues attach one.
+        # A Background puts part of its meaning outside it.
+        for background in block.backgrounds:
+            findings.append(
+                Finding(
+                    sf.relpath,
+                    background.line,
+                    "GH008",
+                    f"feature '{background.feature}' declares a Background; "
+                    f"scenarios are self-contained, so move shared setup into "
+                    f"a harness compound step",
+                )
+            )
         if not found:
             findings.append(
                 Finding(
