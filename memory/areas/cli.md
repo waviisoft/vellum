@@ -27,7 +27,9 @@ scenario moving between files keeps its version. Ledger references take the
 form `scenario:<id>` (`scenario_ref()`).
 
 Lint enforces it: `GH005` missing tag, `GH006` malformed or duplicated-on-one-
-scenario, `GH003` id claimed by two scenarios. `GH003` is checked in
+scenario, `GH003` id claimed by two scenarios. (`GH007` is unrelated to ids: a
+`Scenario Outline` with no `Examples` rows, which parses cleanly and then never
+runs — a suite gap that reads as coverage.) `GH003` is checked in
 `_check_unique_ids()` at the `lint_tree()` level, **not** per file, because ids
 are unique across the whole intent repo — putting that check back inside
 `_check_gherkin()` would silently stop catching the cross-file case.
@@ -80,6 +82,16 @@ matched to an unclaimed scenario with the same fingerprint, which is the only
 reason the spec-v1 scenarios survived the introduction of ids at spec-v2 with
 their versions intact. `_Seen.consumed` stops two new scenarios inheriting from
 one old one. Covered by `test_giving_an_existing_scenario_an_id_keeps_its_version`.
+
+**Renaming an id over unchanged content keeps the version.** A scenario whose
+id disappears and whose content reappears under a new id is dated by the
+fingerprint fallback, so it stays at its original version. That follows from
+the spec's own rule — "changed" is the fingerprint, and this content was
+already specified — but it surprises on first reading. Pinned by
+`test_renaming_an_id_over_unchanged_content_keeps_the_version`. `History.by_fingerprint`
+keeps the *earliest* version among identical content: dating a fallback match
+too early leaves it enforced, which is the safe direction; too late would arm a
+scenario the product already satisfies.
 
 **A bare path absorbs the sentence's full stop.** `...see auth.md#acceptance.`
 would otherwise yield the fragment `acceptance.`. `find_references()` rstrips

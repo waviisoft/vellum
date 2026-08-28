@@ -30,3 +30,12 @@ Feature: Identity
     Given a thing
     Then it holds
 ```
+
+An outline with no rows parses, and then never runs:
+
+```gherkin
+Feature: Empty outline
+  @id:empty-outline
+  Scenario Outline: Has no examples
+    Given <n>
+```

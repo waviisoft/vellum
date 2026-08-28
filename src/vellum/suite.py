@@ -188,7 +188,12 @@ def version_history(repo: Path, prefix: str) -> History:
     for seen in previous:
         if seen.id:
             history.by_id[seen.id] = seen.version
-        history.by_fingerprint.setdefault(seen.fingerprint, seen.version)
+        # Among scenarios sharing content, take the earliest version: that is
+        # when the behavior was first specified, and dating a fallback match
+        # too early only leaves it enforced, never wrongly armed.
+        history.by_fingerprint[seen.fingerprint] = min(
+            history.by_fingerprint.get(seen.fingerprint, seen.version), seen.version
+        )
     return history
 
 

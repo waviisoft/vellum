@@ -167,6 +167,11 @@ class TestScenarioIds(unittest.TestCase):
         one = next(f for f in self.by_code("GH003") if f.file == "features/one.md")
         self.assertIn("features/two.md", one.message)
 
+    def test_a_scenario_outline_with_no_examples_is_reported(self):
+        found = [f for f in self.findings if f.code == "GH007"]
+        self.assertEqual(len(found), 1)
+        self.assertIn("never runs", found[0].message)
+
     def test_the_run_fails(self):
         self.assertEqual(run_cli(["lint", str(FIXTURES / "bad-ids")])[0], 1)
 

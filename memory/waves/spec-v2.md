@@ -88,7 +88,17 @@ landmine in `memory/areas/adapters-github.md`.
    fingerprint. The decision names steps and example tables; converting between
    the two forms necessarily changes the example tables anyway, so nothing is
    lost.
-5. **`suite.json` still emits scenarios that have no id** (with `id: null`),
+5. **`GH007`: a `Scenario Outline` with no `Examples` rows fails lint.** Not
+   asked for and not named in the spec, which describes lint as checking that
+   blocks parse — but such an outline parses and then never executes, which is
+   the "under-specification" failure `docs/design.md` §12 calls the suite's
+   attack surface. The agent coverage review that would otherwise catch it is
+   stubbed until v0.2, so a mechanical check earns its place now.
+6. **`History.by_fingerprint` keeps the earliest version** among scenarios with
+   identical content, so a fallback match is dated when the behavior was first
+   specified. Under-dating leaves a scenario enforced; over-dating would arm one
+   the product already satisfies.
+7. **`suite.json` still emits scenarios that have no id** (with `id: null`),
    rather than dropping them. Lint is where a missing id fails a run; extraction
    describes what is in the tree — the same split the spec-v1 wave chose for
    unparseable blocks.

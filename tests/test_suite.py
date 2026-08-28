@@ -245,6 +245,27 @@ class TestVersionDerivation(unittest.TestCase):
             {"login-good-password": (1, False), "login-bad-password": (1, False)},
         )
 
+    def test_identical_content_under_different_ids_does_not_cross_assign(self):
+        # Two scenarios with the same steps; only one of them changes.
+        both = ("Feature: F\n  @id:alpha\n  Scenario: A\n    Given a\n    Then b\n\n"
+                "  @id:beta\n  Scenario: B\n    Given a\n    Then b")
+        commit_area(self.repo, both, "spec-v1")
+        commit_area(self.repo, both.replace("Then b\n\n  @id:beta", "Then c\n\n  @id:beta"), "spec-v2")
+        self.assertEqual(self.versions(), {"alpha": (2, False), "beta": (1, False)})
+
+    def test_renaming_an_id_over_unchanged_content_keeps_the_version(self):
+        # Consequence of the spec's own rule: "changed" is the fingerprint, and
+        # this content was already specified at spec-v1, so nothing is re-armed.
+        one = "Feature: F\n  @id:one\n  Scenario: S\n    Given a\n    Then b"
+        commit_area(self.repo, one, "spec-v1")
+        commit_area(self.repo, one.replace("@id:one", "@id:two"), "spec-v2")
+        self.assertEqual(self.versions(), {"two": (1, False)})
+
+    def test_a_tree_that_did_not_exist_at_an_older_tag_is_dated_correctly(self):
+        commit_area(self.repo, ONE, "spec-v1")
+        commit_area(self.repo, TWO, "spec-v2")
+        self.assertEqual(self.versions()["login-bad-password"], (2, False))
+
     def test_a_scenario_moving_between_files_keeps_its_version(self):
         # Identity is the id; the file is only its current home.
         commit_area(self.repo, TWO, "spec-v1")
