@@ -1,0 +1,150 @@
+# Spec CI — runs on every spec PR against the INTENT repo.
+#
+# This file lives in the product repo for review and is copied to
+# .github/workflows/spec-ci.yml in waviisoft/vellum-intent. See
+# adapters/github/README.md.
+#
+# Implements spec/features/spec-pipeline.md: "Spec CI runs on every spec PR:
+# lint ..., coherence review (agent), coverage review (agent), and an impact
+# report (agent)." Only lint and extraction are real in v0.1; the three agent
+# reviews are stubs, marked below.
+
+name: spec-ci
+
+on:
+  pull_request:
+    paths:
+      - 'spec/**'
+      - '.github/workflows/spec-ci.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: spec-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  # The vellum CLI lives in the product repo; spec CI installs it from there.
+  VELLUM_REF: main
+
+jobs:
+  lint:
+    name: Lint and extract the suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the spec
+        uses: actions/checkout@v4
+        with:
+          # Full history and tags: `vellum suite extract` dates each scenario by
+          # walking the spec-v* tags, and a shallow clone has none of them.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the vellum CLI
+        run: pip install --quiet "vellum @ git+https://github.com/waviisoft/vellum@${VELLUM_REF}"
+
+      # spec/features/spec-pipeline.md: "Spec CI failure blocks merge exactly as
+      # failing tests block a code PR." A non-zero exit here fails the check.
+      - name: vellum lint
+        run: vellum lint spec/
+
+      - name: vellum suite extract
+        run: vellum suite extract spec/ --output suite.json
+
+      - name: Summarise the suite
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          suite = json.load(open("suite.json"))
+          pending = [s for s in suite["scenarios"] if s["pending"]]
+          print(f"### Acceptance suite\n")
+          print(f"- {suite['scenario_count']} scenarios across "
+                f"{len({s['file'] for s in suite['scenarios']})} files")
+          print(f"- {len(pending)} introduced or changed by this PR "
+                f"(would mint spec-v{suite['spec_version']})\n")
+          for s in pending:
+              print(f"  - `{s['id']}`")
+          PY
+
+      - name: Upload the suite
+        uses: actions/upload-artifact@v4
+        with:
+          name: suite
+          path: suite.json
+
+  # =====================================================================
+  # ===================  STUB — NOT IMPLEMENTED (v0.2)  =================
+  # =====================================================================
+  # The three agent reviews from spec/features/spec-pipeline.md. Each step
+  # below exits 0 without reviewing anything. They are wired up here so the
+  # job graph, permissions and artifact flow are settled before the agents
+  # arrive; replace each `echo` with the agent invocation.
+  #
+  # Until then these checks are PASSING VACUOUSLY. Do not read a green
+  # spec-ci as evidence that a spec change was reviewed for coherence,
+  # coverage or impact.
+  # =====================================================================
+  agent-review:
+    name: Agent review (STUB)
+    runs-on: ubuntu-latest
+    needs: lint
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download the suite
+        uses: actions/download-artifact@v4
+        with:
+          name: suite
+
+      # ---- STUB: coherence review (.vellum/agents/spec-reviewer.md, duty 1) ----
+      # Real behaviour: does this change contradict the spec tree or any other
+      # OPEN spec PR? Does it introduce ambiguity or off-glossary terms?
+      # Consolidate findings into one PR review, citing files and lines.
+      - name: Coherence review (STUB — always passes)
+        run: |
+          echo "::warning title=Stub::coherence review is not implemented (v0.2)"
+          echo "STUB: would review spec/ for contradictions against the tree and open spec PRs"
+
+      # ---- STUB: coverage review (.vellum/agents/spec-reviewer.md, duty 2) ----
+      # Real behaviour: every behavioral change carries scenarios that pin it
+      # down. "Be strict enough to be annoying." suite.json's `pending`
+      # scenarios are the changed set this review reasons over.
+      - name: Coverage review (STUB — always passes)
+        run: |
+          echo "::warning title=Stub::coverage review is not implemented (v0.2)"
+          echo "STUB: would require a scenario for every changed behavioral statement"
+
+      # ---- STUB: impact report (.vellum/agents/spec-reviewer.md, duty 3) ----
+      # Real behaviour: affected areas, predicted product repos, rough size,
+      # risks; check spec:redefining declarations BOTH ways (labelled-but-routine
+      # and unlabelled-but-redefining).
+      - name: Impact report (STUB — always passes)
+        run: |
+          echo "::warning title=Stub::impact report is not implemented (v0.2)"
+          echo "STUB: would post affected areas, predicted repos, size and risk"
+
+  # =====================================================================
+  # ===================  STUB — NOT IMPLEMENTED (v0.2)  =================
+  # Backpressure: spec/features/spec-pipeline.md blocks approval past the
+  # configured cap of unshipped spec versions (divergence_cap in
+  # .vellum/config.yaml). Needs ledger/releases.yaml pointers, which the
+  # librarian maintains from v0.3.
+  # =====================================================================
+  backpressure:
+    name: Backpressure check (STUB)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Divergence cap (STUB — always passes)
+        run: |
+          echo "::warning title=Stub::backpressure check is not implemented (v0.2)"
+          echo "STUB: would compare spec_head to spec_conformed against divergence_cap"
