@@ -355,6 +355,20 @@ class TestPinnedSpecTree(unittest.TestCase):
         # the fingerprint deliberately ignores.
         self.assertEqual(min(versions), 1)
 
+    def test_re_fencing_a_block_did_not_re_date_the_scenarios_in_it(self):
+        # spec-v4 split certification-and-releases.md into two fences, and the
+        # decision behind it claims that "splitting a fence moves no version
+        # and re-dates no scenario". This is that claim, asserted. It is also
+        # the guard on the splitter: reading those older tags is the only
+        # reason the three scenarios here are still dated 1 rather than 4, and
+        # the failure if it goes is silent — right count, nothing pending.
+        refenced = {
+            s["version"]
+            for s in self.suite["scenarios"]
+            if s["file"] == "features/certification-and-releases.md"
+        }
+        self.assertEqual(refenced, {1})
+
     def test_the_suite_is_extracted_at_the_pinned_version(self):
         self.assertEqual(self.suite["spec_version"], pinned_version())
         self.assertFalse(any(s["pending"] for s in self.suite["scenarios"]))

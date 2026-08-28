@@ -176,32 +176,51 @@ def _parse_document(doc: str, base: int) -> dict:
         raise GherkinParseError(_first_error(exc), _error_line(exc, base)) from exc
 
 
+def _split_and_parse(body: str, block_body_line: int) -> list[tuple[int, dict]]:
+    """Cut *body* at top-level ``Feature:`` lines and parse each piece.
+
+    Raises ``GherkinParseError`` for the first piece that does not parse, which
+    for an unsplittable body is the block's own error and lint's GH001.
+    """
+    return [
+        (offset, _parse_document(doc, block_body_line + offset))
+        for offset, doc in split_documents(body)
+    ]
+
+
 def _documents(body: str, block_body_line: int) -> list[tuple[int, dict]]:
     """Parse a fence, asking the stock parser to read it whole before splitting.
 
     A conforming fence holds one Gherkin document, so the parser reads it
     unmodified and nothing is cut — which is exactly the property
     ``spec/features/scenarios-and-harness.md`` asks for, tested here directly
-    rather than approximated by counting ``Feature:`` lines. Only a body the
-    parser rejects falls back to ``split_documents``.
+    rather than approximated by counting ``Feature:`` lines.
 
-    Asking the parser first also keeps the textual cut away from the one body it
-    misreads. Gherkin ignores indentation, so a *step* line beginning
-    ``Feature:`` really is a second Feature and the cut is right. Inside a
-    docstring it is not — the text is literal — and cutting there used to split
-    a sound block in half and report the resulting unterminated docstring as a
-    parse error against a block that parses.
+    Reading it whole is necessary but not sufficient, because the parser does
+    not always *refuse* a second ``Feature:``. It only refuses one it reaches
+    as a declaration; reached where free text is legal — a Feature's
+    description, a Scenario's description — it silently absorbs the line as
+    prose. The block then parses, one Feature short, with the second Feature's
+    scenarios re-parented onto the first and its name gone. So a whole parse is
+    trusted only when the body holds at most one top-level ``Feature:`` line.
+
+    When it holds more, splitting is what tells the two cases apart, and the
+    parser is again the one deciding: real Feature declarations each parse as
+    their own document, while a cut through a docstring — where ``Feature:`` at
+    column zero is literal text and the block really does hold one Feature —
+    does not parse at all, so the whole parse stands.
     """
     try:
-        return [(0, _parse_document(body, block_body_line))]
+        whole = _parse_document(body, block_body_line)
     except GherkinParseError:
-        pass
-    # Re-raises for a single document that simply does not parse, which is the
-    # unsplittable case and the error lint reports as GH001.
-    return [
-        (offset, _parse_document(doc, block_body_line + offset))
-        for offset, doc in split_documents(body)
-    ]
+        return _split_and_parse(body, block_body_line)
+
+    if len(split_documents(body)) <= 1:
+        return [(0, whole)]
+    try:
+        return _split_and_parse(body, block_body_line)
+    except GherkinParseError:
+        return [(0, whole)]
 
 
 def parse_block(body: str, block_body_line: int) -> Block:

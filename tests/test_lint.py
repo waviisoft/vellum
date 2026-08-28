@@ -233,7 +233,7 @@ class TestUnrunnableScenarios(unittest.TestCase):
     def test_an_examples_table_with_a_header_and_no_rows_is_not_coverage(self):
         # The header alone parses into an Examples node, so a truthiness check
         # on `examples` would pass this and the outline would still never run.
-        found = [f for f in self.findings if "no data rows" in f.message]
+        found = [f for f in self.findings if f.line == 26]
         self.assertEqual(len(found), 1)
         self.assertEqual(found[0].code, "GH007")
 
@@ -247,23 +247,66 @@ class TestMultiFeatureFences(unittest.TestCase):
     def setUp(self):
         self.findings = lint_tree(FIXTURES / "bad-multi-feature")
 
+    def gh009(self):
+        return [f for f in self.findings if f.code == "GH009"]
+
     def test_a_second_feature_fails_the_run(self):
-        found = [f for f in self.findings if f.code == "GH009"]
-        self.assertEqual(len(found), 1)
-        self.assertIn("Second concern", found[0].message)
-        self.assertIn("First concern", found[0].message)
+        found = next(f for f in self.gh009() if f.file == "features/two-in-one.md")
+        self.assertIn("Second concern", found.message)
+        self.assertIn("First concern", found.message)
         self.assertEqual(run_cli(["lint", str(FIXTURES / "bad-multi-feature")])[0], 1)
 
     def test_the_finding_points_at_the_second_feature_not_the_fence(self):
-        found = next(f for f in self.findings if f.code == "GH009")
+        found = next(f for f in self.gh009() if f.file == "features/two-in-one.md")
         self.assertEqual(found.line, 21)
+
+    def test_a_second_feature_the_parser_absorbs_as_prose_is_still_found(self):
+        # The parser refuses a second Feature: only where it reaches one as a
+        # declaration. Reached where free text is legal it swallows the line —
+        # into a Feature's description, or a Scenario's — and the block parses
+        # one Feature short with no error at all. Trusting a clean whole-body
+        # parse on its own therefore misses the rule entirely here.
+        found = [f for f in self.gh009() if f.file == "features/absorbed.md"]
+        self.assertEqual([f.line for f in found], [22, 37])
+        self.assertIn("Swallowed by a description", found[0].message)
+        self.assertIn("Swallowed by a scenario description", found[1].message)
+
+    def test_an_absorbed_feature_does_not_steal_the_next_features_scenarios(self):
+        # Left absorbed, the second Feature's scenarios re-parent onto the
+        # first and suite.json reports the wrong feature for each of them.
+        under = {
+            sc.id: sc.feature
+            for sc in scenarios_in_tree(FIXTURES / "bad-multi-feature")
+        }
+        self.assertEqual(
+            under["absorbed-into-feature-description"], "Swallowed by a description"
+        )
+        self.assertEqual(
+            under["absorbed-into-scenario-description"],
+            "Swallowed by a scenario description",
+        )
 
     def test_the_scenarios_themselves_are_not_faulted(self):
         # The extra Feature is the defect; the scenarios in both documents are
-        # well-formed, and both still extract.
-        self.assertEqual({f.code for f in self.findings}, {"GH009"})
+        # well-formed and both still extract. The one GH004 is intrinsic to the
+        # fixture: a Scenario description exists only on a step-less scenario,
+        # which is the only way to build the absorbed-into-a-scenario case.
+        self.assertEqual({f.code for f in self.findings}, {"GH009", "GH004"})
+        self.assertEqual(
+            {f.code for f in self.findings if f.file == "features/two-in-one.md"},
+            {"GH009"},
+        )
         ids = {sc.id for sc in scenarios_in_tree(FIXTURES / "bad-multi-feature")}
-        self.assertEqual(ids, {"two-in-one-first", "two-in-one-second"})
+        self.assertEqual(
+            ids,
+            {
+                "two-in-one-first",
+                "two-in-one-second",
+                "absorbed-host-scenario",
+                "absorbed-into-feature-description",
+                "absorbed-into-scenario-description",
+            },
+        )
 
     def test_a_block_the_stock_parser_reads_whole_is_never_split(self):
         # Indentation is not significant to Gherkin, so a step line beginning
@@ -302,6 +345,7 @@ class TestPinnedSpecTree(unittest.TestCase):
         from vellum.suite import extract
 
         entries = extract(PINNED_SPEC).entries
+        self.assertGreater(pinned_scenario_count(), 0)
         self.assertEqual(len(entries), pinned_scenario_count())
         self.assertTrue(all(e.scenario.id for e in entries))
 

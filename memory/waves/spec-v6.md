@@ -58,8 +58,24 @@ the diff rather than taken on trust:
   for the right reason, and rewrote it as the docstring case.
 
 So the fix is not a narrower `GH009` — it is to stop cutting first.
-`_documents()` hands the whole body to the official parser and only falls back
-to `split_documents()` when the parser refuses. A conforming fence is now never
+`_documents()` hands the whole body to the official parser first.
+
+**Parsing whole is necessary and not sufficient, which review caught and I had
+not.** The first version of this trusted any fence the parser read without
+error. It should not: the parser refuses a second `Feature:` only where it
+reaches one as a declaration, and reached before the first step — in a
+Feature's description or a Scenario's — it absorbs the line as prose. The fence
+parses, with no error, one Feature short, the second Feature's scenarios
+re-parented onto the first. `GH009` did not fire, and `suite.json` reported the
+wrong feature for those scenarios, which is a regression against `main`. The
+review found the Feature-description site; probing it turned up the
+Scenario-description site too, which a description-only check would still have
+missed. So a whole parse is trusted only when the body holds at most one
+top-level `Feature:` line, and otherwise the split decides — real declarations
+each parse as their own document, a cut through a docstring does not parse at
+all. Both absorption sites are fixtures now.
+
+The fallback to `split_documents()` stands when the parser refuses. A conforming fence is now never
 split at all, which is a more honest test of the rule the spec states than any
 count of `Feature:` lines, and the docstring block goes from a spurious `GH001`
 to clean. The splitter stays, and the reason it stays has changed: it is no

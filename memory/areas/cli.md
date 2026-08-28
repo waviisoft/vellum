@@ -55,6 +55,20 @@ scenarios quietly become three versions younger — which would arm scenarios th
 product already satisfies. `TestBlockSplitting` in `tests/test_suite.py` covers
 the splitter; `TestMultiFeatureFences` in `tests/test_lint.py` covers `GH009`.
 
+**A clean whole-fence parse does not mean one Feature.** The Cucumber parser
+refuses a second `Feature:` only where it reaches one *as a declaration*.
+Reached where free text is legal — a Feature's description, a Scenario's
+description, i.e. any point before the first step — it absorbs the line into
+that description as prose. The fence then parses with **no error at all**, one
+Feature short, the second Feature's scenarios re-parented onto the first and
+its name gone from `suite.json`. So `_documents()` trusts a whole parse only
+when the body holds at most one top-level `Feature:` line, and otherwise splits
+to find out. Do not simplify that back to "if it parses, it conforms": `GH009`
+then silently stops firing for exactly the fences an author is most likely to
+write by accident. `test_a_second_feature_the_parser_absorbs_as_prose_is_still_found`
+and `tests/fixtures/bad-multi-feature/features/absorbed.md` cover both
+absorption sites.
+
 **Ask the parser before cutting on `Feature:` lines.** `_FEATURE_RE` matches
 column zero, and Gherkin ignores indentation everywhere *except* inside a
 docstring, where the text is literal. So a docstring line reading `Feature: …`
