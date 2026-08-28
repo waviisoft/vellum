@@ -12,23 +12,30 @@ Two trees, easily confused:
   fails in 3-8 seconds with `conclusion: failure`, no logs (the download
   404s), no `steps` array, and `runner_id: 0` with an empty `runner_name`,
   while the workflow reports `state: active`. Five runs and one re-run failed
-  that way before the label was changed. It reads like an infrastructure blip
-  and is not one — do not "fix" the workflow in response to it, and do not
-  swap the label back to `ubuntu-latest`. Use
-  `blacksmith-<vcpu>vcpu-ubuntu-<release>`; this repo uses
-  `blacksmith-2vcpu-ubuntu-2204` in `.github/workflows/ci.yml` and in both
-  files under `adapters/github/`.
+  that way. It reads like an infrastructure blip and is not one — do not
+  "fix" the workflow in response to it, and never swap the label back to
+  `ubuntu-latest`. Confirmed working:
+  `blacksmith-2vcpu-ubuntu-2204`, used in `.github/workflows/ci.yml` and in
+  both files under `adapters/github/`. A healthy job shows a real
+  `runner_name` (e.g. `blacksmith-01m13gdj...-2vcpu`), a populated `steps`
+  array, and Blacksmith's `job_completed.sh` hook in the log.
 
-  **Design constraint, believed but NOT yet observed:** a workflow's default
-  `GITHUB_TOKEN` is scoped to the repository it runs in, and
-  `waviisoft/vellum-intent` is private, so `actions/checkout` with
-  `submodules: recursive` is expected to fail auth here. This is documented
-  GitHub behaviour and a structural consequence of decision D3 — under split
-  repos a product repo's CI needs a credential for the intent repo — but it
-  has **not** been confirmed against this repo. `ci.yml` is already built for
-  it (`test` takes no submodule; `conformance` uses `secrets.SPEC_TOKEN`),
-  which is correct on its own merits. Confirm it the first time a job reaches
-  its first step; until then treat it as reasoning, not observation.
+  **`SPEC_TOKEN` reads the private intent repo, and is required.** The
+  `conformance` job checks `waviisoft/vellum-intent` out as a separate
+  `actions/checkout` with `token: ${{ secrets.SPEC_TOKEN }}`, moves it to the
+  commit in `.vellum/product.yaml`, then lints and extracts. Observed working:
+  the checkout, `vellum lint`, `vellum suite extract` and the pin assertion
+  all pass, and `suite.json` uploads as an artifact. Without the secret the
+  job takes the `Conformance NOT VERIFIED` step and says so rather than
+  passing quietly — also observed, on the attempts before the secret existed.
+  If that step is ever skipped *and* the pin steps are skipped too, the
+  `steps.cred` guard has broken.
+
+  **Still unverified:** whether `actions/checkout` with `submodules: recursive`
+  would fail on the private submodule under the default `GITHUB_TOKEN`. It is
+  documented GitHub behaviour (the token is scoped to its own repository) and
+  is why `ci.yml` is shaped the way it is, but no job in this repo has ever
+  attempted it on a working runner. Do not cite it as an observation.
 
 - **`adapters/github/`** (below) is written *for the intent repo* and never
   runs here.
