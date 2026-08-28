@@ -48,7 +48,12 @@ def build_parser() -> argparse.ArgumentParser:
     opener = ledger_sub.add_parser("open", help="open a record for an approved version")
     _add_common_ledger_args(opener)
     opener.add_argument("--spec-pr", type=int, help="the spec PR that was merged")
-    opener.add_argument("--baseline", help="conformed version the wave is planned against")
+    opener.add_argument("--baseline", help="conformed version (commit) the wave is planned against")
+    opener.add_argument(
+        "--name",
+        help="decorative name for this version, e.g. spec-v12; never read to "
+             "decide anything, so it may be omitted",
+    )
     opener.add_argument("--label", action="append", default=[], dest="labels")
     opener.add_argument("--line", default="main", help="maintenance line (reserved; default main)")
     opener.add_argument("--approved", help="approval time, ISO 8601 (default: now, UTC)")
@@ -74,7 +79,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _add_common_ledger_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--version", required=True, help="spec version, N or spec-vN")
+    p.add_argument(
+        "--version",
+        required=True,
+        help="spec version: the commit sha of the approved spec change",
+    )
     p.add_argument("--ledger-dir", default="ledger", help="ledger directory (default: ledger)")
 
 
@@ -97,17 +106,18 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _ledger(args: argparse.Namespace) -> int:
-    number = parse_version(args.version)
+    sha = parse_version(args.version)
     if args.ledger_command == "open":
         baseline = parse_version(args.baseline) if args.baseline else None
         path, created = open_record(
             args.ledger_dir,
-            number,
+            sha,
             spec_pr=args.spec_pr,
             baseline=baseline,
             labels=args.labels,
             line=args.line,
             approved=args.approved,
+            name=args.name,
         )
         print(path if created else f"{path} (already open)")
         return 0
@@ -115,7 +125,7 @@ def _ledger(args: argparse.Namespace) -> int:
     plan = load_plan(args.plan) if args.plan else None
     path = advance(
         args.ledger_dir,
-        number,
+        sha,
         state=args.state,
         release=args.release,
         plan=plan,

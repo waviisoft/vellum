@@ -3,13 +3,14 @@
 import contextlib
 import io
 import unittest
+from pathlib import Path
 
 from support import (
     FIXTURES,
-    PINNED_SPEC,
     REPO_ROOT,
+    intent_checkout,
+    intent_spec_tree,
     pinned_scenario_count,
-    pinned_spec_is_checked_out,
 )
 from vellum.cli import main
 from vellum.gherkin_blocks import parse_block
@@ -52,11 +53,32 @@ class TestSpecRootDetection(unittest.TestCase):
         )
 
     def test_intent_repo_root_resolves_to_its_spec_subdirectory(self):
-        # A product repo mounts the whole intent repo at ./spec, so the tree is
-        # one level down; `vellum lint spec/` must work either way.
-        if not (REPO_ROOT / "spec" / "spec" / "index.md").is_file():
-            self.skipTest("spec submodule is not checked out")
-        root = resolve_spec_root(REPO_ROOT / "spec")
+        # `<spec-dir>` is two things: the spec tree, or the intent repo that
+        # holds it one level down at `spec/`. Both must resolve, and this is
+        # built here rather than read off a checkout — it was a submodule test
+        # once, and it went quiet the moment the submodule went away
+        # (spec/decisions/2026-08-28-pin-file.md), which is exactly the kind of
+        # hole an environment-dependent test leaves behind.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = Path(tmp) / "intent"
+            (checkout / "spec").mkdir(parents=True)
+            (checkout / "spec" / "index.md").write_text(
+                "---\nid: index\ntitle: I\nsince: spec-v1\n---\n\n# Index\n"
+            )
+            root = resolve_spec_root(checkout)
+            self.assertEqual(root, (checkout / "spec").resolve())
+            # And the tree itself, given directly, resolves to itself.
+            self.assertEqual(resolve_spec_root(root), root)
+
+    def test_a_real_intent_checkout_resolves_the_same_way(self):
+        # The live case, when one is available: whatever supplied the checkout,
+        # `vellum lint <checkout>` finds the tree inside it.
+        checkout = intent_checkout()
+        if checkout is None:
+            self.skipTest("no intent checkout (set VELLUM_INTENT_REPO)")
+        root = resolve_spec_root(checkout)
         self.assertEqual(root.name, "spec")
         self.assertTrue((root / "index.md").is_file())
 
@@ -259,6 +281,81 @@ class TestUnrunnableScenarios(unittest.TestCase):
         self.assertEqual({f.code for f in self.findings}, {"GH007"})
 
 
+class TestRuleBlocks(unittest.TestCase):
+    """`Rule:` blocks are banned (spec/decisions/2026-08-28-no-rules.md).
+
+    The defect the ban was raised for is a silent drop, not a keyword: a stock
+    runner executes a Rule's nested scenarios and neither lint nor extraction
+    ever saw them (waviisoft/vellum-intent#16). So these check the drop as well
+    as the finding, and keep a tree that merely *says* "Rule:" as the negative
+    control — the lesson GH007 and GH009 both paid for is that a rule keyed on
+    a token faults prose and misses constructs.
+    """
+
+    def setUp(self):
+        self.findings = lint_tree(FIXTURES / "bad-rules")
+
+    def gh010(self):
+        return [f for f in self.findings if f.code == "GH010"]
+
+    def test_a_rule_fails_the_run(self):
+        found = next(f for f in self.gh010() if f.file == "features/nested.md")
+        self.assertIn("Deletion", found.message)
+        self.assertIn("Only admins may delete", found.message)
+        self.assertEqual(run_cli(["lint", str(FIXTURES / "bad-rules")])[0], 1)
+
+    def test_the_finding_points_at_the_rule_not_the_fence(self):
+        found = next(f for f in self.gh010() if f.file == "features/nested.md")
+        self.assertEqual(found.line, 23)
+
+    def test_the_finding_names_how_many_scenarios_are_dropped(self):
+        # The count is the defect: without it the finding reports a style rule,
+        # and with it the finding reports missing coverage.
+        found = next(f for f in self.gh010() if f.file == "features/nested.md")
+        self.assertIn("2 scenario(s)", found.message)
+
+    def test_the_nested_scenarios_really_are_dropped(self):
+        # The oracle for the count above, taken from extraction rather than
+        # from the same code path: the Feature's direct child is described and
+        # the two under the Rule are not.
+        found = scenarios_in_tree(FIXTURES / "bad-rules")
+        ids = {sc.id for sc in found}
+        self.assertIn("rules-direct-child", ids)
+        self.assertNotIn("rules-nested-example", ids)
+        self.assertNotIn("rules-nested-scenario", ids)
+
+    def test_an_empty_rule_is_faulted_before_its_emptiness_matters(self):
+        # The decision calls a Rule with no scenarios moot as an unrunnable
+        # class member, "because the construct fails lint before its emptiness
+        # matters". GH010 fires; GH007 has nothing to say about it.
+        empty = [f for f in self.findings if f.file == "features/empty-rule.md"]
+        self.assertEqual({f.code for f in empty}, {"GH010", "GH002"})
+        self.assertIn("holding no scenarios", next(f for f in empty if f.code == "GH010").message)
+
+    def test_a_rule_absorbs_every_scenario_after_it_not_the_indented_block(self):
+        # Gherkin is not indentation-sensitive: a Rule holds every scenario
+        # until the next Rule or the end of the Feature. So one stray `Rule:`
+        # line above a Feature's existing scenarios takes all of them out of
+        # the suite at once — which is why the finding counts them, and why
+        # this is worse than it looks in a diff. Measured on the real tree:
+        # one inserted line emptied features/repo-topology.md.
+        found = next(f for f in self.gh010() if f.file == "features/absorbs-what-follows.md")
+        self.assertIn("1 scenario(s)", found.message)
+        ids = {sc.id for sc in scenarios_in_tree(FIXTURES / "bad-rules")}
+        self.assertNotIn("rules-absorbed-by-a-rule-above", ids)
+
+    def test_a_rule_written_in_prose_is_not_a_rule(self):
+        # Detected from the parsed node, so a `Rule:` at column zero inside a
+        # docstring — literal text to the parser — and one inside a step's text
+        # are both left alone. A rule matching the token would fault both.
+        self.assertEqual(
+            [f for f in self.findings if f.file == "features/mentions-a-rule.md"], []
+        )
+
+    def test_the_clean_tree_draws_no_rule_finding(self):
+        self.assertEqual([f for f in lint_tree(FIXTURES / "good") if f.code == "GH010"], [])
+
+
 class TestMultiFeatureFences(unittest.TestCase):
     """One Feature per fence (spec/decisions/2026-08-28-one-feature-per-fence.md)."""
 
@@ -353,18 +450,19 @@ class TestPinnedSpecTree(unittest.TestCase):
     """The definition of done: the tree at the pin lints clean."""
 
     def setUp(self):
-        if not pinned_spec_is_checked_out():
-            self.skipTest("spec submodule is not checked out")
+        self.tree = intent_spec_tree()
+        if self.tree is None:
+            self.skipTest("no intent checkout (set VELLUM_INTENT_REPO)")
 
     def test_pinned_spec_lints_clean(self):
-        self.assertEqual(lint_tree(PINNED_SPEC), [])
+        self.assertEqual(lint_tree(intent_checkout()), [])
 
     def test_every_scenario_in_the_pinned_spec_has_an_id(self):
         from vellum.suite import extract
 
-        entries = extract(PINNED_SPEC).entries
-        self.assertGreater(pinned_scenario_count(), 0)
-        self.assertEqual(len(entries), pinned_scenario_count())
+        entries = extract(intent_checkout()).entries
+        self.assertGreater(pinned_scenario_count(self.tree), 0)
+        self.assertEqual(len(entries), pinned_scenario_count(self.tree))
         self.assertTrue(all(e.scenario.id for e in entries))
 
 

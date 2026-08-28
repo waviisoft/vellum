@@ -41,8 +41,12 @@ jobs:
       - name: Check out the spec
         uses: actions/checkout@v4
         with:
-          # Full history and tags: `vellum suite extract` dates each scenario by
-          # walking the spec-v* tags, and a shallow clone has none of them.
+          # Full history: a version is a commit and `vellum suite extract` dates
+          # each scenario by walking main's spec-touching commits, so the
+          # history IS the data. A shallow clone truncates it and re-dates every
+          # scenario below the graft — forward, which is the direction that arms
+          # scenarios the product already satisfies. `suite.json` reports
+          # `shallow: true` when this is wrong; do not rely on it, fetch it all.
           fetch-depth: 0
 
       - name: Set up Python
@@ -59,11 +63,11 @@ jobs:
             exit 1
           fi
 
-      # Checked out rather than pip-installed from the git URL: pip's VCS
-      # install runs `git submodule update --init --recursive`, which tries to
-      # clone the private spec submodule without credentials and fails. The
-      # CLI does not need the spec pin to build; actions/checkout defaults to
-      # no submodules.
+      # Checked out rather than pip-installed from the git URL. This was
+      # originally because pip's VCS install recursively initialized the
+      # private spec submodule and failed; that submodule is gone
+      # (spec/decisions/2026-08-28-pin-file.md), but the checkout stays because
+      # waviisoft/vellum is private and a token has to be supplied either way.
       - name: Check out the vellum CLI
         uses: actions/checkout@v4
         with:
@@ -83,19 +87,29 @@ jobs:
       - name: vellum suite extract
         run: vellum suite extract spec/ --output suite.json
 
+      # "Introduced or changed by this PR" is the set dated at the head being
+      # extracted, not `pending`. Under tags, a scenario no tag carried was
+      # pending and that stood in for "new in this PR"; under ancestry the PR's
+      # own head is a version, so its scenarios are dated at it and `pending`
+      # narrows to genuinely uncommitted content — which on a CI checkout is
+      # nothing. The version comparison is the direct question, and it no
+      # longer quietly includes every merged-but-unnamed commit.
       - name: Summarise the suite
         run: |
           python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
           import json
           suite = json.load(open("suite.json"))
-          pending = [s for s in suite["scenarios"] if s["pending"]]
-          print(f"### Acceptance suite\n")
+          head = suite["spec_version"]
+          changed = [s for s in suite["scenarios"] if s["version"] == head]
+          print("### Acceptance suite\n")
           print(f"- {suite['scenario_count']} scenarios across "
                 f"{len({s['file'] for s in suite['scenarios']})} files")
-          print(f"- {len(pending)} introduced or changed by this PR "
-                f"(would mint spec-v{suite['spec_version']})\n")
-          for s in pending:
+          print(f"- {len(changed)} introduced or changed by this PR\n")
+          for s in changed:
               print(f"  - `{s['id']}`")
+          if suite["shallow"]:
+              print("\n> **Dating is unreliable**: the checkout is shallow, so every")
+              print("> scenario below the graft has been re-dated forward.")
           PY
 
       - name: Upload the suite
@@ -144,8 +158,9 @@ jobs:
 
       # ---- STUB: coverage review (.vellum/agents/spec-reviewer.md, duty 2) ----
       # Real behaviour: every behavioral change carries scenarios that pin it
-      # down. "Be strict enough to be annoying." suite.json's `pending`
-      # scenarios are the changed set this review reasons over.
+      # down. "Be strict enough to be annoying." The changed set this review
+      # reasons over is suite.json's scenarios dated at the PR head, i.e.
+      # `version == spec_version`.
       - name: Coverage review (STUB — always passes)
         run: |
           echo "::warning title=Stub::coverage review is not implemented (v0.2)"
@@ -175,3 +190,4 @@ jobs:
         run: |
           echo "::warning title=Stub::backpressure check is not implemented (v0.2)"
           echo "STUB: would compare spec_head to spec_conformed against divergence_cap"
+          echo "STUB: both are commits now, so 'above/below' is an ancestry test, not arithmetic"

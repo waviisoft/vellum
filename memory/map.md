@@ -7,11 +7,10 @@ notes live in `memory/areas/`; wave worklogs in `memory/waves/`.
 
 | Path | What |
 |---|---|
-| `spec/` | The intent repo, mounted as a git submodule. Read-only here; the gitlink commit is the pin. |
 | `src/vellum/` | The CLI. One module per concern; see `memory/areas/cli.md`. |
 | `tests/` | `unittest` suite plus fixture spec trees under `tests/fixtures/`. |
 | `adapters/github/` | Workflows written **for the intent repo**, ready to copy over. See `memory/areas/adapters-github.md`. |
-| `.vellum/product.yaml` | Backref to the intent repo and the pin. |
+| `.vellum/product.yaml` | Backref to the intent repo, and the pin of record — `pin.commit`. Nothing mounts the intent repo here; CI fetches it, and tests read `VELLUM_INTENT_REPO`. |
 
 ## Areas
 
@@ -24,6 +23,13 @@ notes live in `memory/areas/`; wave worklogs in `memory/waves/`.
 - [`memory/waves/spec-v2.md`](waves/spec-v2.md) — scenarios carry explicit stable ids.
 - [`memory/waves/spec-v3.md`](waves/spec-v3.md) — scenarios are self-contained; Backgrounds banned.
 - [`memory/waves/spec-v6.md`](waves/spec-v6.md) — one Feature per fence; runnable scenarios; the PO/PA/CA hierarchy.
+- [`memory/waves/versions-are-commits.md`](waves/versions-are-commits.md) — versions became commits, the pin became a file, minting shrank, `Rule:` banned.
+
+Worklogs up to `spec-v6.md` are named for the version they landed at. This one
+is named for what it did, because a version's name is decoration now
+(`spec/decisions/2026-08-28-versions-are-commits.md`) and a filename that
+presumes a `spec-vN` the architect has not yet attached would be a name doing
+work. Later waves should follow this one.
 
 ## Technology choice, and why
 

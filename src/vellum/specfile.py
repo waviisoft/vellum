@@ -3,9 +3,11 @@
 A *spec tree* is the directory holding ``index.md``, ``product.md``,
 ``features/``, ``behaviors/`` and ``decisions/``.  ``resolve_spec_root``
 accepts either that directory or the intent-repo root that contains it, so
-``vellum lint spec/`` works both inside the intent repo (where ``spec/`` is
-the tree) and from a product repo (where ``spec/`` is the whole intent repo
-mounted as a submodule and the tree is ``spec/spec/``).
+``vellum lint <path>`` works both inside the intent repo (where ``spec/`` is
+the tree) and against a checkout of the whole intent repo (where the tree is
+one level down). Callers hand it whichever they have — CI points it at the
+checkout it fetched at the pin, a developer at either — and nothing else in
+the codebase may guess which of the two a path is.
 """
 
 from __future__ import annotations
@@ -17,7 +19,11 @@ from pathlib import Path
 import yaml
 
 #: Frontmatter keys, by spec-file kind.  ``decisions/`` files are dated; every
-#: other spec file carries the version it first appeared in.
+#: other spec file carries the version it first appeared in — as a decorative
+#: ``spec-v<N>`` name, which is what the whole tree writes and what
+#: ``spec/index.md`` states. Versions are commits
+#: (spec/decisions/2026-08-28-versions-are-commits.md), but nothing resolves
+#: this field, so a name is the right thing to find here.
 DECISION_KEYS = {"required": ("id", "title", "date"), "optional": ()}
 AREA_KEYS = {"required": ("id", "title", "since"), "optional": ("status",)}
 

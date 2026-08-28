@@ -14,8 +14,8 @@ names a file or symbol you can grep for.
 | `src/vellum/links.py` | `find_references()`, `resolve()`, `heading_anchor()`, `heading_anchors()`. |
 | `src/vellum/lint.py` | `lint_tree()`, `Finding`, the `_check_*` functions. |
 | `src/vellum/suite.py` | `extract()`, `fingerprint()`, `version_history()`, `History`, `to_dict()`. |
-| `src/vellum/gitver.py` | `spec_tags()`, `markdown_at()`, `show()`. All subprocess git lives here. |
-| `src/vellum/ledger.py` | `open_record()`, `advance()`, `dump()`, `RECORD_KEYS`, `ITEM_KEYS`. |
+| `src/vellum/gitver.py` | `spec_commits()`, `names()`, `is_shallow()`, `markdown_at()`, `show()`. All subprocess git lives here. |
+| `src/vellum/ledger.py` | `open_record()`, `advance()`, `find_record()`, `dump()`, `RECORD_KEYS`, `ITEM_KEYS`. |
 
 ## Scenario identity
 
@@ -27,13 +27,40 @@ scenario moving between files keeps its version. Ledger references take the
 form `scenario:<id>` (`scenario_ref()`).
 
 Lint enforces it: `GH005` missing tag, `GH006` malformed or duplicated-on-one-
-scenario, `GH003` id claimed by two scenarios. Three more are unrelated to ids:
+scenario, `GH003` id claimed by two scenarios. Four more are unrelated to ids:
 `GH007`, a `Scenario Outline` with no `Examples` rows, which parses cleanly and
-then never runs; `GH008`, any feature declaring a `Background:`; and `GH009`, a
-second `Feature:` in one fence. `GH003` is checked in
+then never runs; `GH008`, any feature declaring a `Background:`; `GH009`, a
+second `Feature:` in one fence; and `GH010`, any feature declaring a `Rule:`.
+`GH003` is checked in
 `_check_unique_ids()` at the `lint_tree()` level, **not** per file, because ids
 are unique across the whole intent repo — putting that check back inside
 `_check_gherkin()` would silently stop catching the cross-file case.
+
+## Versions are commits
+
+A spec version is a main commit whose diff touches the spec tree
+(`spec/decisions/2026-08-28-versions-are-commits.md`). `spec_commits()` in
+`src/vellum/gitver.py` is `git rev-list --first-parent --reverse <ref> -- <prefix>`
+and `version_history()` walks what it returns. The comparison inside the walk
+did not change at all in the transition — id first, fingerprint as fallback,
+`consumed` to stop cross-assignment. What changed is where the sequence comes
+from, and therefore what can go missing from it.
+
+Three consequences worth holding:
+
+- **`spec_version` is the commit extracted at**, not "the newest version
+  visible". That is the whole fix for the red conformance check on `main`
+  (waviisoft/vellum#4): the tag walker read every `spec-v*` tag *present in the
+  repo*, so a checkout at an older pin was dated by tags it did not contain and
+  the pin assertion failed the moment the intent repo moved ahead — on every
+  branch, including the base. Ancestry cannot do that.
+  `test_dating_reads_the_checkout_ancestry_not_every_ref_in_the_repo` pins it.
+- **`pending` shrank to mean "uncommitted".** Any committed spec change is
+  itself a version, so it needs no tag to become datable. On a CI checkout
+  nothing is pending. "Introduced or changed by this PR" is now
+  `version == spec_version`, which is what `spec-ci.yml` summarises.
+- **"Earliest" is ancestry rank, not `min()`.** Shas do not compare.
+  `History.order` carries the rank, and the fingerprint fallback uses it.
 
 ## Landmines
 
@@ -43,17 +70,24 @@ chain.** Since spec-v4 a fence holds exactly one `Feature:`
 conforming block goes to the official parser whole — `_documents()` in
 `src/vellum/gherkin_blocks.py` tries that first and only falls back to
 `split_documents()` when the parser refuses. Do not follow that through to
-deleting the splitter: `version_history()` reads every `spec-v*` tag, and
-`features/certification-and-releases.md` held two Features in one fence from
-spec-v1 to spec-v5. `scenarios_in()` swallows a parse error, so without the
-splitter that whole fence — all three scenarios, not just the second Feature's
-one — is invisible at every tag before spec-v4, and the three re-date from
-version 1 to version 4, the tag where the split made them readable again.
-Measured, not reasoned: stub `split_documents()` to raise and extract the
-pinned tree. The count stays 20, nothing raises, nothing is pending, and three
-scenarios quietly become three versions younger — which would arm scenarios the
-product already satisfies. `TestBlockSplitting` in `tests/test_suite.py` covers
-the splitter; `TestMultiFeatureFences` in `tests/test_lint.py` covers `GH009`.
+deleting the splitter. **This transferred intact from tags to commits and was
+re-measured, not assumed:** `version_history()` now reads every spec-touching
+*commit*, and `features/certification-and-releases.md` held two Features in one
+fence from the seed commit through `be029e6`. `scenarios_in()` swallows a parse
+error, so without the splitter that whole fence — all three scenarios, not just
+the second Feature's one — is invisible at every commit before `c4307ab`, and
+the three re-date from the seed to `c4307ab`, the commit where the split made
+them readable again.
+
+Re-measured on the real tree during this wave, by stubbing `split_documents()`
+to never split and extracting `main`: count stays 22, nothing raises, nothing is
+pending, and `features/certification-and-releases.md` moves from `bc84e591`
+(spec-v1) to `c4307abe` (spec-v4) — three versions younger, which would arm
+scenarios the product already satisfies. `TestBlockSplitting` in
+`tests/test_suite.py` covers the splitter,
+`test_re_fencing_a_block_did_not_re_date_the_scenarios_in_it` covers the
+consequence against the pinned tree, and `TestMultiFeatureFences` in
+`tests/test_lint.py` covers `GH009`.
 
 **A clean whole-fence parse does not mean one Feature.** The Cucumber parser
 refuses a second `Feature:` only where it reaches one *as a declaration*.
@@ -83,10 +117,18 @@ so it really is a second Feature and `GH009` is right to fault it.
 
 **`<spec-dir>` is two different things.** `resolve_spec_root()` in
 `src/vellum/specfile.py` accepts either the spec tree itself or the intent repo
-that contains it, because a product repo mounts the *whole* intent repo at
-`./spec` — so the tree is at `spec/spec/`, not `spec/`. Both `vellum lint spec/`
-from this repo and `vellum lint spec/` inside the intent repo work. Anything
-walking the tree must go through `resolve_spec_root()` first.
+that contains it — the tree may be at `<path>/spec/`, not `<path>/`. Anything
+walking the tree must go through `resolve_spec_root()` first; `intent_spec_tree()`
+in `tests/support.py` does, rather than appending `spec` itself.
+
+The submodule is gone (`spec/decisions/2026-08-28-pin-file.md`) and the
+ambiguity is not: CI hands the CLI the checkout it fetched, a developer hands
+it either. **The test that covered this went quiet the moment the submodule
+went away** — it was written against `REPO_ROOT / "spec"` and skipped itself
+when that was absent, so removing the submodule silently removed the coverage.
+It now builds a two-level tree in a tempdir and asserts both shapes structurally,
+with the live checkout as a second, skippable case. Any test whose subject is a
+property of the code should not be gated on a property of the environment.
 
 **PyYAML turns an unquoted `2026-08-27` into a `datetime.date`, not a string.**
 Every `decisions/` file in the spec tree has an unquoted date, so a naive
@@ -115,8 +157,8 @@ rewriting `And` as `Given` is presentation while `Given` -> `When` is a change.
 **`version_history()` falls back to fingerprint matching.** A scenario whose id
 is absent from the previous tag — because it has just been given one — is
 matched to an unclaimed scenario with the same fingerprint, which is the only
-reason the spec-v1 scenarios survived the introduction of ids at spec-v2 with
-their versions intact. `_Seen.consumed` stops two new scenarios inheriting from
+reason the seed commit's scenarios survived the introduction of ids at
+`13afa40` with their versions intact. `_Seen.consumed` stops two new scenarios inheriting from
 one old one. Covered by `test_giving_an_existing_scenario_an_id_keeps_its_version`.
 
 **`background_steps` is always empty, and that is deliberate.** Backgrounds are
@@ -130,8 +172,8 @@ a working implementation of a written decision.
 `test_background_steps_would_count_toward_the_fingerprint` pins it directly,
 since no fixture can carry a Background any more.
 
-**Never hard-code any fact about the pinned tree in a test** — not the version,
-not the scenario count, not the file count. Use `pinned_version()`,
+**Never hard-code any fact about the pinned tree in a test** — not the pin, not
+the scenario count, not the file count. Use `pinned_commit()`,
 `pinned_scenario_count()` and `pinned_gherkin_file_count()` in
 `tests/support.py`: the first reads `.vellum/product.yaml`, the same file the
 `conformance` job reads; the other two read the tree itself, counting `@id:`
@@ -139,7 +181,55 @@ tag lines and gherkin fences independently of the extractor they check. A
 hard-coded fact fails on every advance that touches it, which is noise that
 trains people to ignore red. The version bit at spec-v2 -> spec-v3; the counts
 bit at spec-v3 -> spec-v6, when spec-v5 added a twentieth scenario and four
-tests asserting `19` went red at once.
+tests asserting `19` went red at once. The same reasoning is why the pinned
+tests ask ancestry questions ("is every version an ancestor of the pin?",
+"is the seed still the version of something?") rather than naming shas.
+
+**A directory with no git metadata answers for its *parent* repo, silently.**
+One of the failures that cost the submodule its job
+(`spec/decisions/2026-08-28-pin-file.md`), and it bit again the moment the
+gitlink was removed: the leftover empty `spec/` directory made
+`git -C spec rev-parse HEAD` return *this* repo's HEAD, so the intent checkout
+looked present and sat at a commit that was not the pin. `intent_checkout()` in
+`tests/support.py` compares `rev-parse --show-toplevel` against the path itself
+before believing anything else it is told.
+
+**An absent intent checkout skips; a wrong one raises.** `intent_checkout()`
+returns None when nothing is supplied — the ordinary case for the `test` job
+and a fresh clone — and raises `WrongPin` when `VELLUM_INTENT_REPO` (or a
+`./spec` mount) is at some other commit. The distinction is the point: absence
+is a fact about the environment, a wrong commit is a mistake, and skipping past
+it would report conformance against a tree that is not the pinned one. The
+`conformance` job runs the whole suite with the variable set, which is what
+stops the `test` job's eleven skips from being a hole.
+
+**A `Rule:` holds every scenario after it, not the indented block below it.**
+Gherkin is not indentation-sensitive, so a `Rule:` owns every scenario until
+the next Rule or the end of the Feature, whatever the layout suggests. One
+stray `Rule:` line above a Feature's existing scenarios therefore takes all of
+them out of the suite at once. Measured on the real tree while `GH010` was
+written: inserting a single `Rule:` line into `features/repo-topology.md`
+dropped its pre-existing scenario along with the smuggled one, and the finding
+counted two. This is why `GH010`'s message names how many scenarios the Rule
+holds — that count is the defect (waviisoft/vellum-intent#16), not the keyword
+— and why `tests/fixtures/bad-rules/features/absorbs-what-follows.md` exists.
+Detection reads `child["rule"]` from the parsed node, as `GH008` and `GH009` do,
+so a `Rule:` in a docstring or a step's text is left alone; the negative
+control for that is `features/mentions-a-rule.md`.
+
+**The ledger key is the sha, and only the sha.** `find_record()` in
+`src/vellum/ledger.py` locates a record by its `spec_version` field, matching
+sha prefixes in either direction, so an abbreviated `--version` reaches a record
+opened with the full forty and a renamed file is still found. It deliberately
+does **not** match a record whose `spec_version` is a name like `spec-v6`:
+reaching a record by its decoration would be reading a name to decide
+something, which is the practice the versions-are-commits decision removed.
+Consequence, and it is a real one: the intent repo's existing
+`ledger/spec-v1.yaml`..`spec-v11.yaml` are name-keyed and invisible to this CLI
+until someone rewrites their `spec_version` field to the commit sha. That
+migration is the architect's — the ledger lives in the intent repo and is
+written only by automation — and nothing in this repo depends on it, because
+every record `on-spec-merge.yml` writes from now on is sha-keyed.
 
 **Renaming an id over unchanged content keeps the version.** A scenario whose
 id disappears and whose content reappears under a new id is dated by the
@@ -156,10 +246,22 @@ would otherwise yield the fragment `acceptance.`. `find_references()` rstrips
 `.,;:!?` from bare-path fragments only — a markdown link's fragment is
 delimited by `)` and must not be stripped.
 
-**`fetch-depth: 0` is load-bearing.** `version_history()` in
-`src/vellum/suite.py` walks `spec-v*` tags. A shallow clone has no tags, so
-every scenario comes back `pending` at version 1 — wrong, and silently so. Both
-workflows in `adapters/github/` set it.
+**`fetch-depth: 0` is load-bearing, and the failure got quieter.** Under tags a
+shallow clone had none, so every scenario came back `pending` at version 1 —
+wrong, but at least everything was pending. Under ancestry a shallow clone has
+*some* history, so the graft boundary becomes a plausible-looking version and
+every scenario below it re-dates **forward** onto it: right count, nothing
+pending, nothing raised. Measured on the real tree: a `--depth 3` clone dated 21
+of 22 scenarios to `3e28b3b`, which is not even a spec version — it is the
+truncation point. Forward is the dangerous direction, because it arms scenarios
+the product already satisfies.
+
+It cannot be inferred from the walk — a short history and a truncated one look
+identical — so `is_shallow()` in `src/vellum/gitver.py` asks git directly
+(`rev-parse --is-shallow-repository`) and `suite.json` carries `shallow`. All
+three workflows set `fetch-depth: 0`, and the conformance job fails on
+`shallow: true`. Treat the flag as the last line, not the guard.
+`TestShallowHistory` in `tests/test_suite.py` pins it.
 
 **A Gherkin keyword can have a synonym, and the parsed node will not tell you.**
 `GH007` matched the literal string `Scenario Outline`, so an unrunnable
@@ -200,7 +302,22 @@ the unrunnability.
   and a read/write round-trip byte-stable
   (`test_a_record_reread_and_redumped_is_byte_identical`).
 
+**`spec_version` and `spec_head` are different questions.** `spec_version` is
+the commit the suite was extracted at — a checkout's pin, a PR head — and need
+not touch the spec tree at all (the current pin is `9c8b70a`, a ledger commit).
+`spec_head` is the newest commit in that ancestry that *is* a version. CI
+compares the pin against `spec_version`, which is a checkout fact; anything
+asking "what is the newest intent this tree carries" wants `spec_head`.
+
 ## Settled
+
+`spec_tags()` and `BASE_VERSION` are gone from `src/vellum/gitver.py`, and with
+them the idea that a tree can have a version without a commit. `suite.json` is
+schema 2: `version`/`spec_version` are shas, `version_name`/`spec_version_name`
+carry the decoration, `spec_head` is new, `tagged` became `shallow`, and
+`source_commit` is gone because it was always the commit extracted at — which
+is `spec_version`. Anything reading the old integer fields will read a sha, and
+anything reading `tagged` or `source_commit` will read nothing.
 
 The interim Feature+Scenario slug scheme is gone, along with `src/vellum/slug.py`
 which existed to serve it. waviisoft/vellum-intent#2 was answered by

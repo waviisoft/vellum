@@ -6,25 +6,38 @@ intent:
   repo: waviisoft/vellum-intent
   url: https://github.com/waviisoft/vellum-intent
 
-# The pin states conformance. ./spec is the intent repo mounted as a git
-# submodule; the gitlink commit recorded in this repo's tree IS the pin, and
-# advancing it is the closing commit of a wave (spec/features/repo-topology.md).
-# `version` below is the human-readable name of that commit and is checked
-# against it by `vellum lint`'s caller in CI, not by the CLI itself.
+# The pin of record (spec/decisions/2026-08-28-pin-file.md). This file IS the
+# pin: `commit` is the spec version this code implements, and build and CI
+# fetch the spec tree at it. No submodule or subtree is mounted here any more;
+# an installation may keep one as a developer convenience, but nothing treats a
+# gitlink as authoritative and nothing requires one to exist.
+#
+# `name` is decoration (spec/decisions/2026-08-28-versions-are-commits.md).
+# Nothing reads it to decide anything, so it may be absent, late or wrong
+# without changing behavior — a commit that carries no `spec-v*` tag simply has
+# no name. This pin names main's head, which is the ledger commit for spec-v11
+# rather than a spec version itself, so it has none.
+#
+# INTERIM, pending the paired landing (spec/decisions/2026-08-28-paired-landing.md):
+# this wave implements intent main PLUS the approved-unlanded spec PR
+# waviisoft/vellum-intent#20 (the `Rule:` ban, GH010 here). That PR has no
+# merge commit yet, so there is no sha to pin to it. The architect merges #20,
+# then advances this one line to the commit that merge creates, before this
+# repo's implementation lands.
 pin:
-  kind: submodule
-  path: spec
-  version: spec-v6
-  commit: 2906dfb4a92e66e42cf07bd7e7e6e2e72f6dc66b
+  commit: 9c8b70a71089fc8fa6f585ff5f287bb740eff141
+  name: null
 
 # This repo's entry in the intent repo's .vellum/workspace.yaml.
 product:
   name: core
   trees: [src, memory]
 
-# Trees an implementer may write in this repo. harness/, the ledger, and the
-# scenario blocks under spec/ are out of bounds (spec/behaviors/write-boundaries.md);
-# spec/ is a read-only submodule here, so that boundary is a checkout fact.
+# Trees an implementer may write in this repo. harness/ and the ledger are out
+# of bounds (spec/behaviors/write-boundaries.md). The spec tree is no longer a
+# checkout fact here — nothing mounts it — so that boundary is now the plain
+# one it always was for the intent repo: implementers hold no intent-repo
+# credentials (spec/features/repo-topology.md, least authority).
 write_boundaries:
   implementer: [src, tests, memory, adapters, README.md]
 
