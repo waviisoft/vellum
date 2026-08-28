@@ -1,0 +1,6 @@
+# Runtime dependencies. Two, both pure-data libraries, both pinned by range:
+#   PyYAML          - frontmatter and ledger records are YAML; no stdlib parser exists.
+#   gherkin-official - the Cucumber parser itself (decision D5), so lint agrees
+#                      with whatever runs the suite in v0.2.
+PyYAML>=6.0,<7
+gherkin-official>=29,<43
