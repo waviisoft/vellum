@@ -52,6 +52,28 @@ copy instructions.
 
 ## Landmines
 
+**The two copies drift silently; only a `diff` catches it.** `adapters/github/`
+is the upstream copy and is reviewed here, but `waviisoft/vellum-intent`'s
+`.github/workflows/` is what actually runs, and nothing checks that they agree.
+They have already diverged once: the installed copies were edited in place to
+check the CLI out with `VELLUM_TOKEN` and `pip install ./vellum-cli`, and each
+carried an `INSTALLED COPY` header note asking for the fold-back — which then
+sat unfolded while a wave's worth of review happened here against files that
+were not what ran. Folded back now, and the note dropped, so the two sides are
+byte-identical: `diff` them before trusting either. If you must change the
+installed copy first to unbreak CI, fold it back in the same wave.
+
+**The CLI is checked out, not `pip install`ed from its git URL, and that shape
+is load-bearing.** `waviisoft/vellum` is private, so the intent repo's own job
+token cannot read it — hence the `VELLUM_TOKEN` secret, which both workflows
+assert before use so a missing secret fails with a named error instead of an
+opaque pip failure. And it is a checkout rather than `pip install
+"vellum @ git+https://..."` because pip's VCS install runs
+`git submodule update --init --recursive`, which tries to clone the private
+`spec` submodule with no credentials and fails. The CLI does not need the spec
+pin to build, and `actions/checkout` takes no submodules by default. Do not
+"simplify" this back into a one-line pip install.
+
 **The stubs pass vacuously.** Coherence review, coverage review, impact report
 (job `agent-review` in `spec-ci.yml`), the `backpressure` job, and the "Plan the
 wave" step in `on-spec-merge.yml` all `echo` and exit 0. A green `spec-ci` in

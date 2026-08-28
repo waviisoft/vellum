@@ -56,8 +56,30 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Require the VELLUM_TOKEN secret
+        env:
+          VELLUM_TOKEN: ${{ secrets.VELLUM_TOKEN }}
+        run: |
+          if [ -z "$VELLUM_TOKEN" ]; then
+            echo "::error title=Missing secret::VELLUM_TOKEN must hold a token that can read waviisoft/vellum (private), the repo the CLI installs from"
+            exit 1
+          fi
+
+      # Checked out rather than pip-installed from the git URL: pip's VCS
+      # install runs `git submodule update --init --recursive`, which tries to
+      # clone the private spec submodule without credentials and fails. The
+      # CLI does not need the spec pin to build; actions/checkout defaults to
+      # no submodules.
+      - name: Check out the vellum CLI
+        uses: actions/checkout@v4
+        with:
+          repository: waviisoft/vellum
+          ref: ${{ env.VELLUM_REF }}
+          token: ${{ secrets.VELLUM_TOKEN }}
+          path: vellum-cli
+
       - name: Install the vellum CLI
-        run: pip install --quiet "vellum @ git+https://github.com/waviisoft/vellum@${VELLUM_REF}"
+        run: pip install --quiet ./vellum-cli
 
       # Versions are bare monotonic integers (decision D6): the next one is
       # max(existing) + 1, with no semantic arithmetic.
