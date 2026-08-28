@@ -1,9 +1,11 @@
 """``vellum suite extract`` — the acceptance suite for a spec tree.
 
 Walks the tree, collects every fenced Gherkin scenario, and dates each one with
-the spec version that introduced or last changed it. The suite is the contract:
-"product X conforms to spec-vN" is defined as suite@spec-vN passing against a
-deployment of X (``spec/features/scenarios-and-harness.md``).
+the spec version that introduced or last changed it. A version is a commit
+(``spec/decisions/2026-08-28-versions-are-commits.md``), so a scenario's version
+is a sha and "newer" is ancestry. The suite is the contract: "product X conforms
+to spec version C" is defined as suite@C passing against a deployment of X
+(``spec/features/scenarios-and-harness.md``).
 """
 
 from __future__ import annotations
@@ -22,27 +24,35 @@ from vellum.gherkin_blocks import (
     scenario_ref,
 )
 from vellum.gitver import (
-    BASE_VERSION,
     GitUnavailable,
     head_commit,
+    is_shallow,
     markdown_at,
+    names,
     prefix_of,
     repo_root,
     show,
-    spec_tags,
+    spec_commits,
 )
 from vellum.specfile import iter_spec_files, parse_spec_text, resolve_spec_root
 
-SUITE_SCHEMA = 1
+#: 2 since versions became commits: ``version`` and ``spec_version`` are shas
+#: rather than integers, ``version_name``/``spec_version_name`` carry the
+#: decorative names, ``tagged`` became ``shallow``, and ``source_commit`` is
+#: gone — it was always the commit extracted at, which is now ``spec_version``.
+SUITE_SCHEMA = 2
 
 
 @dataclass
 class SuiteEntry:
     scenario: Scenario
     relpath: str
-    version: int
-    #: True when no ``spec-v*`` tag yet contains this scenario — it belongs to
-    #: the version the spec PR under review will mint.
+    #: The commit that introduced or last changed this scenario, or None when
+    #: no commit in the checkout's ancestry carries it.
+    version: str | None
+    #: True when this scenario's content exists only in the working tree — an
+    #: uncommitted spec edit, or a tree with no readable history at all. It has
+    #: no version because the version it will belong to has no sha yet.
     pending: bool
 
     @property
@@ -57,32 +67,47 @@ class SuiteEntry:
 
 @dataclass
 class _Seen:
-    """One scenario as it stood at a tag, while versions are being walked."""
+    """One scenario as it stood at a version, while the history is being walked."""
 
     id: str | None
     fingerprint: str
-    version: int
+    version: str
     consumed: bool = False
 
 
 @dataclass
 class History:
-    """What the ``spec-v*`` tags say about when each scenario last changed."""
+    """What the spec-touching commits say about when each scenario last changed."""
 
-    by_id: dict[str, int] = field(default_factory=dict)
-    #: Fingerprints as of the newest tag. The fallback for a scenario whose id
-    #: the tags do not carry — which is how the 19 scenarios written before
-    #: ids existed keep their version across the change that introduced them.
-    by_fingerprint: dict[str, int] = field(default_factory=dict)
-    latest: int = 0
+    by_id: dict[str, str] = field(default_factory=dict)
+    #: Fingerprints as of the newest version. The fallback for a scenario whose
+    #: id the history does not carry — which is how the 19 scenarios written
+    #: before ids existed keep their version across the change that introduced
+    #: them.
+    by_fingerprint: dict[str, str] = field(default_factory=dict)
+    #: The newest spec version in the walk, or None when the walk was empty.
+    latest: str | None = None
+    #: Ancestry rank per version sha, oldest = 0. Shas do not compare, so this
+    #: is what "earliest" means where the tag-era code could say ``min()``.
+    order: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
 class Suite:
-    spec_version: int
+    #: The version being extracted at: a checkout's pinned commit, or the head
+    #: of the working tree. None when the tree has no readable git history.
+    #: This is the commit of the checkout, which need not itself touch the spec
+    #: tree — a pin may name any commit, and CI compares this against it.
+    spec_version: str | None
+    #: The newest actual spec version in this checkout's ancestry — the commit
+    #: the ledger's ``spec_head`` pointer names when the checkout is main.
+    #: None when the walk found no spec-touching commit.
+    spec_head: str | None = None
     entries: list[SuiteEntry] = field(default_factory=list)
-    source_commit: str | None = None
-    tagged: bool = False
+    #: Decorative names by commit sha, for reporting. Never read for dating.
+    names: dict[str, str] = field(default_factory=dict)
+    #: True when the clone's history is truncated, so dating may be wrong.
+    shallow: bool = False
 
 
 def scenarios_in(relpath: str, text: str) -> list[Scenario]:
@@ -153,33 +178,40 @@ def _scenarios_at(repo: Path, ref: str, prefix: str) -> list[tuple[str | None, s
     return out
 
 
-def version_history(repo: Path, prefix: str) -> History:
-    """Walk the ``spec-v*`` tags, dating each scenario by when it last changed.
+def version_history(repo: Path, prefix: str, ref: str = "HEAD") -> History:
+    """Walk *ref*'s spec versions oldest-first, dating each scenario.
 
     A scenario is matched to its predecessor by id. When the id does not match
-    anything at the previous tag — because the scenario has just been given
+    anything at the previous version — because the scenario has just been given
     one — it falls back to matching an unclaimed scenario with the same
     fingerprint, which is what lets adding an ``@id:`` tag be the presentation
     change the spec says it is rather than a rewrite of the whole suite.
+
+    The walk is over commits rather than ``spec-v*`` tags. The comparison it
+    performs is unchanged; what changed is where the sequence comes from, and
+    so what can go missing from it. A tag registry could lose an entry silently
+    and re-date everything introduced at it; ancestry is the history itself.
     """
-    tags = spec_tags(repo)
-    if not tags:
+    commits = spec_commits(repo, ref, prefix)
+    if not commits:
         return History()
 
-    history = History(latest=tags[-1][0])
+    history = History(
+        latest=commits[-1], order={sha: i for i, sha in enumerate(commits)}
+    )
     previous: list[_Seen] = []
-    for number, tag in tags:
+    for commit in commits:
         by_id = {seen.id: seen for seen in previous if seen.id}
         by_fingerprint: dict[str, list[_Seen]] = {}
         for seen in previous:
             by_fingerprint.setdefault(seen.fingerprint, []).append(seen)
 
         current: list[_Seen] = []
-        for scenario_id, fp in _scenarios_at(repo, tag, prefix):
+        for scenario_id, fp in _scenarios_at(repo, commit, prefix):
             match = by_id.get(scenario_id) if scenario_id else None
             if match is not None and not match.consumed:
                 match.consumed = True
-                version = match.version if match.fingerprint == fp else number
+                version = match.version if match.fingerprint == fp else commit
             else:
                 match = next(
                     (s for s in by_fingerprint.get(fp, []) if not s.consumed), None
@@ -188,7 +220,7 @@ def version_history(repo: Path, prefix: str) -> History:
                     match.consumed = True
                     version = match.version
                 else:
-                    version = number
+                    version = commit
             current.append(_Seen(id=scenario_id, fingerprint=fp, version=version))
 
         previous = current
@@ -198,10 +230,11 @@ def version_history(repo: Path, prefix: str) -> History:
             history.by_id[seen.id] = seen.version
         # Among scenarios sharing content, take the earliest version: that is
         # when the behavior was first specified, and dating a fallback match
-        # too early only leaves it enforced, never wrongly armed.
-        history.by_fingerprint[seen.fingerprint] = min(
-            history.by_fingerprint.get(seen.fingerprint, seen.version), seen.version
-        )
+        # too early only leaves it enforced, never wrongly armed. "Earliest" is
+        # ancestry rank, since two shas do not compare.
+        held = history.by_fingerprint.get(seen.fingerprint)
+        if held is None or history.order[seen.version] < history.order[held]:
+            history.by_fingerprint[seen.fingerprint] = seen.version
     return history
 
 
@@ -209,18 +242,19 @@ def extract(spec_dir: str | Path) -> Suite:
     root = resolve_spec_root(spec_dir)
 
     history = History()
-    commit = None
+    head = None
+    decorations: dict[str, str] = {}
+    shallow = False
     try:
         repo = repo_root(root)
-        history = version_history(repo, prefix_of(repo, root))
-        commit = head_commit(repo)
+        head = head_commit(repo)
+        history = version_history(repo, prefix_of(repo, root), ref=head or "HEAD")
+        decorations = names(repo)
+        shallow = is_shallow(repo)
     except (GitUnavailable, ValueError):
-        # No readable git history: every scenario belongs to the base version.
+        # No readable git history: nothing can be dated, and saying so beats
+        # inventing a version for a tree whose history we cannot see.
         pass
-
-    # A scenario the tags do not yet carry belongs to the version this spec
-    # change will mint — which is what spec CI needs when it runs on a PR.
-    next_version = history.latest + 1 if history.latest else BASE_VERSION
 
     entries: list[SuiteEntry] = []
     for sf in iter_spec_files(root):
@@ -232,20 +266,29 @@ def extract(spec_dir: str | Path) -> Suite:
                 SuiteEntry(
                     scenario=sc,
                     relpath=sf.relpath,
-                    version=version if version is not None else next_version,
+                    version=version,
                     pending=version is None,
                 )
             )
     entries.sort(key=lambda e: (e.relpath, e.scenario.line))
     return Suite(
-        spec_version=(
-            next_version if any(e.pending for e in entries) else history.latest
-        )
-        or BASE_VERSION,
+        spec_version=head,
+        spec_head=history.latest,
         entries=entries,
-        source_commit=commit,
-        tagged=bool(history.latest),
+        names={
+            sha: decorations[sha]
+            for sha in _cited(head, history.latest, entries)
+            if sha in decorations
+        },
+        shallow=shallow,
     )
+
+
+def _cited(head: str | None, spec_head: str | None, entries: list[SuiteEntry]) -> list[str]:
+    """Every sha the suite reports, so only those need a decorative name."""
+    seen = [sha for sha in (head, spec_head) if sha]
+    seen += [e.version for e in entries if e.version]
+    return sorted(set(seen))
 
 
 def to_dict(suite: Suite) -> dict:
@@ -253,8 +296,12 @@ def to_dict(suite: Suite) -> dict:
         "schema": SUITE_SCHEMA,
         "generator": f"vellum {__version__}",
         "spec_version": suite.spec_version,
-        "source_commit": suite.source_commit,
-        "tagged": suite.tagged,
+        # Decoration, emitted so a human reading suite.json sees "spec-v11"
+        # next to the sha. Nothing consumes it.
+        "spec_version_name": suite.names.get(suite.spec_version or ""),
+        "spec_head": suite.spec_head,
+        "spec_head_name": suite.names.get(suite.spec_head or ""),
+        "shallow": suite.shallow,
         "scenario_count": len(suite.entries),
         "scenarios": [
             {
@@ -263,6 +310,7 @@ def to_dict(suite: Suite) -> dict:
                 "file": e.relpath,
                 "line": e.scenario.line,
                 "version": e.version,
+                "version_name": suite.names.get(e.version or ""),
                 "pending": e.pending,
                 "feature": e.scenario.feature,
                 "name": e.scenario.name,

@@ -80,6 +80,25 @@ class Feature:
 
 
 @dataclass
+class Rule:
+    """A ``Rule:`` block. Banned by the spec; lint reports it (GH010).
+
+    ``scenarios`` counts what the Rule holds rather than collecting it. The
+    scenarios under a Rule are not admitted (the construct is banned), and the
+    count exists so the finding can say how much a stock runner would execute
+    that the suite does not describe — which is the defect
+    (waviisoft/vellum-intent#16), not the keyword.
+    """
+
+    feature: str
+    name: str
+    keyword: str
+    #: 1-based line within the spec file.
+    line: int
+    scenarios: int = 0
+
+
+@dataclass
 class Background:
     """A ``Background:`` block. Banned by the spec; lint reports it (GH008)."""
 
@@ -122,6 +141,9 @@ class Block:
     #: Every ``Feature:`` the block declares, in order. A conforming block has
     #: exactly one; lint faults the rest (GH009).
     features: list[Feature] = field(default_factory=list)
+    #: Every ``Rule:`` the block declares. A conforming block has none; lint
+    #: faults each (GH010).
+    rules: list[Rule] = field(default_factory=list)
 
 
 def split_documents(body: str) -> list[tuple[int, str]]:
@@ -264,6 +286,28 @@ def parse_block(body: str, block_body_line: int) -> Block:
         )
         background: list[Step] = []
         for child in feature.get("children", []):
+            if "rule" in child:
+                # Not descended into, deliberately. A Rule is banned
+                # (spec/decisions/2026-08-28-no-rules.md), so its scenarios are
+                # not admitted and lint rejects the construct. The decision
+                # records what changes if the ban is ever lifted: walk them as
+                # first-class, ids required as anywhere, and fold the rule text
+                # into every nested scenario's fingerprint. Reported from the
+                # parsed node, as GH008 and GH009 are — `Rule` localises, and a
+                # rule written in a docstring or a step's text is not one.
+                node = child["rule"]
+                block.rules.append(
+                    Rule(
+                        feature=feature["name"],
+                        name=node["name"],
+                        keyword=node["keyword"].strip(),
+                        line=base + node["location"]["line"] - 1,
+                        scenarios=sum(
+                            1 for c in node.get("children", []) if c.get("scenario")
+                        ),
+                    )
+                )
+                continue
             if "background" in child:
                 node = child["background"]
                 background = _steps(node.get("steps", []))

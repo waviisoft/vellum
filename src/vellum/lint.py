@@ -86,7 +86,13 @@ def _check_frontmatter(sf: SpecFile) -> list[Finding]:
                 sf.relpath,
                 1,
                 "FM004",
-                f"since {fm['since']!r} is not 'spec-v<integer>' (decision D6)",
+                # `since:` carries a decorative version name, not a key. Every
+                # file in the tree says `spec-v1` and spec/index.md states that
+                # convention, so this stays as it is under versions-as-commits:
+                # a name is a legitimate thing to write where nothing resolves
+                # it. (It used to cite decision D6, whose sequence half
+                # 2026-08-28-versions-are-commits.md superseded.)
+                f"since {fm['since']!r} is not 'spec-v<integer>'",
             )
         )
     if "date" in fm and not _is_iso_date(fm["date"]):
@@ -154,6 +160,30 @@ def _check_gherkin(sf: SpecFile) -> tuple[list[Finding], list[Scenario]]:
                     f"feature '{extra.name}' shares a fence with "
                     f"'{block.features[0].name}'; each gherkin fence holds exactly "
                     f"one Gherkin document, so give each Feature its own fence",
+                )
+            )
+        # Rule text is shared meaning hovering over every scenario nested under
+        # it, so a nested scenario does not travel alone — the same reason
+        # Backgrounds are banned (spec/decisions/2026-08-28-no-rules.md). The
+        # concrete harm is the silent drop the ban was raised for
+        # (waviisoft/vellum-intent#16): nothing here walks a Rule's children, so
+        # a stock runner would execute scenarios the suite does not describe.
+        # The finding names how many, because that count is the defect.
+        for rule in block.rules:
+            held = (
+                f"holding {rule.scenarios} scenario(s) that no suite describes"
+                if rule.scenarios
+                else "holding no scenarios"
+            )
+            findings.append(
+                Finding(
+                    sf.relpath,
+                    rule.line,
+                    "GH010",
+                    f"feature '{rule.feature}' declares a {rule.keyword} "
+                    f"('{rule.name}') {held}; scenarios are a Feature's direct "
+                    f"children, so lift them out and put the shared framing in "
+                    f"the section's prose",
                 )
             )
         # A scenario is a contract unit that travels alone: briefings quote it,

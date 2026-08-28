@@ -1,8 +1,14 @@
 """``vellum ledger open|advance`` — the per-version traceability records.
 
-One YAML record per spec version, written only by automation
-(``spec/features/ledger.md``). Records advance state in place; history is git,
-so the file is append-only in effect rather than by construction.
+One YAML record per spec version, keyed by the version's commit sha and written
+only by automation (``spec/features/ledger.md``). Records advance state in
+place; history is git, so the file is append-only in effect rather than by
+construction.
+
+The key is the sha and only the sha. A record may also carry a decorative
+``name`` (``spec-vN``), which is written and displayed and never read to find,
+match or order anything (``spec/decisions/2026-08-28-versions-are-commits.md``)
+— so a record whose name is missing, late or wrong still resolves.
 
 Records are emitted in block style with a fixed key order, so that advancing a
 state produces a one-line diff and a read/write round-trip is byte-stable.
@@ -16,7 +22,9 @@ from pathlib import Path
 
 import yaml
 
-VERSION_RE = re.compile(r"^(?:spec-v)?(\d+)$")
+#: A spec version is a commit. Abbreviations are accepted because a human
+#: types them; git's own 7-character floor is the floor here too.
+SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 
 RECORD_STATES = (
     "approved",
@@ -33,6 +41,7 @@ ITEM_STATES = ("planned", "implementing", "merged", "superseded")
 #: with their defaults so activating them later is implementation, not migration.
 RECORD_KEYS = (
     "spec_version",
+    "name",
     "approved",
     "spec_pr",
     "line",
@@ -51,19 +60,64 @@ class LedgerError(Exception):
     """A ledger operation could not be completed."""
 
 
-def parse_version(value: str | int) -> int:
-    m = VERSION_RE.match(str(value).strip())
-    if not m:
-        raise LedgerError(f"{value!r} is not a spec version (expected N or spec-vN)")
-    return int(m.group(1))
+def parse_version(value: str) -> str:
+    """A spec version is a commit sha (``spec/decisions/2026-08-28-versions-are-commits.md``)."""
+    sha = str(value).strip().lower()
+    if not SHA_RE.match(sha):
+        raise LedgerError(
+            f"{value!r} is not a spec version (expected a commit sha). "
+            f"Versions stopped being integers when they became commits."
+        )
+    return sha
 
 
-def version_tag(number: int) -> str:
-    return f"spec-v{number}"
+def record_path(ledger_dir: str | Path, sha: str) -> Path:
+    """Where a record for *sha* is written. The filename is the key."""
+    return Path(ledger_dir) / f"{sha}.yaml"
 
 
-def record_path(ledger_dir: str | Path, number: int) -> Path:
-    return Path(ledger_dir) / f"{version_tag(number)}.yaml"
+def find_record(ledger_dir: str | Path, sha: str) -> Path | None:
+    """The existing record for *sha*, whatever its filename, or None.
+
+    The filename is where a record is *written*; what identifies one is the
+    ``spec_version`` field, so a record renamed by hand — or written under a
+    fuller or shorter sha than the caller has — is still found. Matching is by
+    sha prefix in either direction, which is what makes ``vellum ledger advance
+    --version 9c8b70a`` reach the record opened with the full forty.
+
+    Raises ``LedgerError`` when the abbreviation reaches more than one record.
+    An abbreviation is a convenience for a human typing, and the convenience
+    ends where it stops naming one version: picking the first match in filename
+    order would advance the state of *a* record, plausibly the wrong one, and
+    say nothing. The caller is told which records it reached and types more of
+    the sha. (An exact filename hit short-circuits above and is never
+    ambiguous.)
+    """
+    sha = str(sha).strip().lower()
+    direct = record_path(ledger_dir, sha)
+    if direct.exists():
+        return direct
+    directory = Path(ledger_dir)
+    if not directory.is_dir():
+        return None
+    matches: list[tuple[Path, str]] = []
+    for path in sorted(directory.glob("*.yaml")):
+        try:
+            recorded = str(yaml.safe_load(path.read_text(encoding="utf-8"))["spec_version"])
+        except (OSError, yaml.YAMLError, KeyError, TypeError):
+            continue
+        recorded = recorded.strip().lower()
+        if not SHA_RE.match(recorded):
+            continue
+        if recorded.startswith(sha) or sha.startswith(recorded):
+            matches.append((path, recorded))
+    if len(matches) > 1:
+        candidates = ", ".join(f"{recorded} ({path.name})" for path, recorded in matches)
+        raise LedgerError(
+            f"{sha!r} is ambiguous: it matches {len(matches)} ledger records "
+            f"— {candidates}. Give more of the sha."
+        )
+    return matches[0][0] if matches else None
 
 
 def _now() -> str:
@@ -82,19 +136,21 @@ def new_cost() -> dict:
 
 
 def new_record(
-    number: int,
+    sha: str,
     spec_pr: int | None = None,
-    baseline: int | None = None,
+    baseline: str | None = None,
     labels: list[str] | None = None,
     line: str = "main",
     approved: str | None = None,
+    name: str | None = None,
 ) -> dict:
     return {
-        "spec_version": version_tag(number),
+        "spec_version": sha,
+        "name": name,
         "approved": approved or _now(),
         "spec_pr": spec_pr,
         "line": line,
-        "baseline": version_tag(baseline) if baseline is not None else None,
+        "baseline": baseline,
         "labels": list(labels or []),
         "state": "approved",
         "locks": [],
@@ -149,23 +205,27 @@ def write(path: Path, record: dict) -> None:
 
 def open_record(
     ledger_dir: str | Path,
-    number: int,
+    sha: str,
     spec_pr: int | None = None,
-    baseline: int | None = None,
+    baseline: str | None = None,
     labels: list[str] | None = None,
     line: str = "main",
     approved: str | None = None,
+    name: str | None = None,
 ) -> tuple[Path, bool]:
-    """Create the record for *number*. Idempotent: an existing one is left alone.
+    """Create the record for *sha*. Idempotent: an existing one is left alone.
 
     Returns ``(path, created)``. Idempotence matters because the reconciler may
     replay an approval (decision D11): a second call must not rewrite a record
-    whose wave has already advanced.
+    whose wave has already advanced. It is also the whole replay guard the
+    minting workflow needs now that there is no version to arithmetic and no
+    tag to check — the record either exists for this commit or it does not.
     """
-    path = record_path(ledger_dir, number)
-    if path.exists():
-        return path, False
-    write(path, new_record(number, spec_pr, baseline, labels, line, approved))
+    existing = find_record(ledger_dir, sha)
+    if existing is not None:
+        return existing, False
+    path = record_path(ledger_dir, sha)
+    write(path, new_record(sha, spec_pr, baseline, labels, line, approved, name))
     return path, True
 
 
@@ -177,7 +237,7 @@ def find_item(record: dict, issue: int) -> dict | None:
 
 def advance(
     ledger_dir: str | Path,
-    number: int,
+    sha: str,
     state: str | None = None,
     release: str | None = None,
     plan: list[dict] | None = None,
@@ -200,9 +260,11 @@ def advance(
     to what is there rather than replacing it. ``--executor`` names the most
     recent one.
     """
-    path = record_path(ledger_dir, number)
-    if not path.exists():
-        raise LedgerError(f"{path}: no ledger record for {version_tag(number)}; open it first")
+    path = find_record(ledger_dir, sha)
+    if path is None:
+        raise LedgerError(
+            f"{record_path(ledger_dir, sha)}: no ledger record for {sha}; open it first"
+        )
     record = load(path)
 
     if state is not None:

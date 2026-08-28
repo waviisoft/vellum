@@ -7,13 +7,15 @@ from pathlib import Path
 
 from support import (
     FIXTURES,
-    PINNED_SPEC,
     commit_area,
+    commit_elsewhere,
+    git,
+    intent_checkout,
+    intent_spec_tree,
     make_spec_repo,
+    pinned_commit,
     pinned_gherkin_file_count,
     pinned_scenario_count,
-    pinned_spec_is_checked_out,
-    pinned_version,
     write_area,
 )
 from vellum.gherkin_blocks import Step, parse_block, split_documents
@@ -205,13 +207,18 @@ class TestFingerprint(unittest.TestCase):
                 "    Examples:\n      | n |\n      | 1 |")
         self.assertNotEqual(self.fp(base), self.fp(base.replace("| 1 |", "| 2 |")))
 
-
 def wrap(block):
     return f"---\nid: a\ntitle: A\nsince: spec-v1\n---\n\n```gherkin\n{block}\n```\n"
 
 
 class TestVersionDerivation(unittest.TestCase):
-    """Each scenario carries the version that introduced or last changed it."""
+    """Each scenario carries the commit that introduced or last changed it.
+
+    A version is a main commit whose diff touches the spec tree
+    (``spec/decisions/2026-08-28-versions-are-commits.md``), so these assert
+    against the shas ``commit_area`` returns. Where a test names a ``spec-v*``
+    tag it is checking the decoration itself; nothing here dates by one.
+    """
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -224,78 +231,143 @@ class TestVersionDerivation(unittest.TestCase):
             for e in extract(self.repo / "spec").entries
         }
 
-    def test_untagged_tree_is_version_one(self):
-        commit_area(self.repo, ONE)
-        self.assertEqual(self.versions(), {"login-good-password": (1, True)})
+    def test_a_committed_tree_dates_from_its_commit(self):
+        # No tag anywhere, and the scenario is still dated and not pending:
+        # the commit is the version, so there is nothing left to be missing.
+        first = commit_area(self.repo, ONE)
+        self.assertEqual(self.versions(), {"login-good-password": (first, False)})
 
     def test_scenario_keeps_the_version_that_introduced_it(self):
-        commit_area(self.repo, ONE, "spec-v1")
-        commit_area(self.repo, TWO, "spec-v2")
-        self.assertEqual(self.versions()["login-good-password"], (1, False))
+        first = commit_area(self.repo, ONE)
+        commit_area(self.repo, TWO)
+        self.assertEqual(self.versions()["login-good-password"], (first, False))
 
     def test_scenario_added_later_carries_the_later_version(self):
-        commit_area(self.repo, ONE, "spec-v1")
-        commit_area(self.repo, TWO, "spec-v2")
-        self.assertEqual(self.versions()["login-bad-password"], (2, False))
+        commit_area(self.repo, ONE)
+        second = commit_area(self.repo, TWO)
+        self.assertEqual(self.versions()["login-bad-password"], (second, False))
 
     def test_changed_scenario_advances_to_the_version_that_changed_it(self):
-        commit_area(self.repo, ONE, "spec-v1")
-        commit_area(self.repo, TWO, "spec-v2")
-        commit_area(self.repo, TWO_CHANGED, "spec-v3")
+        commit_area(self.repo, ONE)
+        second = commit_area(self.repo, TWO)
+        third = commit_area(self.repo, TWO_CHANGED)
         found = self.versions()
-        self.assertEqual(found["login-good-password"], (3, False))
-        self.assertEqual(found["login-bad-password"], (2, False))
+        self.assertEqual(found["login-good-password"], (third, False))
+        self.assertEqual(found["login-bad-password"], (second, False))
 
-    def test_untagged_working_tree_scenario_takes_the_version_it_would_mint(self):
-        # This is spec CI on a PR: the tag does not exist yet.
-        commit_area(self.repo, ONE, "spec-v1")
-        commit_area(self.repo, TWO, "spec-v2")
+    def test_an_uncommitted_scenario_is_pending_with_no_version(self):
+        # Spec CI on a working tree: the version this will belong to has no sha
+        # yet, so there is nothing honest to report but None. Under tags this
+        # said "latest + 1"; an integer could be predicted and a sha cannot.
+        commit_area(self.repo, ONE)
+        commit_area(self.repo, TWO)
         write_area(
             self.repo,
             TWO + "\n\n  @id:login-locked-out\n  Scenario: Locked out\n"
                   "    Given five failures\n    Then they are locked",
         )
-        self.assertEqual(self.versions()["login-locked-out"], (3, True))
+        self.assertEqual(self.versions()["login-locked-out"], (None, True))
+
+    def test_committing_that_scenario_dates_it_at_that_commit(self):
+        # The other half of the pending case, and the reason pending shrank:
+        # any committed spec change is itself a version, so it needs no tag to
+        # become datable.
+        commit_area(self.repo, ONE)
+        third = commit_area(self.repo, TWO)
+        self.assertEqual(self.versions()["login-bad-password"], (third, False))
+
+    def test_a_commit_that_does_not_touch_the_spec_tree_is_not_a_version(self):
+        first = commit_area(self.repo, ONE)
+        commit_elsewhere(self.repo)
+        # The scenario is still dated at the spec commit, not at the head.
+        self.assertEqual(self.versions()["login-good-password"], (first, False))
+
+    def test_dating_reads_the_checkout_ancestry_not_every_ref_in_the_repo(self):
+        # The tag walker read "every spec-v* tag present", so a repo that had
+        # moved ahead of the checkout dated scenarios by tags the checkout did
+        # not contain — which is what failed the conformance check on main
+        # (waviisoft/vellum#4). Ancestry cannot: a commit that is not an
+        # ancestor of HEAD is not a version this tree has.
+        first = commit_area(self.repo, ONE, "spec-v1")
+        commit_area(self.repo, TWO_CHANGED, "spec-v2")
+        git(self.repo, "checkout", "-q", first)
+        suite = extract(self.repo / "spec")
+        self.assertEqual(suite.spec_version, first)
+        self.assertEqual(suite.spec_head, first)
+        self.assertEqual({e.version for e in suite.entries}, {first})
+        self.assertFalse(any(e.pending for e in suite.entries))
+
+    def test_a_version_is_the_same_read_from_any_descendant(self):
+        # `@id:scenario-version-tagging` says the suite may be extracted "at
+        # that version or any descendant" and the scenario still carries the
+        # commit that introduced it. Asserted across every later version rather
+        # than just the next one.
+        first = commit_area(self.repo, ONE)
+        later = [commit_area(self.repo, TWO), commit_area(self.repo, TWO_CHANGED)]
+        later.append(commit_elsewhere(self.repo))
+        for descendant in later:
+            git(self.repo, "checkout", "-q", descendant)
+            found = {
+                (e.scenario.id): e.version
+                for e in extract(self.repo / "spec").entries
+            }
+            self.assertEqual(
+                found["login-bad-password"], later[0], f"read from {descendant[:8]}"
+            )
+        # And at the introducing version itself.
+        git(self.repo, "checkout", "-q", first)
+        self.assertEqual(self.versions()["login-good-password"], (first, False))
 
     def test_renaming_a_scenario_keeps_its_version(self):
-        commit_area(self.repo, ONE, "spec-v1")
-        commit_area(self.repo, ONE.replace("Good password", "Correct password"), "spec-v2")
-        self.assertEqual(self.versions()["login-good-password"], (1, False))
+        first = commit_area(self.repo, ONE)
+        commit_area(self.repo, ONE.replace("Good password", "Correct password"))
+        self.assertEqual(self.versions()["login-good-password"], (first, False))
 
     def test_giving_an_existing_scenario_an_id_keeps_its_version(self):
         # The spec-v1 -> spec-v2 migration: nineteen scenarios gained @id: tags
         # and none of them changed. Matching falls back to the fingerprint.
-        commit_area(self.repo, TWO_WITHOUT_IDS, "spec-v1")
-        commit_area(self.repo, TWO, "spec-v2")
+        first = commit_area(self.repo, TWO_WITHOUT_IDS)
+        commit_area(self.repo, TWO)
         self.assertEqual(
             self.versions(),
-            {"login-good-password": (1, False), "login-bad-password": (1, False)},
+            {"login-good-password": (first, False), "login-bad-password": (first, False)},
         )
 
     def test_identical_content_under_different_ids_does_not_cross_assign(self):
         # Two scenarios with the same steps; only one of them changes.
         both = ("Feature: F\n  @id:alpha\n  Scenario: A\n    Given a\n    Then b\n\n"
                 "  @id:beta\n  Scenario: B\n    Given a\n    Then b")
-        commit_area(self.repo, both, "spec-v1")
-        commit_area(self.repo, both.replace("Then b\n\n  @id:beta", "Then c\n\n  @id:beta"), "spec-v2")
-        self.assertEqual(self.versions(), {"alpha": (2, False), "beta": (1, False)})
+        first = commit_area(self.repo, both)
+        second = commit_area(
+            self.repo, both.replace("Then b\n\n  @id:beta", "Then c\n\n  @id:beta")
+        )
+        self.assertEqual(self.versions(), {"alpha": (second, False), "beta": (first, False)})
 
     def test_renaming_an_id_over_unchanged_content_keeps_the_version(self):
         # Consequence of the spec's own rule: "changed" is the fingerprint, and
-        # this content was already specified at spec-v1, so nothing is re-armed.
+        # this content was already specified at the first commit, so nothing is
+        # re-armed.
         one = "Feature: F\n  @id:one\n  Scenario: S\n    Given a\n    Then b"
-        commit_area(self.repo, one, "spec-v1")
-        commit_area(self.repo, one.replace("@id:one", "@id:two"), "spec-v2")
-        self.assertEqual(self.versions(), {"two": (1, False)})
+        first = commit_area(self.repo, one)
+        commit_area(self.repo, one.replace("@id:one", "@id:two"))
+        self.assertEqual(self.versions(), {"two": (first, False)})
 
-    def test_a_tree_that_did_not_exist_at_an_older_tag_is_dated_correctly(self):
-        commit_area(self.repo, ONE, "spec-v1")
-        commit_area(self.repo, TWO, "spec-v2")
-        self.assertEqual(self.versions()["login-bad-password"], (2, False))
+    def test_the_earliest_version_wins_among_identical_content(self):
+        # Shas do not compare, so "earliest" is ancestry rank. Dating a
+        # fallback match too early leaves it enforced; too late would arm a
+        # scenario the product already satisfies.
+        one = "Feature: F\n  @id:one\n  Scenario: S\n    Given a\n    Then b"
+        first = commit_area(self.repo, one)
+        commit_area(
+            self.repo,
+            one + "\n\n  @id:two\n  Scenario: T\n    Given a\n    Then b",
+        )
+        commit_area(self.repo, one.replace("@id:one", "@id:three"))
+        self.assertEqual(self.versions()["three"], (first, False))
 
     def test_a_scenario_moving_between_files_keeps_its_version(self):
         # Identity is the id; the file is only its current home.
-        commit_area(self.repo, TWO, "spec-v1")
+        first = commit_area(self.repo, TWO)
         second = self.repo / "spec" / "features" / "moved.md"
         from support import AREA_TEMPLATE
 
@@ -307,15 +379,26 @@ class TestVersionDerivation(unittest.TestCase):
         )
         self.addCleanup(second.unlink, missing_ok=True)
         found = self.versions()
-        self.assertEqual(found["login-bad-password"], (1, False))
+        self.assertEqual(found["login-bad-password"], (first, False))
 
-    def test_suite_records_the_commit_it_was_extracted_from(self):
-        commit_area(self.repo, ONE, "spec-v1")
+    def test_the_suite_is_extracted_at_the_checkouts_commit(self):
+        head = commit_area(self.repo, ONE)
         suite = extract(self.repo / "spec")
-        self.assertTrue(suite.tagged)
-        self.assertRegex(suite.source_commit, r"^[0-9a-f]{40}$")
+        self.assertEqual(suite.spec_version, head)
+        self.assertRegex(suite.spec_version, r"^[0-9a-f]{40}$")
+        self.assertFalse(suite.shallow)
 
-    def test_tree_outside_git_falls_back_to_the_base_version(self):
+    def test_spec_head_is_the_newest_version_not_the_checkout_head(self):
+        spec_change = commit_area(self.repo, ONE)
+        other = commit_elsewhere(self.repo)
+        suite = extract(self.repo / "spec")
+        self.assertEqual(suite.spec_version, other)
+        self.assertEqual(suite.spec_head, spec_change)
+
+    def test_tree_outside_git_dates_nothing(self):
+        # There is no base version to fall back to any more: a version is a
+        # commit, and a tree with no history has none. Saying so beats
+        # inventing one.
         with tempfile.TemporaryDirectory() as plain:
             root = Path(plain) / "spec"
             (root / "features").mkdir(parents=True)
@@ -323,7 +406,71 @@ class TestVersionDerivation(unittest.TestCase):
                 "---\nid: index\ntitle: I\nsince: spec-v1\n---\n\nfeatures/auth.md\n"
             )
             (root / "features" / "auth.md").write_text(wrap(ONE))
-            self.assertEqual([e.version for e in extract(root).entries], [1])
+            suite = extract(root)
+            self.assertIsNone(suite.spec_version)
+            self.assertEqual([(e.version, e.pending) for e in suite.entries], [(None, True)])
+
+
+class TestDecorativeNames(unittest.TestCase):
+    """Names are reported, never read. A missing one changes no version."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = make_spec_repo(Path(self.tmp.name))
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_a_name_is_reported_alongside_the_sha(self):
+        first = commit_area(self.repo, ONE, "spec-v1")
+        suite = to_dict(extract(self.repo / "spec"))
+        self.assertEqual(suite["spec_version"], first)
+        self.assertEqual(suite["spec_version_name"], "spec-v1")
+        self.assertEqual(suite["scenarios"][0]["version_name"], "spec-v1")
+
+    def test_dropping_every_name_changes_no_version(self):
+        # The tag-era failure mode, asserted absent: a missing, late or wrong
+        # name breaks nothing, because nothing reads one.
+        commit_area(self.repo, ONE, "spec-v1")
+        commit_area(self.repo, TWO, "spec-v2")
+        with_names = to_dict(extract(self.repo / "spec"))
+        git(self.repo, "tag", "-d", "spec-v1")
+        git(self.repo, "tag", "-d", "spec-v2")
+        without = to_dict(extract(self.repo / "spec"))
+        self.assertEqual(
+            [s["version"] for s in with_names["scenarios"]],
+            [s["version"] for s in without["scenarios"]],
+        )
+        self.assertEqual(without["spec_version_name"], None)
+        self.assertEqual(with_names["spec_version_name"], "spec-v2")
+
+    def test_a_wrong_name_changes_no_version(self):
+        # Out-of-order naming re-dated everything under the tag walker; here it
+        # only mislabels the report.
+        first = commit_area(self.repo, ONE, "spec-v9")
+        second = commit_area(self.repo, TWO, "spec-v2")
+        suite = to_dict(extract(self.repo / "spec"))
+        by_id = {s["id"]: s for s in suite["scenarios"]}
+        self.assertEqual(by_id["login-good-password"]["version"], first)
+        self.assertEqual(by_id["login-bad-password"]["version"], second)
+
+
+class TestShallowHistory(unittest.TestCase):
+    """Truncated history is the one way ancestry dating still goes wrong."""
+
+    def test_a_shallow_clone_is_reported_as_such(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            origin = make_spec_repo(Path(tmp) / "origin")
+            commit_area(origin, ONE)
+            newest = commit_area(origin, TWO_CHANGED)
+            clone = Path(tmp) / "clone"
+            git(Path(tmp), "clone", "-q", "--depth", "1", f"file://{origin}", str(clone))
+            suite = extract(clone / "spec")
+            # The dating is wrong in the dangerous direction — the older
+            # scenario re-dates forward to the graft — and nothing is pending,
+            # so the flag is the only signal there is.
+            self.assertTrue(suite.shallow)
+            self.assertEqual({e.version for e in suite.entries}, {newest})
+            self.assertFalse(any(e.pending for e in suite.entries))
+            self.assertFalse(extract(origin / "spec").shallow)
 
 
 class TestPinnedSpecTree(unittest.TestCase):
@@ -331,47 +478,79 @@ class TestPinnedSpecTree(unittest.TestCase):
 
     Nothing here hard-codes a count. A count is a fact about the pinned tree,
     so it goes stale on the next wave whose spec adds a scenario, exactly the
-    way a hard-coded version goes stale on the next pin advance — and a test
-    that fails on every advance is noise that trains people to ignore red. The
-    oracles in ``support`` read the tree instead.
+    way a hard-coded pin goes stale on the next advance — and a test that fails
+    on every advance is noise that trains people to ignore red. The oracles in
+    ``support`` read the tree instead.
+
+    The tree comes from ``VELLUM_INTENT_REPO`` (or a ``./spec`` mount): the pin
+    of record is a file now and nothing checks the intent repo out for us.
     """
 
     def setUp(self):
-        if not pinned_spec_is_checked_out():
-            self.skipTest("spec submodule is not checked out")
-        self.suite = to_dict(extract(PINNED_SPEC))
+        self.tree = intent_spec_tree()
+        if self.tree is None:
+            self.skipTest("no intent checkout (set VELLUM_INTENT_REPO)")
+        self.suite = to_dict(extract(intent_checkout()))
 
-    def test_every_tagged_scenario_in_the_tree_is_extracted(self):
+    def test_every_scenario_in_the_tree_is_extracted(self):
         # Asserted non-zero first: an oracle that silently found nothing would
         # otherwise agree with an extractor that silently found nothing.
-        self.assertGreater(pinned_scenario_count(), 0)
-        self.assertEqual(self.suite["scenario_count"], pinned_scenario_count())
+        self.assertGreater(pinned_scenario_count(self.tree), 0)
+        self.assertEqual(
+            self.suite["scenario_count"], pinned_scenario_count(self.tree)
+        )
 
-    def test_no_scenario_is_dated_past_the_pin(self):
+    def test_every_version_is_an_ancestor_of_the_pin(self):
+        # "Dated past the pin" is an ancestry question now. A version that is
+        # not an ancestor of the checkout could not have been read from it.
+        pin = pinned_commit()
+        for s in self.suite["scenarios"]:
+            self.assertIsNotNone(s["version"], s["id"])
+            self.assertEqual(
+                0,
+                __import__("subprocess").run(
+                    ["git", "-C", str(intent_checkout()), "merge-base",
+                     "--is-ancestor", s["version"], pin],
+                ).returncode,
+                f"{s['id']} is dated at {s['version'][:12]}, not an ancestor of the pin",
+            )
+
+    def test_the_oldest_scenarios_are_still_at_the_seed_version(self):
+        # spec-v2 only added @id: tags and spec-v4 only re-fenced a block, both
+        # presentation changes the fingerprint deliberately ignores. So the
+        # seed commit must still be the version of something.
         versions = {s["version"] for s in self.suite["scenarios"]}
-        self.assertLessEqual(max(versions), pinned_version())
-        # The spec-v1 tree is still at version 1: spec-v2 only added @id: tags
-        # and spec-v4 only re-fenced a block, both presentation changes that
-        # the fingerprint deliberately ignores.
-        self.assertEqual(min(versions), 1)
+        seed = __import__("subprocess").run(
+            ["git", "-C", str(intent_checkout()), "rev-list", "--first-parent",
+             "--reverse", pinned_commit(), "--", "spec"],
+            capture_output=True, text=True, check=True,
+        ).stdout.split("\n")[0].strip()
+        self.assertIn(seed, versions)
 
     def test_re_fencing_a_block_did_not_re_date_the_scenarios_in_it(self):
         # spec-v4 split certification-and-releases.md into two fences, and the
         # decision behind it claims that "splitting a fence moves no version
         # and re-dates no scenario". This is that claim, asserted. It is also
-        # the guard on the splitter: reading those older tags is the only
-        # reason the three scenarios here are still dated 1 rather than 4, and
-        # the failure if it goes is silent — right count, nothing pending.
+        # the guard on the splitter: reading those older *commits* is the only
+        # reason the three scenarios here are still dated at the seed rather
+        # than at the re-fencing, and the failure if it goes is silent — right
+        # count, nothing pending.
+        seed = __import__("subprocess").run(
+            ["git", "-C", str(intent_checkout()), "rev-list", "--first-parent",
+             "--reverse", pinned_commit(), "--", "spec"],
+            capture_output=True, text=True, check=True,
+        ).stdout.split("\n")[0].strip()
         refenced = {
             s["version"]
             for s in self.suite["scenarios"]
             if s["file"] == "features/certification-and-releases.md"
         }
-        self.assertEqual(refenced, {1})
+        self.assertEqual(refenced, {seed})
 
-    def test_the_suite_is_extracted_at_the_pinned_version(self):
-        self.assertEqual(self.suite["spec_version"], pinned_version())
+    def test_the_suite_is_extracted_at_the_pin(self):
+        self.assertEqual(self.suite["spec_version"], pinned_commit())
         self.assertFalse(any(s["pending"] for s in self.suite["scenarios"]))
+        self.assertFalse(self.suite["shallow"])
 
     def test_every_scenario_has_a_unique_id_and_a_ledger_ref(self):
         ids = [s["id"] for s in self.suite["scenarios"]]
@@ -381,10 +560,10 @@ class TestPinnedSpecTree(unittest.TestCase):
             self.assertEqual(s["ref"], f"scenario:{s['id']}")
 
     def test_every_spec_file_with_a_gherkin_block_is_represented(self):
-        self.assertGreater(pinned_gherkin_file_count(), 0)
+        self.assertGreater(pinned_gherkin_file_count(self.tree), 0)
         self.assertEqual(
             len({s["file"] for s in self.suite["scenarios"]}),
-            pinned_gherkin_file_count(),
+            pinned_gherkin_file_count(self.tree),
         )
 
     def test_suite_is_json_serialisable(self):

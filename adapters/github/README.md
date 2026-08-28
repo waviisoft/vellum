@@ -17,8 +17,8 @@ been edited in place and the other has not.
 
 | File | Trigger | Does |
 |---|---|---|
-| `spec-ci.yml` | `pull_request` touching `spec/**` | `vellum lint` + `vellum suite extract`, uploads `suite.json`, summarises the scenarios the PR would mint. Three agent reviews and the backpressure check are stubs. |
-| `on-spec-merge.yml` | `push` to `main` touching `spec/**` | Mints the next integer tag, opens the ledger record, extracts the suite, files work-item issues from `workplan.yaml`, commits the record. The planner is a stub. |
+| `spec-ci.yml` | `pull_request` touching `spec/**` | `vellum lint` + `vellum suite extract`, uploads `suite.json`, summarises the scenarios the PR introduces or changes. Three agent reviews and the backpressure check are stubs. |
+| `on-spec-merge.yml` | `push` to `main` touching `spec/**` | Opens the ledger record for the merge commit, attaches a decorative name tag, extracts the suite, files work-item issues from `workplan.yaml`, commits the record. The planner is a stub. |
 
 ## What is real and what is not
 
@@ -31,8 +31,13 @@ not evidence that a spec change was reviewed for coherence, coverage or impact.
 Real in v0.1:
 
 - lint and suite extraction, and their non-zero exit codes blocking a merge
-- next-integer version minting, including the "already tagged" replay guard
-- opening and updating the ledger record
+- opening and updating the ledger record, keyed by the merge commit's sha —
+  which is also the entire replay guard, since the record either exists for
+  this commit or it does not
+- naming the version, as decoration: a `spec-vN` tag derived from the count of
+  spec versions in the commit's ancestry. Nothing reads it, so the step is
+  `continue-on-error` and a run whose tag push fails has still recorded the
+  version
 - filing work-item issues from a `workplan.yaml` (reusing an existing issue of
   the same title rather than duplicating it)
 
@@ -43,10 +48,17 @@ intent repo root exercises the issue-filing path end to end.
 
 ## Prerequisites
 
-- The intent repo carries `spec-v1` and `spec-v2`, so `on-spec-merge.yml` will
-  mint `spec-v3` on the next spec merge. Both tags must stay pushed: the
-  sequence is `max(spec-v*) + 1`, and a missing tag silently re-dates every
-  scenario introduced at it.
+- **Nothing depends on the tags.** A spec version is a `main` commit whose diff
+  touches `spec/**` (`spec/decisions/2026-08-28-versions-are-commits.md`); the
+  `spec-v*` tags are names for eleven of them, and a missing, late or wrong one
+  changes no behavior.
+
+- **The installed ledger records are still name-keyed.** `ledger/spec-vN.yaml`
+  carry `spec_version: spec-vN`, and the CLI keys records by commit sha, so it
+  does not see them. Nothing here depends on the old records — every record
+  written from now on is sha-keyed under `ledger/<sha>.yaml` — but rewriting
+  those `spec_version` fields to the commits they name is worth doing while
+  re-syncing these files.
 
 - The intent repo needs a **`VELLUM_TOKEN`** secret holding a token that can
   read `waviisoft/vellum`. This repo is private, so the intent repo's own job
@@ -55,14 +67,19 @@ intent repo root exercises the issue-filing path end to end.
   legibly inside pip.
 - Both workflows check this repo out at `env.VELLUM_REF` (`main`) and
   `pip install` that path. Point it at a tag once this repo cuts one. They
-  check the CLI out rather than installing from its git URL because a pip VCS
-  install runs `git submodule update --init --recursive`, which tries to clone
-  the private `spec` submodule without credentials and fails. The CLI does not
-  need the spec pin to build, and `actions/checkout` takes no submodules by
-  default.
+  check the CLI out rather than installing from its git URL because the repo is
+  private and a token has to be supplied, which `pip install
+  "vellum @ git+https://..."` has nowhere to take. (It was also, originally,
+  because pip's VCS install recursively initialized the private `spec`
+  submodule and failed — that submodule is gone, and the private-repo reason
+  stands on its own.)
 - `on-spec-merge.yml` needs `contents: write` (to push the tag and the ledger
   commit) and `issues: write` (to file work items). Branch protection on `main`
   must allow the workflow token to push, or the ledger commit step fails.
-- Both check out with `fetch-depth: 0`: the version sequence lives in tags, and
-  `vellum suite extract` dates scenarios by walking them. A shallow clone
-  silently reports every scenario as new.
+- Both check out with `fetch-depth: 0`: the version sequence *is* main's
+  history, and `vellum suite extract` dates scenarios by walking it. A shallow
+  clone silently re-dates every scenario below its graft **forward**, onto the
+  truncation point — right count, nothing pending, nothing raised, and wrong in
+  the direction that arms scenarios the product already satisfies. `suite.json`
+  carries `shallow: true` when it happens; treat that as the last line, not the
+  guard.
