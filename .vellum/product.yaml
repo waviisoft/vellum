@@ -15,17 +15,11 @@ intent:
 # `name` is decoration (spec/decisions/2026-08-28-versions-are-commits.md).
 # Nothing reads it to decide anything, so it may be absent, late or wrong
 # without changing behavior — a commit that carries no `spec-v*` tag simply has
-# no name. This pin names main's head, which is the ledger commit for spec-v11
-# rather than a spec version itself, so it has none.
+# no name yet. This pin is the spec version the Rule: ban created at landing;
+# its decorative name arrives when the intent workflow tags it.
 #
-# INTERIM, pending the paired landing (spec/decisions/2026-08-28-paired-landing.md):
-# this wave implements intent main PLUS the approved-unlanded spec PR
-# waviisoft/vellum-intent#20 (the `Rule:` ban, GH010 here). That PR has no
-# merge commit yet, so there is no sha to pin to it. The architect merges #20,
-# then advances this one line to the commit that merge creates, before this
-# repo's implementation lands.
 pin:
-  commit: 9c8b70a71089fc8fa6f585ff5f287bb740eff141
+  commit: 8244862a9928ea2469ee4d6d81a7eb01231c5d52
   name: null
 
 # This repo's entry in the intent repo's .vellum/workspace.yaml.
