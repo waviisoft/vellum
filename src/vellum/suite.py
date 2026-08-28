@@ -14,7 +14,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from vellum import __version__
-from vellum.gherkin_blocks import GherkinParseError, Scenario, parse_block
+from vellum.gherkin_blocks import (
+    GherkinParseError,
+    Scenario,
+    Step,
+    parse_block,
+    scenario_ref,
+)
 from vellum.gitver import (
     BASE_VERSION,
     GitUnavailable,
@@ -40,8 +46,35 @@ class SuiteEntry:
     pending: bool
 
     @property
-    def id(self) -> str:
-        return f"{self.relpath}#{self.scenario.anchor}"
+    def id(self) -> str | None:
+        return self.scenario.id
+
+    @property
+    def ref(self) -> str | None:
+        """How the ledger refers to this scenario: ``scenario:<id>``."""
+        return scenario_ref(self.scenario.id) if self.scenario.id else None
+
+
+@dataclass
+class _Seen:
+    """One scenario as it stood at a tag, while versions are being walked."""
+
+    id: str | None
+    fingerprint: str
+    version: int
+    consumed: bool = False
+
+
+@dataclass
+class History:
+    """What the ``spec-v*`` tags say about when each scenario last changed."""
+
+    by_id: dict[str, int] = field(default_factory=dict)
+    #: Fingerprints as of the newest tag. The fallback for a scenario whose id
+    #: the tags do not carry — which is how the 19 scenarios written before
+    #: ids existed keep their version across the change that introduced them.
+    by_fingerprint: dict[str, int] = field(default_factory=dict)
+    latest: int = 0
 
 
 @dataclass
@@ -71,66 +104,102 @@ def scenarios_in(relpath: str, text: str) -> list[Scenario]:
     return found
 
 
-def fingerprint(sc: Scenario) -> str:
-    """Content hash of a scenario: name, tags, steps, examples — never position.
+def _normalized(step: Step) -> list[str]:
+    return [step.keyword_type, " ".join(step.text.split())]
 
-    Line numbers and surrounding prose are excluded so that moving or
-    reformatting a scenario does not read as a behavioral change.
+
+def fingerprint(sc: Scenario) -> str:
+    """Content hash of a scenario: normalized steps and example tables only.
+
+    "Changed" means the fingerprint changed
+    (``spec/decisions/2026-08-28-scenario-identity.md``). Titles and tags are
+    presentation and are excluded, as are line numbers and surrounding prose —
+    so renaming a scenario, re-tagging it, moving it, or re-indenting it does
+    not read as a behavioral change. Background steps are included because they
+    execute as part of the scenario.
     """
     payload = {
-        "keyword": sc.keyword,
-        "name": sc.name,
-        "tags": sorted(sc.tags),
-        "background": [[s.keyword, s.text] for s in sc.background_steps],
-        "steps": [[s.keyword, s.text] for s in sc.steps],
-        "examples": sc.examples,
+        "steps": [_normalized(s) for s in (*sc.background_steps, *sc.steps)],
+        "examples": [
+            {
+                "header": [" ".join(c.split()) for c in ex["header"]],
+                "rows": [[" ".join(c.split()) for c in row] for row in ex["rows"]],
+            }
+            for ex in sc.examples
+        ],
     }
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
-def _fingerprints_at(repo: Path, ref: str, prefix: str) -> dict[tuple[str, str], str]:
-    """``(relpath, anchor) -> fingerprint`` for the whole tree at one ref."""
-    out: dict[tuple[str, str], str] = {}
-    for path in markdown_at(repo, ref, prefix):
+def _scenarios_at(repo: Path, ref: str, prefix: str) -> list[tuple[str | None, str]]:
+    """``(id, fingerprint)`` for every scenario in the tree at one ref."""
+    out: list[tuple[str | None, str]] = []
+    for path in sorted(markdown_at(repo, ref, prefix)):
         text = show(repo, ref, path)
         if text is None:
             continue
         relpath = path[len(prefix) + 1 :] if prefix else path
         for sc in scenarios_in(relpath, text):
-            out[(relpath, sc.anchor)] = fingerprint(sc)
+            out.append((sc.id, fingerprint(sc)))
     return out
 
 
-def version_history(repo: Path, prefix: str) -> tuple[dict[tuple[str, str], int], int]:
-    """Map each scenario to the version that introduced or last changed it.
+def version_history(repo: Path, prefix: str) -> History:
+    """Walk the ``spec-v*`` tags, dating each scenario by when it last changed.
 
-    Returns the map and the highest tagged version (0 when the repo has no
-    ``spec-v*`` tags yet).
+    A scenario is matched to its predecessor by id. When the id does not match
+    anything at the previous tag — because the scenario has just been given
+    one — it falls back to matching an unclaimed scenario with the same
+    fingerprint, which is what lets adding an ``@id:`` tag be the presentation
+    change the spec says it is rather than a rewrite of the whole suite.
     """
     tags = spec_tags(repo)
     if not tags:
-        return {}, 0
-    versions: dict[tuple[str, str], int] = {}
-    previous: dict[tuple[str, str], str] = {}
+        return History()
+
+    history = History(latest=tags[-1][0])
+    previous: list[_Seen] = []
     for number, tag in tags:
-        current = _fingerprints_at(repo, tag, prefix)
-        for key, fp in current.items():
-            if previous.get(key) != fp:
-                versions[key] = number
+        by_id = {seen.id: seen for seen in previous if seen.id}
+        by_fingerprint: dict[str, list[_Seen]] = {}
+        for seen in previous:
+            by_fingerprint.setdefault(seen.fingerprint, []).append(seen)
+
+        current: list[_Seen] = []
+        for scenario_id, fp in _scenarios_at(repo, tag, prefix):
+            match = by_id.get(scenario_id) if scenario_id else None
+            if match is not None and not match.consumed:
+                match.consumed = True
+                version = match.version if match.fingerprint == fp else number
+            else:
+                match = next(
+                    (s for s in by_fingerprint.get(fp, []) if not s.consumed), None
+                )
+                if match is not None:
+                    match.consumed = True
+                    version = match.version
+                else:
+                    version = number
+            current.append(_Seen(id=scenario_id, fingerprint=fp, version=version))
+
         previous = current
-    return versions, tags[-1][0]
+
+    for seen in previous:
+        if seen.id:
+            history.by_id[seen.id] = seen.version
+        history.by_fingerprint.setdefault(seen.fingerprint, seen.version)
+    return history
 
 
 def extract(spec_dir: str | Path) -> Suite:
     root = resolve_spec_root(spec_dir)
 
-    versions: dict[tuple[str, str], int] = {}
-    latest = 0
+    history = History()
     commit = None
     try:
         repo = repo_root(root)
-        versions, latest = version_history(repo, prefix_of(repo, root))
+        history = version_history(repo, prefix_of(repo, root))
         commit = head_commit(repo)
     except (GitUnavailable, ValueError):
         # No readable git history: every scenario belongs to the base version.
@@ -138,27 +207,31 @@ def extract(spec_dir: str | Path) -> Suite:
 
     # A scenario the tags do not yet carry belongs to the version this spec
     # change will mint — which is what spec CI needs when it runs on a PR.
-    next_version = latest + 1 if latest else BASE_VERSION
+    next_version = history.latest + 1 if history.latest else BASE_VERSION
 
     entries: list[SuiteEntry] = []
     for sf in iter_spec_files(root):
         for sc in scenarios_in(sf.relpath, sf.text):
-            key = (sf.relpath, sc.anchor)
-            tagged = key in versions
+            version = history.by_id.get(sc.id) if sc.id else None
+            if version is None:
+                version = history.by_fingerprint.get(fingerprint(sc))
             entries.append(
                 SuiteEntry(
                     scenario=sc,
                     relpath=sf.relpath,
-                    version=versions[key] if tagged else next_version,
-                    pending=not tagged,
+                    version=version if version is not None else next_version,
+                    pending=version is None,
                 )
             )
     entries.sort(key=lambda e: (e.relpath, e.scenario.line))
     return Suite(
-        spec_version=max(latest, next_version if entries else latest) or BASE_VERSION,
+        spec_version=(
+            next_version if any(e.pending for e in entries) else history.latest
+        )
+        or BASE_VERSION,
         entries=entries,
         source_commit=commit,
-        tagged=bool(latest),
+        tagged=bool(history.latest),
     )
 
 
@@ -173,8 +246,8 @@ def to_dict(suite: Suite) -> dict:
         "scenarios": [
             {
                 "id": e.id,
+                "ref": e.ref,
                 "file": e.relpath,
-                "anchor": e.scenario.anchor,
                 "line": e.scenario.line,
                 "version": e.version,
                 "pending": e.pending,

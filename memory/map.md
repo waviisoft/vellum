@@ -18,6 +18,11 @@ notes live in `memory/areas/`; wave worklogs in `memory/waves/`.
 - [`memory/areas/cli.md`](areas/cli.md) — `vellum lint`, `vellum suite extract`, `vellum ledger`.
 - [`memory/areas/adapters-github.md`](areas/adapters-github.md) — the two GitHub Actions workflows.
 
+## Waves
+
+- [`memory/waves/spec-v1.md`](waves/spec-v1.md) — the hand-built loop.
+- [`memory/waves/spec-v2.md`](waves/spec-v2.md) — scenarios carry explicit stable ids.
+
 ## Technology choice, and why
 
 **Python 3.10+, standard library, plus exactly two pure-data dependencies:

@@ -136,6 +136,44 @@ class TestGherkin(unittest.TestCase):
         self.assertEqual([f.code for f in self.findings if f.code == "GH002"], ["GH002"])
 
 
+class TestScenarioIds(unittest.TestCase):
+    """Every scenario carries exactly one well-formed, repo-unique @id: tag."""
+
+    def setUp(self):
+        self.findings = lint_tree(FIXTURES / "bad-ids")
+
+    def by_code(self, code):
+        return [f for f in self.findings if f.code == code]
+
+    def test_missing_id_is_reported(self):
+        found = self.by_code("GH005")
+        self.assertEqual(len(found), 1)
+        self.assertIn("Declares no id at all", found[0].message)
+
+    def test_malformed_id_is_reported(self):
+        self.assertTrue(any("Not_A_Slug" in f.message for f in self.by_code("GH006")))
+
+    def test_a_scenario_with_two_ids_is_reported(self):
+        self.assertTrue(any("2 id tags" in f.message for f in self.by_code("GH006")))
+
+    def test_duplicate_ids_are_caught_across_files_not_just_within_one(self):
+        # Ids are unique across the intent repo, not per file.
+        found = self.by_code("GH003")
+        self.assertEqual({f.file for f in found}, {"features/one.md", "features/two.md"})
+        for f in found:
+            self.assertIn("shared-id", f.message)
+
+    def test_each_home_of_a_duplicate_id_names_the_others(self):
+        one = next(f for f in self.by_code("GH003") if f.file == "features/one.md")
+        self.assertIn("features/two.md", one.message)
+
+    def test_the_run_fails(self):
+        self.assertEqual(run_cli(["lint", str(FIXTURES / "bad-ids")])[0], 1)
+
+    def test_a_tree_with_well_formed_ids_is_clean(self):
+        self.assertEqual(lint_tree(FIXTURES / "good"), [])
+
+
 class TestPinnedSpecTree(unittest.TestCase):
     """The definition of done: the pinned spec-v1 tree lints clean."""
 
@@ -145,6 +183,13 @@ class TestPinnedSpecTree(unittest.TestCase):
 
     def test_pinned_spec_lints_clean(self):
         self.assertEqual(lint_tree(REPO_ROOT / "spec"), [])
+
+    def test_every_scenario_in_the_pinned_spec_has_an_id(self):
+        from vellum.suite import extract
+
+        entries = extract(REPO_ROOT / "spec").entries
+        self.assertEqual(len(entries), 19)
+        self.assertTrue(all(e.scenario.id for e in entries))
 
 
 if __name__ == "__main__":

@@ -16,7 +16,11 @@ from gherkin.errors import CompositeParserException, ParserException
 from gherkin.parser import Parser
 from gherkin.token_scanner import TokenScanner
 
-from vellum.slug import slugify
+#: Scenario identity is an explicit ``@id:<slug>`` tag, globally unique across
+#: the intent repo (spec/decisions/2026-08-28-scenario-identity.md). The id is
+#: the identity; the file is only its current home.
+ID_TAG_PREFIX = "@id:"
+SCENARIO_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 #: ``Feature:`` at column zero starts a new document. Localised keywords are out
 #: of scope for v0.1: the spec tree is English and lint would silently pass a
@@ -38,6 +42,10 @@ class GherkinParseError(Exception):
 class Step:
     keyword: str
     text: str
+    #: Context / Action / Outcome, with And and But resolved to the type of the
+    #: step above them. Fingerprints use this rather than the written keyword,
+    #: so rewriting "And" as "Given" is not a behavioral change.
+    keyword_type: str = ""
 
 
 @dataclass
@@ -51,7 +59,12 @@ class Scenario:
     steps: list[Step] = field(default_factory=list)
     background_steps: list[Step] = field(default_factory=list)
     examples: list[dict] = field(default_factory=list)
-    anchor: str = ""
+    #: The ``@id:`` slug, or None when the scenario declares none. Lint reports
+    #: a missing id (GH005); extraction falls back to the fingerprint, which is
+    #: how scenarios written before ids existed keep their version.
+    id: str | None = None
+    #: Every ``@id:`` tag seen, so lint can report a scenario carrying two.
+    id_tags: list[str] = field(default_factory=list)
 
 
 def split_documents(body: str) -> list[tuple[int, str]]:
@@ -80,7 +93,22 @@ def split_documents(body: str) -> list[tuple[int, str]]:
 
 
 def _steps(raw: list[dict]) -> list[Step]:
-    return [Step(keyword=s["keyword"].strip(), text=s["text"]) for s in raw]
+    steps: list[Step] = []
+    previous = "Context"
+    for item in raw:
+        keyword_type = item.get("keywordType") or ""
+        if keyword_type == "Conjunction":
+            keyword_type = previous
+        elif keyword_type:
+            previous = keyword_type
+        steps.append(
+            Step(
+                keyword=item["keyword"].strip(),
+                text=item["text"],
+                keyword_type=keyword_type,
+            )
+        )
+    return steps
 
 
 def _examples(raw: list[dict]) -> list[dict]:
@@ -136,21 +164,22 @@ def parse_block(body: str, block_body_line: int) -> list[Scenario]:
                     examples=_examples(node.get("examples")),
                 )
             )
-    return assign_anchors(scenarios)
+    return [_attach_id(sc) for sc in scenarios]
 
 
-def assign_anchors(scenarios: list[Scenario]) -> list[Scenario]:
-    """Anchor each scenario ``<feature-slug>/<scenario-slug>``, de-duplicated.
+def _attach_id(sc: Scenario) -> Scenario:
+    """Read the scenario's ``@id:`` tag(s) onto it. Validation is lint's job."""
+    sc.id_tags = [
+        t[len(ID_TAG_PREFIX) :] for t in sc.tags if t.startswith(ID_TAG_PREFIX)
+    ]
+    if len(sc.id_tags) == 1 and SCENARIO_ID_RE.match(sc.id_tags[0]):
+        sc.id = sc.id_tags[0]
+    return sc
 
-    Duplicates get a ``-2``, ``-3`` suffix in document order so extraction never
-    collides; lint reports them (GH003) so an author can make them distinct.
-    """
-    seen: dict[str, int] = {}
-    for sc in scenarios:
-        base = f"{slugify(sc.feature)}/{slugify(sc.name)}"
-        seen[base] = seen.get(base, 0) + 1
-        sc.anchor = base if seen[base] == 1 else f"{base}-{seen[base]}"
-    return scenarios
+
+def scenario_ref(scenario_id: str) -> str:
+    """The form ledger ``satisfies:`` entries use for an acceptance criterion."""
+    return f"scenario:{scenario_id}"
 
 
 def _first_error(exc: Exception) -> str:

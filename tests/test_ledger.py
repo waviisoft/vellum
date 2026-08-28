@@ -111,13 +111,13 @@ class TestAdvance(LedgerCase):
 
     def test_work_item_is_added_then_updated_in_place(self):
         advance(self.dir, 42, issue=121, title="Session expiry", repo="app",
-                satisfies=["features/auth.md#session-expiry/idle-session-expires"])
+                satisfies=["scenario:auth-idle-session-expires"])
         advance(self.dir, 42, issue=121, item_state="merged", pr=124)
         items = self.record()["work_items"]
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["state"], "merged")
         self.assertEqual(items[0]["pr"], 124)
-        self.assertEqual(items[0]["satisfies"], ["features/auth.md#session-expiry/idle-session-expires"])
+        self.assertEqual(items[0]["satisfies"], ["scenario:auth-idle-session-expires"])
 
     def test_work_item_carries_every_field_the_spec_names(self):
         advance(self.dir, 42, issue=121, title="t", repo="app")
@@ -182,7 +182,7 @@ class TestWorkPlan(LedgerCase):
         path = self.plan_file(
             "work_items:\n"
             "  - issue: 121\n    title: Session expiry\n    repo: app\n"
-            "    satisfies: [features/auth.md#session-expiry/idle-session-expires]\n"
+            "    satisfies: [scenario:auth-idle-session-expires]\n"
             "  - issue: 122\n    title: Sign-out\n    repo: app\n"
         )
         advance(self.dir, 42, plan=load_plan(path))
@@ -211,7 +211,7 @@ class TestRoundTrip(LedgerCase):
         open_record(self.dir, 42, spec_pr=118, baseline=38, labels=["spec:feature"])
         advance(self.dir, 42, state="implementing")
         advance(self.dir, 42, issue=121, title="Session expiry", repo="app",
-                satisfies=["features/auth.md#session-expiry/idle-session-expires"])
+                satisfies=["scenario:auth-idle-session-expires"])
         advance(self.dir, 42, issue=121, item_state="merged", pr=124,
                 attempts=2, tokens=412000, usd=3.10, executor="claude-actions")
         advance(self.dir, 42, state="shipped", release="r58")

@@ -13,7 +13,6 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from vellum.slug import heading_anchor
 from vellum.specfile import SpecFile
 
 _MD_LINK_RE = re.compile(r"\[[^\]\n]*\]\(\s*([^)\s]+?)\s*(?:\"[^\"]*\")?\s*\)")
@@ -21,6 +20,12 @@ _BARE_PATH_RE = re.compile(r"(?:[\w.\-]+/)*[\w.\-]+\.md(?:#[\w\-./]+)?")
 _INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
 _HEADING_RE = re.compile(r"^#{1,6}\s+(.*?)\s*#*$")
 _EXTERNAL_RE = re.compile(r"^(?:[a-z][a-z0-9+.-]*:|//|#)", re.IGNORECASE)
+
+
+def heading_anchor(text: str) -> str:
+    """GitHub's heading-anchor slug: drop punctuation, spaces become hyphens."""
+    kept = "".join(c for c in text.strip().lower() if c.isalnum() or c in " -_")
+    return kept.replace(" ", "-")
 
 
 @dataclass

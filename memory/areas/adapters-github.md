@@ -44,9 +44,11 @@ protection that lets the workflow token push, or the "Commit the ledger record"
 step fails after the tag has already been pushed — leaving a minted version
 with no committed record.
 
-## Prerequisite not yet met
+## Tags are the version sequence
 
-`spec-v1` does not exist as a tag on the intent repo. `on-spec-merge.yml` mints
-`max(spec-v*) + 1`, so with no tags the *next* spec merge would mint `spec-v1`
-and attach it to the wrong commit. The tag command is in
-`adapters/github/README.md` and in `memory/waves/spec-v1.md`.
+The intent repo carries `spec-v1` and `spec-v2`; the next spec merge mints
+`spec-v3`. Both tags must stay pushed. A missing tag does not fail loudly — it
+silently re-dates every scenario introduced at it, because `version_history()`
+only sees the tags that exist. This bit during the spec-v2 wave, when
+`spec-v2` was pushed before `spec-v1` and every scenario briefly reported as
+version 2.

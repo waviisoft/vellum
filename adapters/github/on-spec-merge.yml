@@ -114,7 +114,10 @@ jobs:
       #   work_items:
       #     - title: "Session expiry per features/auth.md"
       #       repo: core
-      #       satisfies: [features/auth.md#session-expiry/idle-session-expires]
+      #       satisfies: [scenario:auth-idle-session-expires]
+      #
+      # Acceptance criteria are referenced by scenario id, never by file
+      # position (spec/features/ledger.md); the ids come from suite.json.
       #
       # Until the planner runs, a workplan.yaml committed by hand at the repo
       # root is picked up by the next step, so the rest of this job is real and

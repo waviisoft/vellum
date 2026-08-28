@@ -116,26 +116,15 @@ renumbering churn. Behavioral: it changes `suite.json` ids, what the ledger's
 Implemented option (b), a Feature+Scenario slug, as a documented default so the
 wave continued; it is isolated in `assign_anchors()` and `src/vellum/slug.py`.
 
-## Left undone, and why
+## Left undone, and why — CLOSED in the spec-v2 wave
 
-**The `spec-v1` tag does not exist on the intent repo.** The owner approved
-creating it, but this session's git credential accepts branch refs only (403 on
-`refs/tags/*`) and the GitHub MCP server exposes no create-ref tool. The
-submodule is therefore pinned to `bc84e591` — the commit `spec-v1` names — so
-the pin is correct either way, and version derivation was written to work
-before and after the tag exists: with no tags, every scenario is version 1 and
-`pending: true`; once `spec-v1` exists, the same scenarios are version 1 and
-`pending: false`. Both paths are tested
-(`test_untagged_tree_is_version_one`, `TestVersionDerivation`).
+At the time of writing, `spec-v1` did not exist as a tag on the intent repo:
+the owner approved creating it, but this session's git credential accepted
+branch refs only (403 on `refs/tags/*`) and no create-ref tool was available.
+The submodule was pinned to `bc84e591` — the commit `spec-v1` names — so the
+pin was correct either way, and version derivation was written to work before
+and after the tag existed.
 
-To finish it:
-
-```sh
-git -C spec tag -a spec-v1 bc84e591d1c8a4ba34fd806029e9f0c0a21c1456 \
-  -m "spec-v1: seed the Vellum spec tree"
-git -C spec push origin spec-v1
-```
-
-Until that lands, `adapters/github/on-spec-merge.yml` would mint `spec-v1` on
-the next spec merge and attach it to the wrong commit. Noted in
-`memory/areas/adapters-github.md` and `adapters/github/README.md`.
+**Resolved.** The owner pushed `spec-v1` at `bc84e591` during the spec-v2
+wave; both `spec-v1` and `spec-v2` are now on the intent repo. See
+`memory/waves/spec-v2.md`.

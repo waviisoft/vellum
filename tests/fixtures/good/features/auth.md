@@ -17,11 +17,13 @@ Feature: Session expiry
   Background:
     Given the reference environment
 
+  @id:auth-idle-session-expires
   Scenario: Idle session expires
     Given a signed-in user idle for 31 minutes
     When they request any authenticated page
     Then they are redirected to sign-in
 
+  @id:auth-idle-threshold
   Scenario Outline: Idle threshold
     Given a signed-in user idle for <minutes> minutes
     When they request any authenticated page
@@ -34,6 +36,7 @@ Feature: Session expiry
 
 Feature: Sign-out
   @slow
+  @id:auth-sign-out-clears-session
   Scenario: Sign-out clears the session
     Given a signed-in user
     When they sign out

@@ -38,15 +38,10 @@ intent repo root exercises the issue-filing path end to end.
 
 ## Prerequisites
 
-- **`spec-v1` must exist as a tag** on the intent repo. `on-spec-merge.yml`
-  mints `max(spec-v*) + 1`; with no tags at all the first merge mints `spec-v1`,
-  so if `spec-v1` should point at the seed commit rather than the next merge,
-  create it first:
-
-  ```sh
-  git tag -a spec-v1 bc84e591d1c8a4ba34fd806029e9f0c0a21c1456 -m "spec-v1: seed the Vellum spec tree"
-  git push origin spec-v1
-  ```
+- The intent repo carries `spec-v1` and `spec-v2`, so `on-spec-merge.yml` will
+  mint `spec-v3` on the next spec merge. Both tags must stay pushed: the
+  sequence is `max(spec-v*) + 1`, and a missing tag silently re-dates every
+  scenario introduced at it.
 
 - Both workflows `pip install` the CLI from this repo's `main`
   (`env.VELLUM_REF`). Point it at a tag once this repo cuts one.

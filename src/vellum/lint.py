@@ -11,7 +11,12 @@ import json
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
-from vellum.gherkin_blocks import GherkinParseError, parse_block
+from vellum.gherkin_blocks import (
+    ID_TAG_PREFIX,
+    GherkinParseError,
+    Scenario,
+    parse_block,
+)
 from vellum.links import find_references, heading_anchors, resolve
 from vellum.specfile import (
     DATE_RE,
@@ -91,9 +96,7 @@ def _check_frontmatter(sf: SpecFile) -> list[Finding]:
     return findings
 
 
-def _check_links(
-    sf: SpecFile, root: Path, scenario_anchors: dict[str, set[str]]
-) -> list[Finding]:
+def _check_links(sf: SpecFile, root: Path) -> list[Finding]:
     findings: list[Finding] = []
     for ref in find_references(sf):
         target = resolve(ref, sf, root)
@@ -110,36 +113,35 @@ def _check_links(
             continue
         if not ref.fragment:
             continue
-        try:
-            rel = target.relative_to(root).as_posix()
-        except ValueError:
-            rel = None
-        known = heading_anchors(target) | scenario_anchors.get(rel or "", set())
-        if ref.fragment not in known:
+        if ref.fragment not in heading_anchors(target):
             findings.append(
                 Finding(
                     sf.relpath,
                     ref.line,
                     "LN002",
-                    f"'{ref.target}' has no heading or scenario anchor "
-                    f"'#{ref.fragment}'",
+                    f"'{ref.target}' has no heading '#{ref.fragment}'",
                 )
             )
     return findings
 
 
-def _check_gherkin(sf: SpecFile) -> tuple[list[Finding], set[str]]:
+def _check_gherkin(sf: SpecFile) -> tuple[list[Finding], list[Scenario]]:
+    """Parse every gherkin block; return findings and the scenarios found.
+
+    Id uniqueness is not checked here: ids are unique across the whole intent
+    repo, not per file, so ``lint_tree`` checks them once it has the tree.
+    """
     findings: list[Finding] = []
-    anchors: set[str] = set()
+    scenarios: list[Scenario] = []
     for fence in sf.fences:
         if fence.info != "gherkin":
             continue
         try:
-            scenarios = parse_block(fence.body, fence.body_line)
+            found = parse_block(fence.body, fence.body_line)
         except GherkinParseError as exc:
             findings.append(Finding(sf.relpath, exc.line, "GH001", exc.message))
             continue
-        if not scenarios:
+        if not found:
             findings.append(
                 Finding(
                     sf.relpath,
@@ -148,25 +150,80 @@ def _check_gherkin(sf: SpecFile) -> tuple[list[Finding], set[str]]:
                     "gherkin block declares no scenarios",
                 )
             )
-        for sc in scenarios:
-            if sc.anchor in anchors or sc.anchor[-2:-1] == "-" and sc.anchor[-1].isdigit():
-                findings.append(
-                    Finding(
-                        sf.relpath,
-                        sc.line,
-                        "GH003",
-                        f"duplicate scenario anchor '{sc.anchor.rsplit('-', 1)[0]}'"
-                        f" — give the scenario a distinct name",
-                    )
-                )
-            anchors.add(sc.anchor)
+        for sc in found:
+            findings.extend(_check_scenario_id(sf, sc))
             if not sc.steps and not sc.background_steps:
                 findings.append(
                     Finding(
                         sf.relpath, sc.line, "GH004", f"scenario '{sc.name}' has no steps"
                     )
                 )
-    return findings, anchors
+        scenarios.extend(found)
+    return findings, scenarios
+
+
+def _check_scenario_id(sf: SpecFile, sc: Scenario) -> list[Finding]:
+    """Every scenario carries exactly one well-formed ``@id:`` tag."""
+    if not sc.id_tags:
+        return [
+            Finding(
+                sf.relpath,
+                sc.line,
+                "GH005",
+                f"scenario '{sc.name}' has no {ID_TAG_PREFIX}<slug> tag",
+            )
+        ]
+    if len(sc.id_tags) > 1:
+        return [
+            Finding(
+                sf.relpath,
+                sc.line,
+                "GH006",
+                f"scenario '{sc.name}' carries {len(sc.id_tags)} id tags "
+                f"({', '.join(sorted(sc.id_tags))}); a scenario has exactly one",
+            )
+        ]
+    if sc.id is None:
+        return [
+            Finding(
+                sf.relpath,
+                sc.line,
+                "GH006",
+                f"scenario id '{sc.id_tags[0]}' is not a lowercase slug",
+            )
+        ]
+    return []
+
+
+def _check_unique_ids(found: list[tuple[str, Scenario]]) -> list[Finding]:
+    """Scenario ids are unique across the intent repo, not merely per file.
+
+    Identity is the id and the file is only its current home, so two files
+    claiming one id makes "introduced or last changed" unanswerable.
+    """
+    homes: dict[str, list[tuple[str, Scenario]]] = {}
+    for relpath, sc in found:
+        if sc.id is not None:
+            homes.setdefault(sc.id, []).append((relpath, sc))
+
+    findings: list[Finding] = []
+    for scenario_id, claims in sorted(homes.items()):
+        if len(claims) == 1:
+            continue
+        for relpath, sc in claims:
+            others = [
+                f"{other}:{o.line}" for other, o in claims if o is not sc
+            ]
+            findings.append(
+                Finding(
+                    relpath,
+                    sc.line,
+                    "GH003",
+                    f"duplicate scenario id '{scenario_id}', also at "
+                    f"{', '.join(sorted(others))}",
+                )
+            )
+    return findings
 
 
 def lint_tree(spec_dir: str | Path) -> list[Finding]:
@@ -175,14 +232,15 @@ def lint_tree(spec_dir: str | Path) -> list[Finding]:
     files = iter_spec_files(root)
 
     findings: list[Finding] = []
-    scenario_anchors: dict[str, set[str]] = {}
+    scenarios: list[tuple[str, Scenario]] = []
     for sf in files:
-        gh_findings, anchors = _check_gherkin(sf)
+        gh_findings, found = _check_gherkin(sf)
         findings.extend(gh_findings)
-        scenario_anchors[sf.relpath] = anchors
+        scenarios.extend((sf.relpath, sc) for sc in found)
+    findings.extend(_check_unique_ids(scenarios))
     for sf in files:
         findings.extend(_check_frontmatter(sf))
-        findings.extend(_check_links(sf, root, scenario_anchors))
+        findings.extend(_check_links(sf, root))
     return sorted(findings, key=lambda f: (f.file, f.line, f.code, f.message))
 
 
