@@ -45,7 +45,7 @@ than reporting conformance against the wrong tree. A checkout left at `./spec`
 is picked up without the variable.
 
 Python 3.10+, with two dependencies (`PyYAML`, `gherkin-official`). The
-reasoning behind that choice is in [`memory/map.md`](memory/map.md).
+reasoning behind that choice is in [`.vellum/memory/map.md`](.vellum/memory/map.md).
 
 Tests: `PYTHONPATH=tests .venv/bin/python -m unittest discover -s tests -t tests`
 
@@ -146,7 +146,7 @@ use `--ledger-dir` to point elsewhere.
 | `tests/` | The `unittest` suite plus fixture spec trees, including failing ones. |
 | `.github/workflows/ci.yml` | CI for **this** repo: tests, plus a conformance check on the pin. |
 | `adapters/github/` | Workflows **for the intent repo** — see [`adapters/github/README.md`](adapters/github/README.md). |
-| `memory/` | Area notes, wave worklogs, and the map. Start at [`memory/map.md`](memory/map.md). |
+| `.vellum/memory/` | Area notes, wave worklogs, and the map. Start at [`.vellum/memory/map.md`](.vellum/memory/map.md). |
 | `.vellum/product.yaml` | Backref to the intent repo, and **the pin of record**. |
 
 ## CI and the private spec
