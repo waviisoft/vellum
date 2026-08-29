@@ -15,17 +15,17 @@ intent:
 # `name` is decoration (spec/decisions/2026-08-28-versions-are-commits.md).
 # Nothing reads it to decide anything, so it may be absent, late or wrong
 # without changing behavior — a commit that carries no `spec-v*` tag simply has
-# no name yet. This pin is the spec version the Rule: ban created at landing;
-# its decorative name arrives when the intent workflow tags it.
+# no name yet. This pin is the spec version the memory relocation landed
+# with; its decorative name arrives when the intent workflow tags it.
 #
 pin:
-  commit: 8244862a9928ea2469ee4d6d81a7eb01231c5d52
+  commit: 666df3d3bf60413412627535f8727d32d39145dd
   name: null
 
 # This repo's entry in the intent repo's .vellum/workspace.yaml.
 product:
   name: core
-  trees: [src, memory]
+  trees: [src, .vellum/memory]
 
 # Trees an implementer may write in this repo. harness/ and the ledger are out
 # of bounds (spec/behaviors/write-boundaries.md). The spec tree is no longer a
@@ -33,7 +33,7 @@ product:
 # one it always was for the intent repo: implementers hold no intent-repo
 # credentials (spec/features/repo-topology.md, least authority).
 write_boundaries:
-  implementer: [src, tests, memory, adapters, README.md]
+  implementer: [src, tests, .vellum/memory, adapters, README.md]
 
 # The spec-first guard and the certification runner arrive in v0.2
 # (docs/design.md section 10); nothing in this repo enforces them yet.

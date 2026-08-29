@@ -4,7 +4,8 @@ Worklog for the first wave: the scaffold, the `vellum` CLI, and the two GitHub
 Actions workflows. Built by hand, before the pipeline it implements existed —
 docs/design.md §10 calls this "implementation still manual-ish".
 
-Scope delivered: submodule pin, `.vellum/memory/` tree, `.vellum/product.yaml`,
+Scope delivered: submodule pin, `memory/` tree (since moved to
+`.vellum/memory/`), `.vellum/product.yaml`,
 `vellum lint`, `vellum suite extract`, `vellum ledger open|advance`,
 `adapters/github/spec-ci.yml`, `adapters/github/on-spec-merge.yml`, 74 tests.
 

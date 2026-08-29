@@ -71,7 +71,7 @@ landmine in `.vellum/memory/areas/adapters-github.md`.
   suite is the ledger guard's job (v0.3), and a format check that cannot
   confirm the id exists gives false confidence. The examples in the README and
   tests were updated to the new form so nothing documents the superseded one.
-- **Editing `.vellum/memory/waves/spec-v1.md` in place.** Waves are per approved
+- **Editing `memory/waves/spec-v1.md` in place.** Waves are per approved
   version and their worklogs are archival; this is a new wave, so it is a new
   file. spec-v1's "Left undone" section is now answered by this one.
 
