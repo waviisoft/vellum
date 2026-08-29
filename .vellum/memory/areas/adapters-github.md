@@ -142,7 +142,7 @@ replay idempotent (decision D11).
 and `vellum suite extract` walks it. The requirement did not change when tags
 did; the failure mode got quieter, because a shallow clone now re-dates
 scenarios forward onto the graft instead of marking them all pending. See
-`memory/areas/cli.md`.
+`.vellum/memory/areas/cli.md`.
 
 **`on-spec-merge.yml` pushes to `main`.** It needs `contents: write` and branch
 protection that lets the workflow token push, or the "Commit the ledger record"

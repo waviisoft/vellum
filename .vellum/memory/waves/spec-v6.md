@@ -184,7 +184,7 @@ gherkin-file count, and "every scenario is version 1" — and spec-v5's twentiet
 scenario turned all four red at once. Bumping the literals is one character
 each and puts the same trap back for the next wave that adds a scenario.
 
-`memory/areas/cli.md` already carries the landmine one size down: *never
+`.vellum/memory/areas/cli.md` already carries the landmine one size down: *never
 hard-code the pinned spec version in a test*, because "a hard-coded version
 fails on every pin advance, which is noise that trains people to ignore red."
 A hard-coded count is that landmine wearing a different hat, and it had already

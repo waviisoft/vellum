@@ -53,7 +53,7 @@ still registers. Recorded below as a judgment call.
 **Tag order matters more than it looks.** `spec-v2` was pushed before
 `spec-v1`, and with only `spec-v2` present every scenario reported as version 2
 and looked plausible. Nothing failed; the numbers were just wrong. Noted as a
-landmine in `memory/areas/adapters-github.md`.
+landmine in `.vellum/memory/areas/adapters-github.md`.
 
 ## Paths rejected
 
@@ -71,7 +71,7 @@ landmine in `memory/areas/adapters-github.md`.
   suite is the ledger guard's job (v0.3), and a format check that cannot
   confirm the id exists gives false confidence. The examples in the README and
   tests were updated to the new form so nothing documents the superseded one.
-- **Editing `memory/waves/spec-v1.md` in place.** Waves are per approved
+- **Editing `.vellum/memory/waves/spec-v1.md` in place.** Waves are per approved
   version and their worklogs are archival; this is a new wave, so it is a new
   file. spec-v1's "Left undone" section is now answered by this one.
 
@@ -115,7 +115,7 @@ detail, so it was raised rather than chosen.
 
 **Answered at spec-v3**, which banned Backgrounds outright rather than settling
 the fingerprint question — and recorded this wave's conservative reading as
-what must hold if the ban is ever lifted. See `memory/waves/spec-v3.md`.
+what must hold if the ban is ever lifted. See `.vellum/memory/waves/spec-v3.md`.
 
 Latent when raised: the tree had no `Background:` blocks at spec-v2, which is
 why it was cheap to settle then. v0.1 implements the conservative direction (a
@@ -133,4 +133,4 @@ change — the corpus answers it.
 `spec-v1` and `spec-v2` are both tagged and pushed on the intent repo — the
 owner pushed `spec-v1` at `bc84e591` during this wave, which is what made
 correct version derivation possible. The "Left undone" section of
-`memory/waves/spec-v1.md` is closed by that.
+`.vellum/memory/waves/spec-v1.md` is closed by that.

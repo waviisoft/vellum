@@ -4,7 +4,7 @@ Worklog for the first wave: the scaffold, the `vellum` CLI, and the two GitHub
 Actions workflows. Built by hand, before the pipeline it implements existed —
 docs/design.md §10 calls this "implementation still manual-ish".
 
-Scope delivered: submodule pin, `memory/` tree, `.vellum/product.yaml`,
+Scope delivered: submodule pin, `.vellum/memory/` tree, `.vellum/product.yaml`,
 `vellum lint`, `vellum suite extract`, `vellum ledger open|advance`,
 `adapters/github/spec-ci.yml`, `adapters/github/on-spec-merge.yml`, 74 tests.
 
@@ -72,7 +72,7 @@ genuinely raise.
   mis-reads, and "silently" is the problem. Took `PyYAML`.
 - **Go or Node.** Both need a toolchain or `node_modules` in CI and a YAML
   dependency anyway. Python is already on every runner. Reasoning kept in
-  `memory/map.md`.
+  `.vellum/memory/map.md`.
 - **`git blame` / `git log -L` for scenario versions.** Line-level history is
   fragile against reformatting and moved blocks, and would report a re-indented
   scenario as changed. Walking the `spec-v*` tags and comparing content
@@ -127,4 +127,4 @@ and after the tag existed.
 
 **Resolved.** The owner pushed `spec-v1` at `bc84e591` during the spec-v2
 wave; both `spec-v1` and `spec-v2` are now on the intent repo. See
-`memory/waves/spec-v2.md`.
+`.vellum/memory/waves/spec-v2.md`.

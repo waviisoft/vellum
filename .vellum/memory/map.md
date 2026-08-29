@@ -1,29 +1,29 @@
 # Map
 
 Where things are in this repo, and the standing decisions behind them. Area
-notes live in `memory/areas/`; wave worklogs in `memory/waves/`.
+notes live in `.vellum/memory/areas/`; wave worklogs in `.vellum/memory/waves/`.
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `src/vellum/` | The CLI. One module per concern; see `memory/areas/cli.md`. |
+| `src/vellum/` | The CLI. One module per concern; see `.vellum/memory/areas/cli.md`. |
 | `tests/` | `unittest` suite plus fixture spec trees under `tests/fixtures/`. |
-| `adapters/github/` | Workflows written **for the intent repo**, ready to copy over. See `memory/areas/adapters-github.md`. |
+| `adapters/github/` | Workflows written **for the intent repo**, ready to copy over. See `.vellum/memory/areas/adapters-github.md`. |
 | `.vellum/product.yaml` | Backref to the intent repo, and the pin of record — `pin.commit`. Nothing mounts the intent repo here; CI fetches it, and tests read `VELLUM_INTENT_REPO`. |
 
 ## Areas
 
-- [`memory/areas/cli.md`](areas/cli.md) — `vellum lint`, `vellum suite extract`, `vellum ledger`.
-- [`memory/areas/adapters-github.md`](areas/adapters-github.md) — the two GitHub Actions workflows.
+- [`.vellum/memory/areas/cli.md`](areas/cli.md) — `vellum lint`, `vellum suite extract`, `vellum ledger`.
+- [`.vellum/memory/areas/adapters-github.md`](areas/adapters-github.md) — the two GitHub Actions workflows.
 
 ## Waves
 
-- [`memory/waves/spec-v1.md`](waves/spec-v1.md) — the hand-built loop.
-- [`memory/waves/spec-v2.md`](waves/spec-v2.md) — scenarios carry explicit stable ids.
-- [`memory/waves/spec-v3.md`](waves/spec-v3.md) — scenarios are self-contained; Backgrounds banned.
-- [`memory/waves/spec-v6.md`](waves/spec-v6.md) — one Feature per fence; runnable scenarios; the PO/PA/CA hierarchy.
-- [`memory/waves/versions-are-commits.md`](waves/versions-are-commits.md) — versions became commits, the pin became a file, minting shrank, `Rule:` banned.
+- [`.vellum/memory/waves/spec-v1.md`](waves/spec-v1.md) — the hand-built loop.
+- [`.vellum/memory/waves/spec-v2.md`](waves/spec-v2.md) — scenarios carry explicit stable ids.
+- [`.vellum/memory/waves/spec-v3.md`](waves/spec-v3.md) — scenarios are self-contained; Backgrounds banned.
+- [`.vellum/memory/waves/spec-v6.md`](waves/spec-v6.md) — one Feature per fence; runnable scenarios; the PO/PA/CA hierarchy.
+- [`.vellum/memory/waves/versions-are-commits.md`](waves/versions-are-commits.md) — versions became commits, the pin became a file, minting shrank, `Rule:` banned.
 
 Worklogs up to `spec-v6.md` are named for the version they landed at. This one
 is named for what it did, because a version's name is decoration now
