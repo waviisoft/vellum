@@ -65,6 +65,7 @@ from pathlib import Path
 import yaml
 
 from vellum.gitver import (
+    TAG_RE,
     GitUnavailable,
     is_ancestor,
     is_shallow,
@@ -81,16 +82,26 @@ PRODUCT_RELPATH = Path(".vellum") / "product.yaml"
 
 #: A top-level `pin:` key: column zero, no leading space.
 _PIN_BLOCK_RE = re.compile(r"^pin:\s*$")
-#: `  commit: <value>` / `  name: <value>` nested one level under it. The
-#: indent is captured so the rewritten line keeps the file's own, and any
-#: trailing `# comment` is captured so the rewrite keeps that too — this file's
-#: comments are the documentation, and dropping one while replacing a value
-#: beside it is exactly the loss the line-level edit exists to avoid.
+#: `  commit: <value>` / `  name: <value>` under the pin block. Matched only at
+#: the block's *own* indent — see `_rewrite`. The indent is captured so the
+#: rewritten line keeps the file's own, and any trailing `# comment` is
+#: captured so the rewrite keeps that too: this file's comments are the
+#: documentation, and dropping one while replacing the value beside it is
+#: exactly the loss the line-level edit exists to avoid.
+#:
+#: The comment group requires whitespace before the `#`, because a `#` with no
+#: space in front of it is part of the scalar (`name: v1#2` is the five
+#: characters `v1#2`), not a comment. `value` is `.*?` rather than `[^#]*?` for
+#: the same reason — excluding `#` from the value made such a line match
+#: nothing at all, which left `pin.name` stale and silent.
 _FIELD_RE = re.compile(
-    r"^(?P<indent>\s+)(?P<key>commit|name):"
-    r"(?P<value>[^#]*?)"
-    r"(?P<comment>\s+#.*)?$"
+    r"^(?P<indent>[ \t]+)(?P<key>commit|name):"
+    r"(?P<value>.*?)"
+    r"(?P<comment>[ \t]+#.*)?$"
 )
+
+#: A blank line, or one holding only a comment. Neither sets the block's indent.
+_SKIP_RE = re.compile(r"^\s*(#.*)?$")
 #: Any other key at column zero ends the pin block.
 _TOP_LEVEL_RE = re.compile(r"^[A-Za-z_][\w-]*:")
 
@@ -111,14 +122,17 @@ class Advance:
     #: How the sha was recognised: ``ledger-record`` or ``spec-ancestor``.
     evidence: str
     changed: bool
+    #: False when the file's pin block carries no ``name:`` line. Nothing is
+    #: inserted, so the report must not claim a name was written.
+    has_name: bool = True
 
     def report(self) -> str:
-        lines = [
-            f"{self.path}",
-            f"  pin.commit  {self.was} -> {self.now}",
-            f"  pin.name    {self.was_name or 'null'} -> {self.name or 'null'}",
-            f"  evidence    {self.evidence}",
-        ]
+        lines = [f"{self.path}", f"  pin.commit  {self.was} -> {self.now}"]
+        if self.has_name:
+            lines.append(f"  pin.name    {self.was_name or 'null'} -> {self.name or 'null'}")
+        else:
+            lines.append("  pin.name    (no name: line in the pin block; none added)")
+        lines.append(f"  evidence    {self.evidence}")
         if not self.changed:
             lines.append("  (already at this pin; the file was not rewritten)")
         return "\n".join(lines)
@@ -168,10 +182,18 @@ def verify_version(intent: str | Path, sha: str) -> tuple[str, str | None, str]:
     except LedgerError as exc:
         raise PinError(str(exc)) from exc
     if record is not None:
-        data = yaml.safe_load(record.read_text(encoding="utf-8")) or {}
+        # `find_record` short-circuits on an exact filename hit without parsing,
+        # so an unreadable `ledger/<sha>.yaml` arrives here unparsed. Letting
+        # `yaml` raise out of this would be a traceback rather than one of the
+        # two exit codes this CLI promises.
+        try:
+            data = yaml.safe_load(record.read_text(encoding="utf-8")) or {}
+        except (OSError, yaml.YAMLError) as exc:
+            raise PinError(f"{record}: cannot read the ledger record: {exc}") from exc
+        if not isinstance(data, dict):
+            raise PinError(f"{record}: ledger record is not a YAML mapping")
         recorded = str(data.get("spec_version") or "").strip().lower()
-        name = data.get("name")
-        return (full or recorded), (str(name) if name else None), f"ledger record {record.name}"
+        return (full or recorded), _decorative_name(data.get("name")), f"ledger record {record.name}"
 
     if full is None:
         raise PinError(
@@ -207,6 +229,23 @@ def verify_version(intent: str | Path, sha: str) -> tuple[str, str | None, str]:
     return full, None, "spec-touching commit in the intent checkout's ancestry"
 
 
+def _decorative_name(value) -> str | None:
+    """A ledger record's ``name``, if it is one this will write into the pin.
+
+    Validated against `spec-v<N>` rather than trusted, because it is written
+    into a YAML file by string interpolation and it arrives from the intent
+    repo's `ledger/`, which anyone who can land a merge there can write. A name
+    is decoration and nothing reads it to decide anything, so a malformed one is
+    dropped rather than raised on — the pin still advances, it just carries no
+    name, which is the documented shape for a version whose tag has not been
+    pushed.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text if TAG_RE.match(text) else None
+
+
 def _rewrite(text: str, commit: str, name: str | None) -> str:
     """Replace ``pin.commit`` and ``pin.name`` in *text*, touching nothing else."""
     lines = text.split("\n")
@@ -218,11 +257,26 @@ def _rewrite(text: str, commit: str, name: str | None) -> str:
         )
     start = starts[0]
 
+    # Only the block's own keys are rewritten, never anything nested inside
+    # them. YAML requires a block scalar's body to be indented deeper than its
+    # key, so an indent test is what separates `pin.name` from the word `name:`
+    # appearing inside a `note: |` two lines below it. Without this the scan
+    # rewrote a line in the middle of someone's prose and every check below
+    # passed: `drifted` skips `pin` entirely, and comparing key sets cannot see
+    # a changed value.
+    block_indent: str | None = None
     seen: dict[str, int] = {}
     for i in range(start + 1, len(lines)):
         line = lines[i]
         if _TOP_LEVEL_RE.match(line):
             break
+        if _SKIP_RE.match(line):
+            continue
+        indent = line[: len(line) - len(line.lstrip())]
+        if block_indent is None:
+            block_indent = indent
+        if indent != block_indent:
+            continue
         field = _FIELD_RE.match(line)
         if not field:
             continue
@@ -231,6 +285,13 @@ def _rewrite(text: str, commit: str, name: str | None) -> str:
             raise PinError(f"`pin.{key}` appears twice; refusing to guess which is the pin")
         seen[key] = i
         value = commit if key == "commit" else (name or "null")
+        # A value spanning lines would write a second key into the block, and
+        # neither check in `advance()` would notice: the key set grows by one
+        # the comparison does not look for. `name` reaches here from a ledger
+        # record, which anyone who can land a merge on the intent repo writes,
+        # so this is a boundary and not a formality.
+        if "\n" in value or "\r" in value:
+            raise PinError(f"refusing to write a `pin.{key}` that spans lines: {value!r}")
         lines[i] = f"{field.group('indent')}{key}: {value}{field.group('comment') or ''}"
 
     if "commit" not in seen:
@@ -241,14 +302,17 @@ def _rewrite(text: str, commit: str, name: str | None) -> str:
 def advance(product_checkout: str | Path, to: str, intent: str | Path) -> Advance:
     """Move *product_checkout*'s pin to *to*, having checked it is a version."""
     path = product_path(product_checkout)
+    # Absent, unreadable, or not YAML: all "there is no pin file here", which
+    # is the same answer as "this is not a pin file" below and takes the same
+    # code. A caller should not have to tell those apart by reading the text.
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
-        raise PinError(f"{path}: cannot read the pin of record: {exc}") from exc
+        raise SpecTreeError(f"{path}: cannot read the pin of record: {exc}") from exc
     try:
         before = yaml.safe_load(text)
     except yaml.YAMLError as exc:
-        raise PinError(f"{path}: not valid YAML: {exc}") from exc
+        raise SpecTreeError(f"{path}: not valid YAML: {exc}") from exc
     if not isinstance(before, dict) or not isinstance(before.get("pin"), dict):
         raise SpecTreeError(f"{path}: no `pin:` mapping; this is not a pin file")
     if "commit" not in before["pin"]:
@@ -284,8 +348,21 @@ def advance(product_checkout: str | Path, to: str, intent: str | Path) -> Advanc
         )
     if after.get("pin", {}).get("commit") != full:
         raise PinError(f"{path}: the rewrite did not take; the file is unchanged")
-    if set(before["pin"]) != set(after.get("pin", {})):
+    after_pin = after.get("pin") or {}
+    if set(before["pin"]) != set(after_pin):
         raise PinError(f"{path}: the rewrite changed the pin's keys; the file is unchanged")
+    # Values too, not only keys. `commit` and `name` are what this command is
+    # for; anything else under `pin:` must come back identical, and comparing
+    # key sets alone let a rewritten line inside a nested block scalar through.
+    pin_drift = sorted(
+        k for k in before["pin"]
+        if k not in ("commit", "name") and before["pin"][k] != after_pin.get(k)
+    )
+    if pin_drift:
+        raise PinError(
+            f"{path}: rewriting the pin would have changed pin.{pin_drift}; "
+            f"the file is unchanged"
+        )
 
     changed = updated != text
     if changed:
@@ -298,4 +375,5 @@ def advance(product_checkout: str | Path, to: str, intent: str | Path) -> Advanc
         was_name=was_name,
         evidence=evidence,
         changed=changed,
+        has_name="name" in before["pin"],
     )

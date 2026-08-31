@@ -401,6 +401,16 @@ class TestEmit(MintCase):
 
         self.assertEqual(self.emitted(out)["earlier"], "kept")
 
+    def test_an_empty_emit_path_is_an_error_not_a_silent_skip(self):
+        # `--emit "$GITHUB_OUTPUT"` with the variable unset expands to `""`.
+        # Treating that as "no --emit was asked for" takes the whole job green
+        # with every downstream step skipped — the exact failure the flag
+        # exists to prevent, arriving silently.
+        self.spec_commit()
+        code, out = run_cli(["mint", str(self.repo), "--emit", ""])
+        self.assertEqual(code, 1)
+        self.assertIn("GITHUB_OUTPUT", out)
+
     def test_a_value_spanning_lines_is_refused_rather_than_forging_a_key(self):
         from vellum.cli import _emit
 

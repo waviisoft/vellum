@@ -129,8 +129,18 @@ def measure(
     ledger_dir: str | Path | None = None,
     cap: int | None = None,
     pending: int = 0,
+    strict: bool = False,
 ) -> Window:
-    """The divergence window for the intent checkout at *checkout*."""
+    """The divergence window for the intent checkout at *checkout*.
+
+    A record this cannot read is reported and not counted, which makes the
+    window *narrower* than the truth — a gate failing open on corruption. That
+    is the tolerant default, because a name-keyed leftover from before versions
+    were commits is a migration to do rather than a merge to block. *strict*
+    refuses to answer instead, and belongs on wherever the gate actually
+    blocks: there, "I could not read three records" must not read as "there is
+    room for three more versions".
+    """
     if pending < 0:
         raise BackpressureError(f"--pending must not be negative (got {pending})")
     if cap is None:
@@ -174,6 +184,13 @@ def measure(
         name = data.get("name")
         unshipped.append((sha, state or "(no state)", str(name) if name else None))
 
+    if unreadable and strict:
+        raise BackpressureError(
+            f"{ledger}: {len(unreadable)} file(s) could not be read as ledger records "
+            f"({', '.join(unreadable)}). Under --strict the window is not measured at "
+            f"all rather than measured short: an unreadable record is one this cannot "
+            f"prove has shipped."
+        )
     return Window(cap=cap, unshipped=unshipped, pending=pending, unreadable=unreadable)
 
 
@@ -182,6 +199,7 @@ def run(
     ledger_dir: str | None = None,
     cap: int | None = None,
     pending: int = 0,
+    strict: bool = False,
     out=None,
 ) -> int:
     """Report the window and exit non-zero past the cap.
@@ -193,7 +211,9 @@ def run(
     import sys
 
     stream = out if out is not None else sys.stdout
-    window = measure(checkout, ledger_dir=ledger_dir, cap=cap, pending=pending)
+    window = measure(
+        checkout, ledger_dir=ledger_dir, cap=cap, pending=pending, strict=strict
+    )
     print(window.report(), file=stream)
     if window.blocked:
         print(

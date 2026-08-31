@@ -284,8 +284,6 @@ def _commit_record(repo: Path, ledger: Path, result: Mint) -> None:
     process builds. Pushing is not done here — it needs a credential and a
     branch, which are the caller's.
     """
-    _git(repo, "config", "user.name", COMMITTER_NAME)
-    _git(repo, "config", "user.email", COMMITTER_EMAIL)
     try:
         rel = ledger.resolve().relative_to(repo.resolve()).as_posix()
     except ValueError as exc:
@@ -303,6 +301,16 @@ def _commit_record(repo: Path, ledger: Path, result: Mint) -> None:
         result.notes.append("Nothing to commit: the record is already in the tree.")
         return
     message = f"ledger: open {result.name or result.sha}"
-    _git(repo, "commit", "-q", "-m", message)
+    # `-c`, not `git config`. The workflow this was lifted from wrote the
+    # identity into `.git/config` because a runner's checkout is thrown away a
+    # minute later; a developer running `vellum mint . --commit` in their own
+    # clone would keep it. Scoped to the one command, the behaviour is the same
+    # in CI and does not follow anyone home.
+    _git(
+        repo,
+        "-c", f"user.name={COMMITTER_NAME}",
+        "-c", f"user.email={COMMITTER_EMAIL}",
+        "commit", "-q", "-m", message,
+    )
     result.committed = True
     result.notes.append(f"Committed: {message} (not pushed — that is the caller's)")

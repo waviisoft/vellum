@@ -16,14 +16,17 @@ rather than a deployment one (``spec/features/scenarios-and-harness.md``).
 Exit codes, in the one place they are all visible:
 
 * ``0`` — it worked, or the command decided there was nothing to do.
-* ``1`` — the *tree, repo or window* is the problem: a fence that drops
-  scenarios, a shallow clone, a divergence window past its cap. Something a
-  caller should act on.
-* ``2`` — the *invocation* is the problem: the path is not a spec tree, the
-  sha is not a sha, the pin file is not a pin file.
+* ``1`` — the command answered, and the answer is bad news: a fence that drops
+  scenarios, a shallow clone, a divergence window at its cap.
+* ``2`` — the command could not answer: the path is not a spec tree, the sha is
+  not a sha, the pin file is not a pin file, the config has no cap.
 
-The split is load-bearing for a caller that has to tell a bad spec from a bad
-command line, so tests assert the number rather than "non-zero".
+The line is between *an answer you will not like* and *no answer*, and it is
+load-bearing for ``vellum backpressure`` in particular: the moment its
+``continue-on-error`` comes off in ``spec-ci.yml``, 1 has to mean "blocked" and
+nothing else, or a renamed ``.vellum/config.yaml`` reads as backpressure and
+the gate blocks for a reason nobody can find. Tests assert the number rather
+than "non-zero".
 """
 
 from __future__ import annotations
@@ -34,7 +37,7 @@ import sys
 from vellum import __version__
 from vellum.backpressure import BackpressureError
 from vellum.backpressure import run as backpressure_run
-from vellum.config import INTENT_ENV, ConfigError
+from vellum.config import INTENT_ENV
 from vellum.ledger import LedgerError, advance, load_plan, open_record, parse_version
 from vellum.lint import run as lint_run
 from vellum.mint import MintError, mint as mint_run
@@ -162,6 +165,13 @@ def _add_backpressure(sub) -> None:
         default=0,
         help="approved spec PRs not yet landed, counted alongside the ledger's",
     )
+    b.add_argument(
+        "--strict",
+        action="store_true",
+        help="refuse to measure at all when any ledger file cannot be read, "
+             "rather than reporting it and counting a narrower window; belongs "
+             "wherever the gate actually blocks",
+    )
 
 
 def _add_pin(sub) -> None:
@@ -214,6 +224,7 @@ def main(argv: list[str] | None = None) -> int:
                 ledger_dir=args.ledger_dir,
                 cap=args.cap,
                 pending=args.pending,
+                strict=args.strict,
             )
         if args.command == "pin":
             return _pin(args)
@@ -223,18 +234,15 @@ def main(argv: list[str] | None = None) -> int:
     except LedgerError as exc:
         print(f"vellum: {exc}", file=sys.stderr)
         return 2
-    # A shallow clone, an unreadable spec history, a checkout with no ledger:
-    # the repository is the problem, not the command line, so these take lint's
-    # code rather than 2. A window *past its cap* never arrives here —
-    # `backpressure_run` returns 1 for that itself, because being past the cap
-    # is an answer the command computed, not a failure to compute one.
-    except MintError as exc:
-        print(f"vellum: {exc}", file=sys.stderr)
-        return 1
+    # A window could not be measured at all — no ledger directory, no cap in
+    # the config — which is "no answer", not "blocked". Sharing code 1 with
+    # `blocked` would make an armed gate indistinguishable from a broken one.
     except BackpressureError as exc:
         print(f"vellum: {exc}", file=sys.stderr)
-        return 1
-    except ConfigError as exc:
+        return 2
+    # A shallow clone, an unreadable spec history, a sha that is not a version:
+    # the command answered, and the answer is that this cannot proceed.
+    except MintError as exc:
         print(f"vellum: {exc}", file=sys.stderr)
         return 1
     except PinError as exc:
@@ -253,7 +261,16 @@ def _mint(args: argparse.Namespace) -> int:
         commit=args.commit,
     )
     print(result.report())
-    if args.emit:
+    if args.emit is not None:
+        # Not `if args.emit:`. `--emit "$GITHUB_OUTPUT"` with the variable
+        # unset expands to the empty string, and treating that as "no --emit
+        # was asked for" takes the whole job green with every downstream step
+        # skipped — the failure this flag exists to prevent, arriving silently.
+        if not args.emit:
+            raise MintError(
+                "--emit was given an empty path. If this is "
+                '`--emit "$GITHUB_OUTPUT"`, the variable is unset.'
+            )
         _emit(args.emit, result.emit())
     return 0
 

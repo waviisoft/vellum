@@ -94,6 +94,16 @@ versions actually leave the window. The `set -o pipefail` beside it is
 load-bearing — without it the step's status is `tee`'s, and arming the gate
 would produce a check that can never close.
 
+It runs with `--strict`, which refuses to measure at all when a ledger file
+cannot be read rather than reporting it and counting a narrower window. On a
+gate that is the right direction. And `1` from this command means *blocked* and
+nothing else — every other non-zero exit is `2` — so an armed gate's red always
+has one meaning.
+
+The job's `pull_request` trigger includes `.vellum/config.yaml` and `ledger/**`
+alongside `spec/**`, because a PR that raises `divergence_cap` or adds unshipped
+versions must re-run the check that reads them.
+
 ## Prerequisites
 
 - **Nothing depends on the tags.** A spec version is a `main` commit whose diff
@@ -110,6 +120,12 @@ would produce a check that can never close.
   version this CLI recognises, so it is reported as unreadable rather than
   counted, and a ledger half-migrated would have measured a window short.
 
+- **Only one checkout keeps its credential.** `persist-credentials: false` is
+  set on every `actions/checkout` in both files except `on-spec-merge.yml`'s
+  `Check out main`, which is the one that pushes the tag and the ledger commit.
+  It matters most in `spec-ci.yml`, where the jobs run on `pull_request` in a
+  workspace whose root is the PR's merged tree, and where `VELLUM_TOKEN` reads
+  a private repository.
 - The intent repo needs a **`VELLUM_TOKEN`** secret holding a token that can
   read `waviisoft/vellum`. This repo is private, so the intent repo's own job
   token cannot read it. Both workflows check the secret first and fail with an

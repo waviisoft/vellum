@@ -156,8 +156,12 @@ class TestTheCap(BackpressureCase):
         )
         with self.assertRaises(BackpressureError):
             measure(self.repo)
+        # 2, not 1. Once `spec-ci.yml` drops its `continue-on-error`, 1 has to
+        # mean "blocked" and nothing else — otherwise a config the command
+        # cannot read blocks every merge and reads as backpressure while doing
+        # it.
         code, out = run_cli(["backpressure", str(self.repo)])
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 2)
         self.assertIn("divergence_cap", out)
 
     def test_a_non_integer_cap_is_an_error(self):
@@ -171,6 +175,36 @@ class TestTheCap(BackpressureCase):
         (self.repo / ".vellum" / "config.yaml").unlink()
         with self.assertRaises(BackpressureError):
             measure(self.repo)
+
+
+class TestStrict(BackpressureCase):
+    """A gate must not read "I could not measure" as "there is room"."""
+
+    def test_by_default_an_unreadable_record_is_reported_and_not_counted(self):
+        (self.ledger / "broken.yaml").write_text("{ not: valid", encoding="utf-8")
+        self.records("approved")
+        window = measure(self.repo)
+        self.assertEqual(window.count, 1)
+        self.assertEqual(window.unreadable, ["broken.yaml"])
+
+    def test_strict_refuses_to_measure_at_all(self):
+        (self.ledger / "broken.yaml").write_text("{ not: valid", encoding="utf-8")
+        self.records("approved")
+        with self.assertRaises(BackpressureError) as caught:
+            measure(self.repo, strict=True)
+        self.assertIn("broken.yaml", str(caught.exception))
+
+    def test_strict_is_silent_when_every_record_reads(self):
+        self.records("approved", "approved")
+        self.assertEqual(measure(self.repo, strict=True).count, 2)
+
+    def test_the_cli_exits_two_under_strict_not_one(self):
+        # 2 is "no answer". Sharing 1 with "blocked" would make a corrupt
+        # ledger indistinguishable from real backpressure on an armed gate.
+        (self.ledger / "broken.yaml").write_text("{ not: valid", encoding="utf-8")
+        code, out = run_cli(["backpressure", str(self.repo), "--strict"])
+        self.assertEqual(code, 2)
+        self.assertIn("broken.yaml", out)
 
 
 class TestPending(BackpressureCase):
@@ -229,10 +263,24 @@ class TestInvocationErrors(BackpressureCase):
         with self.assertRaises(BackpressureError):
             measure(self.repo)
 
-    def test_the_cli_exits_one_for_it(self):
+    def test_the_cli_exits_two_for_it(self):
+        # "I could not measure the window" must never share a code with
+        # "the window is at its cap"; see TestTheCap.
         code, out = run_cli(["backpressure", str(Path(self.tmp.name) / "nowhere")])
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 2)
         self.assertIn("config", out)
+
+    def test_blocked_is_the_only_thing_that_exits_one(self):
+        self.records("approved", "approved", "approved")
+        blocked, _ = run_cli(["backpressure", str(self.repo)])
+        self.assertEqual(blocked, 1)
+        # Every other non-zero path from this command is 2, so an armed gate's
+        # red is unambiguous.
+        for argv in (
+            ["backpressure", str(Path(self.tmp.name) / "nowhere")],
+            ["backpressure", str(self.repo), "--pending", "-1"],
+        ):
+            self.assertEqual(run_cli(argv)[0], 2, argv)
 
     def test_ledger_dir_points_it_elsewhere(self):
         other = Path(self.tmp.name) / "elsewhere"

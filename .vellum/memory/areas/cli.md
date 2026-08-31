@@ -394,13 +394,20 @@ one (`spec/features/scenarios-and-harness.md`). That the forge's trigger
 *causes* the invocation stays a deployment property, and no harness may
 re-implement the workflow to grade it.
 
-**Exit codes are a contract, and the split is the old one.** 0 worked or
-decided there was nothing to do; 1 the tree, repo or window is the problem; 2
-the invocation is. `suite` already used 1 for "the tree is the problem" and
-`SpecTreeError`/`LedgerError` already meant 2, and the pipeline commands were
-fitted to that rather than inventing a third scheme — which is why
-`vellum pin advance --to spec-v1` exits 2 (that is `LedgerError`, unwrapped on
-purpose) while `--to <a commit that is not a version>` exits 1. Tests assert
+**Exit codes are a contract: 1 is an answer you will not like, 2 is no
+answer.** 0 worked or decided there was nothing to do. `suite` already used 1
+for "the tree is the problem" and `SpecTreeError`/`LedgerError` already meant
+2, and the pipeline commands were fitted to that rather than inventing a third
+scheme — which is why `vellum pin advance --to spec-v1` exits 2 (that is
+`LedgerError`, unwrapped on purpose) while `--to <a commit that is not a
+version>` exits 1.
+
+The line matters most for `backpressure`, and it is why `BackpressureError`
+exits **2** rather than 1: the moment `spec-ci.yml` drops its
+`continue-on-error`, 1 has to mean "blocked" and nothing else. Sharing it with
+"I could not find the config" would make a renamed `.vellum/config.yaml` block
+every spec merge while reading as backpressure — a red nobody can find the
+cause of. `test_blocked_is_the_only_thing_that_exits_one` pins it. Tests assert
 the number, not "non-zero".
 
 ### `vellum mint`
@@ -482,6 +489,14 @@ gate closed. The intent repo's own migration is done
 (`waviisoft/vellum-intent#22`) — measured on `main`, all eleven records are
 sha-keyed — so this guard is protecting a fresh installation, not that one.
 
+**`--strict` is for wherever the gate blocks.** By default a ledger file that
+cannot be read is reported and *not counted*, which makes the window narrower
+than the truth — a gate failing open on corruption. That is the right default
+for a report (a name-keyed leftover is a migration to do, not a merge to
+block) and the wrong one for a gate, so `spec-ci.yml` passes `--strict` and
+gets a refusal instead. "I could not read three records" must never arrive as
+"there is room for three more versions".
+
 ### `vellum pin advance`
 
 **Two sufficient answers, not one checked twice.** A sha is a version if a
@@ -506,6 +521,47 @@ beside a commit that is a different version is decoration that has become a
 lie, and the reader it misleads is the reader it was for. It is set from the
 ledger record's name, or `null` when there is none. A pin file with no `name:`
 key is not given one — only lines already in the block are rewritten.
+
+**The rewrite is scoped to the pin block's own indent, and it has to be.**
+`_rewrite()` walks from `pin:` to the next column-zero key, and it used to
+rewrite *any* line matching `^\s+(commit|name):` at any depth. YAML requires a
+block scalar's body to be indented deeper than its key, so a `note: |` holding
+the word `name:` in its prose got that line rewritten — and **every check in
+`advance()` passed**: `drifted` skips `pin` entirely, and comparing the pin's
+*key set* cannot see a changed value. Found in review, with a working repro.
+The fix is two halves and both are load-bearing: `_rewrite` matches only at the
+block's own indent, and `advance()` now compares the pin's other *values*, not
+just its keys. `TestTheRewriteCannotReachNestedContent` covers it.
+
+**A ledger record's `name` is not trusted, because `ledger/` is not ours.**
+It is interpolated into YAML by f-string, and it arrives from the intent repo's
+`ledger/`, which anyone who can land a merge there writes. A `name` of
+`"spec-v9\n  ref: forged"` wrote a *second key* into the pin block, and neither
+check caught it — the key set grew by one the comparison was not looking for,
+and the pin is what the product's CI fetches the spec at. `_decorative_name()`
+now validates against `TAG_RE` and drops anything else (a name is decoration,
+so dropping beats raising), and `_rewrite` refuses a multi-line value outright.
+Two layers on purpose: the second is what protects a future caller that reaches
+`_rewrite` another way.
+
+**`find_record` short-circuits without parsing, so `pin` must guard the read.**
+An exact filename hit returns immediately (`ledger.py`), so a corrupt
+`ledger/<sha>.yaml` arrives at `verify_version` unparsed and `yaml.safe_load`
+raised straight out of `main()` — a traceback, not one of the two exit codes.
+`mint.py` already handled the same case; `pin.py` did not until review.
+
+**A test that unsets `VELLUM_INTENT_REPO` disarms the conformance job.**
+`run_cli` calls `main()` **in-process** and `_candidate()` reads the variable at
+call time, so a bare `os.environ.pop` leaks into every module discovered after
+it — and discovery is alphabetical, so `test_pin` precedes `test_suite`.
+Measured: `test_suite` alone with the variable set runs 77 tests in 14s with
+zero skips; with a leaking `test_pin` in front of it, 8 skip in 3s. The whole
+point of running the suite inside the `conformance` job is that those skips are
+not a hole, so this made the job green and hollow. `addCleanup(os.environ.pop,
+...)` is the same bug by another route — it *deletes* rather than restores, so
+it only bites in the shape where the variable was set. Use
+`unittest.mock.patch.dict`. `PinCase` now asserts `os.environ` is unchanged
+after every test in the file, which is what caught the second instance.
 
 **`VELLUM_INTENT_REPO` has one definition now.** It lives in
 `src/vellum/config.py` and `tests/support.py` re-exports it. `pin advance`

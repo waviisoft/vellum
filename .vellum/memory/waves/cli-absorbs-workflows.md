@@ -127,6 +127,45 @@ when only the ledger half was measured, rather than implying the whole window.
   "someone should do this" note in that file outlived the doing — run the
   check, do not read the note.
 
+## What the bench found, and what it cost
+
+An independent review of the diff before landing. Four real defects, all in
+`vellum pin advance` or its tests, none in the guards that moved:
+
+1. **A test unset `VELLUM_INTENT_REPO` in-process and never put it back**,
+   which silently disarmed eight of `test_suite`'s pinned-tree assertions — in
+   the CI job whose entire purpose is to stop those skips from being a hole.
+   Measured: `test_suite` alone with the variable set is 77 tests in 14s with
+   zero skips; behind the leaking test, 8 skip in 3s. **The wave's own first
+   report of "conformance green" was true and hollow**, and the fix moved shape
+   two from `skipped=8` to `skipped=0`.
+2. **`_rewrite` could edit a line nested inside a `pin:` block scalar**, and
+   every check in `advance()` passed — `drifted` skips `pin`, and comparing key
+   sets cannot see a changed value. Latent today only because the real
+   `product.yaml` is flat.
+3. **A ledger record's `name` was interpolated raw into YAML**, so a name
+   containing a newline wrote a second key into the pin block undetected.
+   `ledger/` is written by anyone who can land a merge on the intent repo, and
+   the pin is what product CI fetches the spec at.
+4. **`yaml.safe_load` on a ledger record was unguarded in `pin.py`** — a
+   traceback rather than an exit code. `mint.py` already handled it.
+
+The guard added for (1) — `PinCase` asserting `os.environ` is unchanged after
+every test — immediately caught a *second* instance the review had not spotted:
+`addCleanup(os.environ.pop, ...)` deletes rather than restores, so it only
+bites in the shape where the variable was already set. Guards that pay for
+themselves within the same commit are worth writing.
+
+Also taken from the review: `backpressure` errors now exit **2**, leaving `1`
+to mean "blocked" and nothing else once the gate is armed; `--strict` so the
+gate refuses to answer rather than measuring a short window over an unreadable
+record; `--emit ''` is an error rather than a silent skip; `--commit` scopes
+the committer identity with `git -c` instead of writing it into the developer's
+`.git/config`; `persist-credentials: false` on every checkout that does not
+push; `spec-ci.yml` triggers on `.vellum/config.yaml` and `ledger/**`; and the
+`::notice` annotations the old guard step emitted are raised again from
+`steps.mint.outputs.reason`.
+
 ## Landmines this wave planted
 
 **`set -o pipefail` in the backpressure step.** Without it the step's status is

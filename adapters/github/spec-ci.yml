@@ -21,6 +21,12 @@ on:
     paths:
       - 'spec/**'
       - '.github/workflows/spec-ci.yml'
+      # The backpressure job reads these, so a PR that changes them has to
+      # re-run it: `divergence_cap` lives in the config, and the window is
+      # counted from the ledger. Without these a PR could raise the cap, or
+      # add unshipped versions, without the gate that reads them ever running.
+      - '.vellum/config.yaml'
+      - 'ledger/**'
 
 permissions:
   contents: read
@@ -49,6 +55,9 @@ jobs:
           # `shallow: true` when this is wrong and the summary step below fails
           # the job on it — a backstop for this line, not a substitute for it.
           fetch-depth: 0
+          # This checkout never pushes, so the credential has no reason to
+          # outlive it in `.git/config`.
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -76,6 +85,10 @@ jobs:
           ref: ${{ env.VELLUM_REF }}
           token: ${{ secrets.VELLUM_TOKEN }}
           path: vellum-cli
+          # Nothing in this workflow pushes. VELLUM_TOKEN reads a private repo,
+          # and this job's workspace root is a pull request's merged tree, so
+          # the credential should not be left sitting in `.git/config`.
+          persist-credentials: false
 
       - name: Install the vellum CLI
         run: pip install --quiet ./vellum-cli
@@ -177,6 +190,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # This checkout never pushes, so the credential has no reason to
+          # outlive it in `.git/config`.
+          persist-credentials: false
 
       - name: Download the suite
         uses: actions/download-artifact@v4
@@ -250,6 +266,11 @@ jobs:
           # job in this pipeline is checked out with and a per-job exception is
           # how one of them ends up shallow by accident.
           fetch-depth: 0
+          # Nothing here pushes, and this job runs on `pull_request` in a
+          # workspace holding the PR's merged tree. Leaving the job token in
+          # `.git/config` buys nothing and widens what a future step in this
+          # job could reach.
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:
@@ -271,10 +292,23 @@ jobs:
           ref: ${{ env.VELLUM_REF }}
           token: ${{ secrets.VELLUM_TOKEN }}
           path: vellum-cli
+          # VELLUM_TOKEN reads the private product repo and has no business
+          # outliving the checkout that needed it, least of all in a workspace
+          # whose root is a pull request's merged tree.
+          persist-credentials: false
 
       - name: Install the vellum CLI
         run: pip install --quiet ./vellum-cli
 
+      # `--strict` refuses to answer when a ledger file cannot be read, rather
+      # than reporting it and counting a window that is narrower than the
+      # truth. On a gate that is the right direction: "I could not read three
+      # records" must not arrive as "there is room for three more versions".
+      #
+      # This measures the LANDED half of the window only. The spec counts
+      # approved-but-unlanded spec PRs alongside it; those are forge state, and
+      # `--pending <n>` is where that count goes once something here can see it.
+      #
       # Remove `continue-on-error` to make this block a merge. See above.
       #
       # `set -o pipefail` is load-bearing and not style: without it the step's
@@ -285,4 +319,4 @@ jobs:
         continue-on-error: true
         run: |
           set -o pipefail
-          vellum backpressure . | tee -a "$GITHUB_STEP_SUMMARY"
+          vellum backpressure . --strict | tee -a "$GITHUB_STEP_SUMMARY"

@@ -171,6 +171,10 @@ vellum mint . --ref "$GITHUB_SHA" --emit "$GITHUB_OUTPUT"
 vellum mint . --commit                       # also stage and commit; never pushes
 ```
 
+`--commit` does not lint. `on-spec-merge.yml` runs `vellum lint spec/` between
+minting and committing and does its own commit, so a tree that fails lint never
+reaches a commit there; a caller using `--commit` should lint first itself.
+
 **It exits 0 on both of its no-ops** — a commit whose diff does not touch the
 spec tree (a racing merge, a hand-run on a ledger commit), and a replay where a
 record already exists — because both are benign and the workflow step it
@@ -198,7 +202,18 @@ The divergence gate. Counts ledger records that are neither `shipped` nor
 vellum backpressure .              # exit 1 at or past the cap, 0 below
 vellum backpressure . --cap 5      # ask a what-if without editing policy
 vellum backpressure . --pending 2  # plus approved spec PRs that have not landed
+vellum backpressure . --strict     # refuse to answer if any record is unreadable
 ```
+
+**1 means blocked and nothing else.** Every other non-zero exit from this
+command is 2, "I could not measure the window" — a missing config, no ledger
+directory, and under `--strict` a record that will not parse. Without that
+split, an armed gate blocking because `.vellum/config.yaml` was renamed is
+indistinguishable from real backpressure.
+
+`--strict` belongs wherever the gate actually blocks: by default an unreadable
+record is reported and *not counted*, which measures the window narrower than
+the truth.
 
 It blocks **at** the cap, not past it: the question is "may another version
 land". `--pending` exists because an open spec PR is forge state, not

@@ -119,6 +119,26 @@ takes `tee`'s status, which is always 0, so deleting `continue-on-error` would
 arm a gate that can never close — a guard that silently does nothing, which is
 worse than none.
 
+Two more things the armed gate depends on. It runs with **`--strict`**, so a
+ledger file that cannot be read refuses the measurement instead of shrinking
+the window; failing open on corruption is the wrong direction for a gate. And
+**`1` from `vellum backpressure` means blocked and nothing else** — every other
+non-zero exit is `2` — so a renamed `.vellum/config.yaml` can never present as
+backpressure once the hold comes off.
+
+**The job triggers on what it measures.** `spec-ci.yml`'s `paths:` carries
+`.vellum/config.yaml` and `ledger/**` beside `spec/**`. Without them a PR could
+raise `divergence_cap`, or add unshipped versions, without the gate that reads
+them ever running.
+
+**Only the pushing checkout keeps its credential.** `persist-credentials: false`
+is on every `actions/checkout` in both files except `on-spec-merge.yml`'s
+`Check out main`, which pushes the tag and the ledger commit. `actions/checkout`
+defaults to persisting, and `spec-ci.yml`'s jobs run on `pull_request` in a
+workspace rooted at the PR's merged tree — `VELLUM_TOKEN` reads a private repo
+and has no reason to sit in `.git/config` there. If you add a checkout, decide
+which of the two it is.
+
 **The stubs pass vacuously.** Coherence review, coverage review, impact report
 (job `agent-review` in `spec-ci.yml`) and the "Plan the wave" step in
 `on-spec-merge.yml` all `echo` and exit 0. A green `spec-ci` in
@@ -138,6 +158,14 @@ driven in a sandbox, which is what makes pipeline behavior PASS-able rather
 than a deployment property (`spec/features/scenarios-and-harness.md`). Do not
 move a guard back into a `run:` body to "keep it visible"; it becomes
 ungradeable there.
+
+**A no-op still raises a `::notice`, and that is a separate step now.** The old
+guard step emitted `::notice title=Not a spec version` / `::notice
+title=Already recorded`, which is how a no-op showed up in the run summary
+rather than only in a log nobody opens. `vellum mint` prints prose — it has no
+business knowing this forge's annotation syntax — so `Say why nothing was
+recorded` re-raises the annotation from `steps.mint.outputs.reason`. Delete it
+and the two most common outcomes of this workflow become invisible.
 
 **Gate on `steps.mint.outputs.minted`, never on the exit code.** `vellum mint`
 exits 0 on both no-ops — a commit that does not touch `spec/`, and a replay —

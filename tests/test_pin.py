@@ -45,6 +45,25 @@ class PinCase(unittest.TestCase):
         self.product = make_product_repo(root / "product")
         self.pin_file = product_path(self.product)
 
+        # Every test in this file is checked for leaving os.environ as it
+        # found it. `run_cli` calls `main()` in-process, so a test that unsets
+        # VELLUM_INTENT_REPO for good silently disarms `test_suite`'s
+        # pinned-tree assertions — which is what a bare `os.environ.pop` here
+        # did, invisibly, in the CI job that exists to run them.
+        import os
+
+        self._environ = dict(os.environ)
+        self.addCleanup(self._assert_environ_restored)
+
+    def _assert_environ_restored(self):
+        import os
+
+        self.assertEqual(
+            dict(os.environ), self._environ,
+            "this test changed os.environ and did not put it back; "
+            "later test modules read VELLUM_INTENT_REPO at call time",
+        )
+
     def pin(self) -> dict:
         return yaml.safe_load(self.pin_file.read_text(encoding="utf-8"))["pin"]
 
@@ -281,9 +300,16 @@ class TestMalformedPinFiles(PinCase):
             advance(self.product, self.sha, self.intent)
 
     def test_a_missing_file_is_refused(self):
+        # Same code as "this is not a pin file": both are "there is no pin
+        # here", and a caller should not have to read the message to tell an
+        # absent file from a malformed one.
         self.pin_file.unlink()
-        with self.assertRaises(PinError):
+        with self.assertRaises(SpecTreeError):
             advance(self.product, self.sha, self.intent)
+        code, _ = run_cli(
+            ["pin", "advance", str(self.product), "--to", self.sha, "--intent", str(self.intent)]
+        )
+        self.assertEqual(code, 2)
 
     def test_a_second_top_level_pin_block_is_refused_rather_than_guessed(self):
         # Two `pin:` blocks is not a file to repair by picking one.
@@ -293,6 +319,146 @@ class TestMalformedPinFiles(PinCase):
         )
         with self.assertRaises(PinError):
             advance(self.product, self.sha, self.intent)
+
+
+class TestTheRewriteCannotReachNestedContent(PinCase):
+    """The verification in `advance()` cannot see inside the `pin:` block.
+
+    `drifted` skips `pin` entirely and the key-set check ignores values, so a
+    rewrite that edited a line nested under `pin:` passed every check and was
+    written. The guard is therefore in `_rewrite` itself: only the block's own
+    indent level is a candidate.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.sha = commit_area(self.intent, BLOCK)
+
+    def test_a_key_inside_a_block_scalar_is_not_rewritten(self):
+        self.pin_file.write_text(
+            "pin:\n"
+            "  commit: " + "c" * 40 + "\n"
+            "  name: null\n"
+            "  note: |\n"
+            "    how this pin is chosen\n"
+            "    name: whatever the tag says\n",
+            encoding="utf-8",
+        )
+        write_record(self.ledger, self.sha, name="spec-v9")
+
+        advance(self.product, self.sha, self.intent)
+
+        pin = self.pin()
+        self.assertEqual(pin["commit"], self.sha)
+        self.assertEqual(pin["name"], "spec-v9")
+        self.assertEqual(
+            pin["note"], "how this pin is chosen\nname: whatever the tag says\n"
+        )
+
+    def test_a_deeper_nested_commit_is_not_rewritten(self):
+        self.pin_file.write_text(
+            "pin:\n  commit: " + "c" * 40 + "\n  meta:\n    commit: keep-me\n",
+            encoding="utf-8",
+        )
+        advance(self.product, self.sha, self.intent)
+
+        pin = self.pin()
+        self.assertEqual(pin["commit"], self.sha)
+        self.assertEqual(pin["meta"], {"commit": "keep-me"})
+
+    def test_another_value_under_pin_is_preserved_exactly(self):
+        self.pin_file.write_text(
+            "pin:\n  commit: " + "c" * 40 + "\n  line: main\n",
+            encoding="utf-8",
+        )
+        advance(self.product, self.sha, self.intent)
+        self.assertEqual(self.pin()["line"], "main")
+
+
+class TestANameFromTheLedgerIsNotTrusted(PinCase):
+    """`ledger/` is written by anyone who can land a merge on the intent repo.
+
+    The name goes into a YAML file by string interpolation, and the pin is what
+    the product's CI fetches the spec at, so this is a trust boundary rather
+    than a formality.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.sha = commit_area(self.intent, BLOCK)
+        self.pin_file.write_text(
+            "pin:\n  commit: " + "c" * 40 + "\n  name: null\n  line: main\n",
+            encoding="utf-8",
+        )
+
+    def write_name(self, name):
+        import yaml as _yaml
+
+        from vellum.ledger import record_path
+
+        self.ledger.mkdir(parents=True, exist_ok=True)
+        record_path(self.ledger, self.sha).write_text(
+            _yaml.safe_dump(
+                {"spec_version": self.sha, "name": name, "state": "approved"},
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+
+    def test_a_name_that_would_forge_another_key_is_dropped(self):
+        self.write_name("spec-v9\n  line: forged")
+
+        advance(self.product, self.sha, self.intent)
+
+        pin = self.pin()
+        self.assertIsNone(pin["name"])
+        self.assertEqual(pin["line"], "main")
+        self.assertEqual(pin["commit"], self.sha)
+
+    def test_a_name_that_is_not_a_spec_vn_is_dropped(self):
+        self.write_name("not a version name")
+        advance(self.product, self.sha, self.intent)
+        self.assertIsNone(self.pin()["name"])
+
+    def test_a_well_formed_name_is_still_written(self):
+        self.write_name("spec-v9")
+        advance(self.product, self.sha, self.intent)
+        self.assertEqual(self.pin()["name"], "spec-v9")
+
+    def test_the_rewrite_refuses_a_multi_line_value_directly(self):
+        # The second layer. `_decorative_name` filters upstream; this is the
+        # guard at the point of writing, so a future caller reaching `_rewrite`
+        # another way cannot forge a key either.
+        from vellum.pin import _rewrite
+
+        with self.assertRaises(PinError):
+            _rewrite(
+                "pin:\n  commit: b\n  name: null\n", "a" * 40, "spec-v9\n  ref: forged"
+            )
+
+
+class TestAnUnreadableLedgerRecord(PinCase):
+    def test_it_raises_pin_error_rather_than_a_traceback(self):
+        # `find_record` short-circuits on an exact filename hit *without*
+        # parsing, so a corrupt `ledger/<sha>.yaml` reaches the read unparsed.
+        sha = commit_area(self.intent, BLOCK)
+        self.ledger.mkdir(parents=True, exist_ok=True)
+        (self.ledger / f"{sha}.yaml").write_text("{ not: valid: yaml", encoding="utf-8")
+
+        with self.assertRaises(PinError):
+            advance(self.product, sha, self.intent)
+
+    def test_the_cli_exits_one_for_it(self):
+        sha = commit_area(self.intent, BLOCK)
+        self.ledger.mkdir(parents=True, exist_ok=True)
+        (self.ledger / f"{sha}.yaml").write_text("{ not: valid: yaml", encoding="utf-8")
+
+        code, out = run_cli(
+            ["pin", "advance", str(self.product), "--to", sha, "--intent", str(self.intent)]
+        )
+
+        self.assertEqual(code, 1)
+        self.assertIn("ledger record", out)
 
 
 class TestTheCommandLine(PinCase):
@@ -309,20 +475,36 @@ class TestTheCommandLine(PinCase):
         import os
         from vellum.config import INTENT_ENV
 
-        sha = commit_area(self.intent, BLOCK)
-        os.environ[INTENT_ENV] = str(self.intent)
-        self.addCleanup(os.environ.pop, INTENT_ENV, None)
+        # `patch.dict` restores; `addCleanup(os.environ.pop, ...)` *deletes*,
+        # which throws away a value the environment already had. Same leak as
+        # the one below by a different route, and it only shows up in the shape
+        # where the variable was already set — the conformance job.
+        import unittest.mock
 
-        code, _ = run_cli(["pin", "advance", str(self.product), "--to", sha])
+        sha = commit_area(self.intent, BLOCK)
+        with unittest.mock.patch.dict(os.environ, {INTENT_ENV: str(self.intent)}):
+            code, _ = run_cli(["pin", "advance", str(self.product), "--to", sha])
 
         self.assertEqual(code, 0)
         self.assertEqual(self.pin()["commit"], sha)
 
     def test_no_intent_checkout_at_all_exits_two(self):
         import os
+        import unittest.mock
         from vellum.config import INTENT_ENV
 
-        os.environ.pop(INTENT_ENV, None)
+        # `patch.dict`, not a bare `pop`. `run_cli` calls `main()` in-process,
+        # so unsetting this for good leaks into every module discovered after
+        # this one — and `test_suite`'s pinned-tree assertions read it at call
+        # time. A bare pop here silently skipped eight of them, in the CI job
+        # whose whole purpose is to stop that skip from being a hole.
+        with unittest.mock.patch.dict(os.environ):
+            os.environ.pop(INTENT_ENV, None)
+            self._assert_no_intent_exits_two()
+
+    def _assert_no_intent_exits_two(self):
+        from vellum.config import INTENT_ENV
+
         sha = commit_area(self.intent, BLOCK)
         code, out = run_cli(["pin", "advance", str(self.product), "--to", sha])
         self.assertEqual(code, 2)

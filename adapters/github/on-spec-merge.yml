@@ -113,6 +113,11 @@ jobs:
           ref: ${{ env.VELLUM_REF }}
           token: ${{ secrets.VELLUM_TOKEN }}
           path: vellum-cli
+          # VELLUM_TOKEN reads the private product repo and nothing here pushes
+          # to it, so it has no reason to outlive this step in `.git/config`.
+          # (The `Check out main` above is the one checkout that must keep its
+          # credential — it pushes the tag and the ledger commit.)
+          persist-credentials: false
 
       - name: Install the vellum CLI
         run: pip install --quiet ./vellum-cli
@@ -133,6 +138,23 @@ jobs:
         env:
           SHA: ${{ github.sha }}
         run: vellum mint . --ref "$SHA" --emit "$GITHUB_OUTPUT"
+
+      # The old guard step emitted `::notice title=Not a spec version` and
+      # `::notice title=Already recorded`, which is how a no-op showed up in the
+      # run summary rather than only in a log nobody opens. `vellum mint` prints
+      # prose — it has no business knowing this forge's annotation syntax — so
+      # the annotation is re-raised here from the reason it reported.
+      - name: Say why nothing was recorded
+        if: steps.mint.outputs.minted != 'yes'
+        env:
+          REASON: ${{ steps.mint.outputs.reason }}
+          SHA: ${{ steps.mint.outputs.sha }}
+        run: |
+          if [ "$REASON" = "replay" ]; then
+            echo "::notice title=Already recorded::${SHA} already has a ledger record; this run is a replay"
+          else
+            echo "::notice title=Not a spec version::${SHA} does not change spec/, so there is no version here to record. This run is a no-op."
+          fi
 
       - name: Verify the spec still lints
         if: steps.mint.outputs.minted == 'yes'
