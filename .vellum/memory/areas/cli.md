@@ -1,7 +1,7 @@
 # Area: the `vellum` CLI
 
-`src/vellum/`. Thirteen commands — `lint`, `suite extract`,
-`ledger open|advance|verify`, `certify record|check`, the three pipeline
+`src/vellum/`. Fourteen commands — `lint`, `suite extract`,
+`ledger open|advance|verify`, `certify record|check`, `tick`, the three pipeline
 commands `mint`, `backpressure`, `pin advance`, and the five mechanical guards
 `verify boundaries|deps|exit-duty`, `ledger verify` and `budget` — dispatched
 from `build_parser()` in `src/vellum/cli.py`. Every claim below names a file or
@@ -18,7 +18,7 @@ symbol you can grep for.
 | `src/vellum/lint.py` | `lint_tree()`, `Finding`, the `_check_*` functions. |
 | `src/vellum/suite.py` | `extract()`, `scan_file()`, `scenarios_in()`, `BlockError`, `DroppedScenarios`, `fingerprint()`, `version_history()`, `History`, `to_dict()`. |
 | `src/vellum/gitver.py` | `spec_commits()`, `names()`, `is_shallow()`, `markdown_at()`, `show()`. All subprocess git lives here. |
-| `src/vellum/ledger.py` | `open_record()`, `advance()`, `find_record()`, `dump()`, `parse_time()`, `RECORD_KEYS`, `ITEM_KEYS`. Also the certification and lease half: `certify()`, `certification_authorizes()`, `take_lease()`, `clear_lease()`, `active_lease()`. |
+| `src/vellum/ledger.py` | `open_record()`, `advance()`, `find_record()`, `dump()`, `parse_time()`, `upsert_plan()`, `RECORD_KEYS`, `ITEM_KEYS`. Also the certification and lease half: `certify()`, `certification_authorizes()`, `take_lease()`, `clear_lease()`, `active_lease()`. |
 | `src/vellum/certify.py` | `check()` -> `Authorization`, `run_check()`, `run_record()`. The merge gate's evidence. |
 | `src/vellum/mint.py` | `mint()` -> `Mint`, `_commit_record()`. The `on-spec-merge` bookkeeping. |
 | `src/vellum/backpressure.py` | `measure()` -> `Window`, `run()`, `SETTLED_STATES`. The divergence gate. |
@@ -30,6 +30,7 @@ symbol you can grep for.
 | `src/vellum/deps.py` | `check()` -> `Policy`, `registries()`, `host_of()`, `_scan_toml_arrays()`. The dependency-registry guard. |
 | `src/vellum/chain.py` | `verify()` -> `Chain`, `Finding`, `CERTIFIABLE_STATES`. The ledger guard. |
 | `src/vellum/budget.py` | `measure()` -> `Spend`, `window_for()`, `parse_time()`, `PARK_MARKER`. The spend guard. |
+| `src/vellum/reconcile.py` | `reconcile()` -> `Tick`, `run()`, `Action`, `Observed`, `read_observed()`, `corpus_answer()`, `question_terms()`, `_Reconciler`, `ACTION_KINDS`. The stateless reconciler. |
 
 ## Scenario identity
 
@@ -988,6 +989,209 @@ spend window; two definitions of how this project reads a recorded moment is
 how those two come to disagree. It sits next to the `_now()` that writes them.
 `from vellum.budget import parse_time` still works, which is what `cli.py` and
 `tests/test_budget.py` do.
+
+## The reconciler
+
+`vellum tick <intent-checkout>`, in `src/vellum/reconcile.py`. One pass of
+`spec/features/orchestration.md`'s loop: read desired state, read observed
+state, compute the convergent next actions, act. Not a daemon and not a watcher
+— it holds nothing between runs, which is what
+`spec/decisions/2026-08-28-reconciler.md` means by stateless.
+
+**Desired state is repository state; observed state is supplied.** The ledger,
+the spec tree and `releases.yaml` are read off disk. Everything only a forge can
+see — which issues exist, which questions are open, which clarify PR merged,
+what direction was recorded — arrives as `--observed <file>`. That is the same
+division `backpressure --pending`, `budget --projected` and `certify check
+--head` already draw, and it is the reason the reconciler's behavior is a
+PASS-able property instead of a deployment one. **Do not reach for a forge API
+here.** The command reaches no network and takes no credential.
+
+**Every action carries whether the tick performed it.** `ACTION_KINDS` maps each
+kind to `taken`. The four writes are `commit-plan`, `supersede`, `claim` and
+`record-direction`, all of them ledger edits; `plan`, `file-issue`,
+`open-question`, `answer-question`, `draft-clarify`, `close-question` and
+`dispatch` are decided and emitted for the caller, and `hold` is a statement
+about why nothing happened. The set is closed on purpose — an action nothing in
+the spec asks for is a spec question, not a new string.
+
+**`active_lease` is asked before `take_lease`, and `_claim()` is the only place
+either is reached from.** That ordering is the whole lease mutex and the Wave D
+bench asked for it by name: a claimed, unexpired item is not re-dispatched, and
+an expired one returns to the queue. Making `_claim` the single door means a
+later caller cannot get the order wrong by writing a second one.
+`TestTheLeaseIsAMutex` asserts both directions, and
+`test_the_holders_lease_is_not_overwritten_by_the_tick` asserts it on the
+**bytes** — the double-claim being forbidden is a write, not just a dispatch, and
+a test that only checked the action list would pass while the ledger recorded
+the wrong holder.
+
+**A claim is stamped with the tick's own `--now`, not `new_lease`'s wall
+clock.** A tick reconciles *as of* a moment — that is what resolves every expiry
+it reads — so a claim stamped from a different clock puts `taken` after
+`expires` whenever an old moment is replayed, and the lease's own window then
+describes no interval at all.
+
+**Parking is observed, not stored, and that is a reading of the reconciler
+decision rather than a shortcut.** `ITEM_STATES` has no `parked`, and none was
+invented. Under "the forge and the repos are the database", a parked item is
+exactly one the observed state shows an open question issue against, recomputed
+every tick — so nothing can go stale and no migration is owed. Whether the
+ledger *should* carry a park is flagged as a spec question in the wave PR; do
+not settle it by adding a state here.
+
+**There is no mid-run channel, so direction is recorded and the lease is left to
+lapse.** `directions()` writes the new briefing onto the item — `briefing` is a
+real ledger field, "what the agent knew" — and does **not** clear a live lease
+or dispatch beside it. The fresh run carrying the direction is the *next* tick's
+dispatch, after expiry. That is `spec/decisions/2026-08-28-fire-and-collect-executors.md`
+read literally, and the failure it protects against is the one that decision was
+written about.
+
+**Coalescing reads "unstarted" as state *and* lease.** `planned` with no live
+lease. An item an executor is mid-run on is not unstarted; "a superseded
+in-flight item stops" is a different sentence with a different remedy — the
+lease lapses — and marking a running item superseded would take an executor's
+work out of the ledger while it was still being done.
+
+**Overlap is decided on criteria, and the newer version's claims are not
+enough.** The scenario's `When` is an *approval*, which happens before anyone
+plans against it, so a newer wave usually has no items yet. `coalesce()` unions
+the newer record's own `satisfies:` with the scenarios `ledger/suite-<sha>.json`
+dates to that commit — `_armed()`, the same reading of "armed" `chain.py` uses.
+Deleting the armed half makes `@id:coalescing-supersedes` pass only for a wave
+that was already planned, which is the case the scenario is not about.
+
+**Ordering is ancestry, with `approved` times as a reported fallback.** Shas do
+not compare, so `_newer()` asks `gitver.is_ancestor` first. A record for a commit
+the checkout does not have — a shallow clone, a record copied in — cannot be
+ordered that way, and the fallback is the records' own `approved` times, the only
+other clock the ledger has. Without an order, two records claiming the same
+criterion would supersede *each other*, or whichever the filename sort reached
+first, which is a coin flip on the sha.
+
+**"Reported" had to be made true: a supersede the fallback decided says so.**
+`_newer()`'s docstring always promised the approved-time fallback "is reported
+rather than silent, because it is weaker", but nothing carried the fact out — a
+supersede is a *write* (the item leaves the queue), and it was being decided on
+timestamps with no trace anywhere. `_newer()` now returns `(later,
+by_approved_time)`, the supersede's detail gains "(ordered by approved time, not
+ancestry)", and `note_time_ordered()` puts one note per version pair in the
+report. Weaker is the point: two versions approved in the same second do not
+order at all, which is the case the docstring itself flags. The strong ordering
+stays quiet, so the note means something —
+`test_a_supersede_ancestry_decided_carries_no_such_note` holds that end.
+
+**A shape the observed file cannot be read in is refused, never read as "nothing
+there".** `_mappings()` raises rather than skipping. The two are opposite
+instructions: "nothing is filed" makes a tick file every issue again, and "nobody
+holds a lease" makes it dispatch an item somebody is already running. A caller's
+mistyped key must not arrive as a confident tick.
+`TestObservedStateIsRefusedRatherThanMisread` covers the shapes. An *empty* file
+is still supplied observed state holding nothing, which is a different fixture
+and a different answer.
+
+**`data.get(key) or []` is how that rule breaks, and it broke twice.** `or []`
+coerces a *falsy* value before any `isinstance` check runs, so `issues: 0`,
+`issues: false`, `issues: ''` and `issues: {}` all parsed as "observed, and
+nothing is filed" — the misread the rule exists to stop, and the loudest one
+there is, because it makes the tick emit `file-issue` for every planned item
+whose issue already exists. `_mappings()` never had the bug because it tests the
+raw value against `(None, [])` first; `issues:` and a question's `comments:` now
+do the same. The check to reach for is the raw value, never a truthiness test —
+only absent and the empty list are empty. Both refusals are exit 2, both are in
+`TestObservedStateIsRefusedRatherThanMisread`, and
+`test_an_absent_or_empty_issue_list_is_the_one_thing_that_is_empty` guards the
+other side so the refusal cannot grow over the shapes that really are empty.
+
+**A claim is the one action a tick writes on a fact it could not check, and it
+says so.** With `--executor` and no `--observed`, `queue()` leases and dispatches
+an item whose forge issue nothing confirms was ever filed — the issue-filed guard
+below it only fires when observed state *was* supplied. Requiring observed state
+before a claim was considered and rejected: it breaks a legitimate path. The
+`@id:fire-and-collect` lease-mutex tests assert the mutex with no forge in reach,
+which is right — the mutex is a property of repository state, and this module's
+whole design note is that its behavior is "a PASS-able property rather than a
+deployment one". Gating the claim on a forge fixture would also contradict the
+command's own contract that absent observed state means acting on repository
+state alone. So the claim is still taken and *named*: `leased_unconfirmed`
+collects the items and the report carries "A claim wants observed state ...", and
+`--executor`'s help says to pair it with `--observed`. Inferring "this item was
+leased before, so its issue must exist" was rejected too — an earlier tick could
+have taken that lease without observed state, so the inference gives false
+assurance, and it is a rule no spec sentence backs. Making the refusal real is a
+spec question, not a guess for this module.
+
+**Idempotence is asserted on the bytes.** A record is written only when the pass
+actually changed its `dump()`, so a second tick over an unchanged world writes
+nothing. The way this fails in practice is a record rewritten identically every
+tick — invisible in a report, very visible in a git history —
+so `test_a_second_tick_over_an_unchanged_world_writes_nothing` compares
+`read_bytes()`. **Measured on the real ledger, not assumed:** a tick over
+waviisoft/vellum-intent at the pin reads 12 records, reaches 12 `plan` actions
+(every record is `approved` with an empty work plan — no record in that repo has
+ever carried a work item), writes nothing, and leaves the directory
+byte-identical.
+
+**Exit 1 means a parked wave and nothing else.** The same discipline
+`backpressure` needs: 1 is what a caller blocks on, so it is reserved for the one
+answer the spec says stops a wave — "past the timebox (default 24h) the wave
+parks". Every way the command can fail to answer is 2, including an unreadable
+`--observed`, an unreadable `--now`, `--plan` without `--version`, a `--version`
+naming no record, and `--lease-minutes 0`.
+`test_a_parked_wave_is_the_only_thing_that_exits_one` pins it, and the tests
+assert the number rather than "non-zero".
+
+**Two numbers in here are the command's own and say so.** No spec sentence and
+no config key gives a **lease duration** (`--lease-minutes`, default 60) or a
+**corpus match threshold** (`--corpus-match`, default 1.0 — every significant
+term). Both are named in the report rather than left to look derived, and both
+are knobs so an installation can move them without a code change. The corpus
+default is the strict end deliberately: a question wrongly bounced hands an
+agent an answer that is not the answer and the mistake lands in code, while a
+question wrongly escalated costs a human one glance at an issue. The threshold
+is the part a spec slice would pin.
+
+**`_conformed_baseline()` reports and never writes.** `mint` sets a record's
+`baseline` to the previous spec *version*; `spec/features/orchestration.md` says
+a plan is produced against the *conformed* baseline, which is
+`releases.yaml`'s `channels.<ch>.spec_conformed`. Those are different commits and
+the record has one field, so the tick names the conformed baseline in its `plan`
+action and leaves `baseline` alone. On the real ledger `spec_conformed` is
+`null`, and the action says "none recorded" rather than guessing — flagged as a
+spec question in the wave PR.
+
+**Every outside string the report prints goes through `_one_line()` first.** The
+report is printed and a caller may pipe it into a step summary the way
+`spec-ci.yml` pipes `backpressure`'s; a value carrying a newline starts a line of
+its own, and a line of its own is all `::add-mask` needs. Executor names,
+question text, briefings and paths all arrive from an observed file or from the
+intent repo's `ledger/`, both written by whoever can land a merge there.
+`TestTheReportIsNotAWorkflowCommandChannel` covers them, and one test in that
+class covers the *other* direction: a briefing reaches the ledger through
+`ledger.dump`, never an f-string, so a briefing shaped like `ok\nstate:
+superseded` does not forge a key — the failure `pin.py` had with a record's
+`name`.
+
+**Ledger *filenames* were the one gap in that "every", and they are the easiest
+to forget.** `report()` joined `written` and `unreadable` from `path.name`
+directly while every other outside string went through `_one_line()`. A filename
+is attacker-controlled in exactly the way the note above describes — anyone who
+lands a merge writes `ledger/`, git permits a newline inside a filename, and the
+`*.yaml` glob matches across one — so `evil\n::error::pwned .yaml` put
+`::error::pwned` on a line of its own. Both halves are reachable: a record is
+keyed by the `spec_version` it carries and not by what it is called, so a valid
+record under a crafted name is a real record whose name reaches `written` the
+moment the tick writes it. `to_dict()` is left alone on purpose — JSON escapes
+the newline, and the raw name is the accurate datum there.
+
+**`upsert_plan()` is a new public seam on `ledger.py`, and it exists because the
+reconciler batches writes.** `advance()` reads, merges and writes in one call,
+which is what a single `ledger advance --plan` wants; a tick holds several
+records open and writes each once at the end, so it needs the merge without the
+read/write around it. Both go through `_upsert_planned`, so the two cannot come
+to disagree about what committing a plan means.
+
 
 ## Patterns worth keeping
 

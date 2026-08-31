@@ -437,6 +437,21 @@ def _upsert_planned(record: dict, entry: dict) -> None:
         existing.update({k: v for k, v in fields.items() if v})
 
 
+def upsert_plan(record: dict, plan: list[dict]) -> None:
+    """Merge a whole work plan into *record*, in place, keyed by issue number.
+
+    The public seam over ``_upsert_planned``. ``advance()`` reads a record,
+    merges and writes in one call, which is what a single ``vellum ledger
+    advance --plan`` wants; the reconciler holds several records open across one
+    tick and writes each once at the end, so it needs the merge without the
+    read/write around it (``src/vellum/reconcile.py``). Idempotent for the same
+    reason ``advance --plan`` is: an entry whose issue is already in the record
+    updates that item rather than adding a second one.
+    """
+    for entry in plan:
+        _upsert_planned(record, entry)
+
+
 def load_plan(path: str | Path) -> list[dict]:
     """Read ``workplan.yaml``: a ``work_items:`` list, or a bare list."""
     data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
