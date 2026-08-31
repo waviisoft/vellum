@@ -85,7 +85,7 @@ from vellum.gitver import (
     spec_commits,
 )
 from vellum.ledger import LedgerError, open_record, record_path
-from vellum.specfile import resolve_spec_root
+from vellum.specfile import SpecTreeError, resolve_spec_root
 
 #: The identity ledger commits are made under, matching what
 #: ``on-spec-merge.yml`` configured before it called git.
@@ -175,7 +175,19 @@ def mint(
                 f"it descends from and what to call it — all three are wrong below the "
                 f"graft. Fetch the full history (fetch-depth: 0)."
             )
-        sha = resolve(repo, ref)
+        # Resolved on its own, because a `--ref` that names nothing is a
+        # different answer from a history that cannot be read. "You asked about
+        # a commit that is not here" is `no answer` — exit 2, the same code
+        # `pin advance --to` gives a sha it cannot make sense of — while
+        # everything else in this block is a repository this cannot walk, which
+        # is exit 1 alongside the shallow refusal above.
+        try:
+            sha = resolve(repo, ref)
+        except GitUnavailable as exc:
+            raise SpecTreeError(
+                f"{ref!r} does not name a commit in {repo}: {exc}. `--ref` takes "
+                f"something the checkout can resolve — a sha, a branch, a tag, HEAD."
+            ) from exc
         versions = spec_commits(repo, sha, prefix)
     except (GitUnavailable, ValueError) as exc:
         raise MintError(f"{checkout}: cannot read the spec history: {exc}") from exc
@@ -306,11 +318,17 @@ def _commit_record(repo: Path, ledger: Path, result: Mint) -> None:
     # minute later; a developer running `vellum mint . --commit` in their own
     # clone would keep it. Scoped to the one command, the behaviour is the same
     # in CI and does not follow anyone home.
+    #
+    # Scoped with `-- <rel>`, exactly as the `add` above is. Without the
+    # pathspec this commits the whole index, so a developer running `vellum
+    # mint . --commit` over a tree where they had staged something else gets
+    # their work swept into a commit named `ledger: open …`. The command stages
+    # one directory; it should commit the one it staged.
     _git(
         repo,
         "-c", f"user.name={COMMITTER_NAME}",
         "-c", f"user.email={COMMITTER_EMAIL}",
-        "commit", "-q", "-m", message,
+        "commit", "-q", "-m", message, "--", rel,
     )
     result.committed = True
     result.notes.append(f"Committed: {message} (not pushed — that is the caller's)")

@@ -17,7 +17,7 @@ been edited in place and the other has not.
 
 | File | Trigger | Does |
 |---|---|---|
-| `spec-ci.yml` | `pull_request` touching `spec/**` | `vellum lint` + `vellum suite extract`, uploads `suite.json`, summarises the scenarios the PR introduces or changes, and runs `vellum backpressure` (reporting, not blocking — see below). The three agent reviews are stubs. |
+| `spec-ci.yml` | `pull_request` touching `spec/**`, `ledger/**`, `.vellum/config.yaml` or the workflow itself | `vellum lint` + `vellum suite extract`, uploads `suite.json`, summarises the scenarios the PR introduces or changes, and runs `vellum backpressure` (reporting, not blocking — see below). The three agent reviews are stubs. |
 | `on-spec-merge.yml` | `push` to `main` touching `spec/**` | `vellum mint` opens the ledger record for the merge commit; the workflow tags the decorative name, extracts the suite, files work-item issues from `workplan.yaml`, commits and pushes. The planner is a stub. |
 
 ## The bodies are shims

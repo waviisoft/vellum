@@ -166,10 +166,16 @@ baseline and a derived decorative name. This is what
 bodies are shims over it).
 
 ```sh
-vellum mint .                                # report what it would record
+vellum mint .                                # writes the record; does not commit it
 vellum mint . --ref "$GITHUB_SHA" --emit "$GITHUB_OUTPUT"
 vellum mint . --commit                       # also stage and commit; never pushes
 ```
+
+**There is no dry run.** The first line above writes `ledger/<sha>.yaml` — what
+`--commit` adds is the `git add` and `git commit`, not the write. The line is
+still safe to run twice, because a second run is a replay and leaves the record
+alone, but it is not a preview: to see what would be recorded without recording
+it, run it against a scratch `--ledger-dir`.
 
 `--commit` does not lint. `on-spec-merge.yml` runs `vellum lint spec/` between
 minting and committing and does its own commit, so a tree that fails lint never

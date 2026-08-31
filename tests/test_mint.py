@@ -188,6 +188,71 @@ class TestRacingMergeIsANoOp(MintCase):
         self.assertIn("No spec version exists", result.report())
 
 
+class TestANoFfMergeCommitIsAVersion(MintCase):
+    """The case the `rev-list --first-parent` choice exists for.
+
+    `spec/features/spec-pipeline.md`: "the merge commit on main is the spec
+    version". Ask `git diff-tree` what a merge commit changed and it says
+    nothing — a merge's default diff is the combined one, which is empty unless
+    the merge resolved a conflict. So a guard built on `diff-tree` sees a
+    `--no-ff` spec merge as "not a spec version", mints nothing, and the
+    version that a spec PR just landed never gets a record.
+
+    `rev-list --first-parent -- spec` asks the question the spec actually
+    states: does this commit differ from *its first parent* inside the spec
+    tree. On a merge commit that is the whole of what the branch brought in.
+    Main is squash-linear today, which is exactly why this case needs a test
+    rather than a comment — nothing else in the suite would notice if the walk
+    were changed back.
+    """
+
+    def merge_a_spec_branch(self) -> str:
+        first = self.spec_commit()
+        git(self.repo, "checkout", "-q", "-b", "side")
+        self.spec_commit(CHANGED)
+        git(self.repo, "checkout", "-q", "main")
+        git(self.repo, "merge", "--no-ff", "--no-edit", "-q", "side")
+        return first
+
+    def test_the_merge_commit_is_minted(self):
+        self.merge_a_spec_branch()
+        merge = git(self.repo, "rev-parse", "HEAD").strip()
+
+        result = mint(self.repo)
+
+        self.assertTrue(result.minted)
+        self.assertEqual(result.sha, merge)
+        self.assertEqual(self.record(merge)["spec_version"], merge)
+
+    def test_it_is_the_second_version_with_the_first_as_its_baseline(self):
+        # The commit on the branch is not on main's first-parent line, so it is
+        # not a version and does not get counted or become the baseline.
+        first = self.merge_a_spec_branch()
+
+        result = mint(self.repo)
+
+        self.assertEqual(result.name, "spec-v2")
+        self.assertEqual(result.baseline, first)
+
+    def test_a_merge_that_brings_in_nothing_from_the_spec_tree_is_not_a_version(self):
+        # The other half of the same question: `--first-parent` decides on the
+        # diff against the first parent, so a `--no-ff` merge of a branch that
+        # touched nothing under spec/ is still a no-op.
+        first = self.spec_commit()
+        git(self.repo, "checkout", "-q", "-b", "side")
+        commit_elsewhere(self.repo, "notes only")
+        git(self.repo, "checkout", "-q", "main")
+        git(self.repo, "merge", "--no-ff", "--no-edit", "-q", "side")
+
+        result = mint(self.repo)
+
+        self.assertFalse(result.minted)
+        self.assertEqual(result.reason, "not-a-spec-version")
+        self.assertEqual(sorted(pth.name for pth in self.ledger.glob("*.yaml")), [])
+        # ... and the version it names instead is the one before the merge.
+        self.assertIn(first, "\n".join(result.notes))
+
+
 class TestReplayGuard(MintCase):
     """The record either exists for this commit or it does not (decision D11)."""
 
@@ -342,6 +407,23 @@ class TestCommitting(MintCase):
         self.assertFalse(result.committed)
         self.assertEqual(git(self.repo, "rev-parse", "HEAD").strip(), head)
 
+    def test_it_commits_the_ledger_and_not_whatever_else_was_staged(self):
+        # `git commit` without a pathspec commits the whole index. A developer
+        # running this in their own clone with unrelated work staged had it
+        # swept into a commit called `ledger: open …`; the command stages one
+        # directory and should commit the one it staged.
+        self.spec_commit()
+        (self.repo / "unrelated.txt").write_text("mine\n", encoding="utf-8")
+        git(self.repo, "add", "unrelated.txt")
+
+        mint(self.repo, commit=True)
+
+        files = git(self.repo, "show", "--name-only", "--format=", "HEAD").split()
+        self.assertTrue(all(f.startswith("ledger/") for f in files), files)
+        self.assertNotIn("unrelated.txt", files)
+        # ...and it is still staged, not swallowed and not thrown away.
+        self.assertIn("unrelated.txt", git(self.repo, "diff", "--cached", "--name-only"))
+
     def test_a_record_already_in_the_tree_is_not_re_committed(self):
         sha = self.spec_commit()
         write_record(self.ledger, sha, name="spec-v1")
@@ -406,10 +488,27 @@ class TestEmit(MintCase):
         # Treating that as "no --emit was asked for" takes the whole job green
         # with every downstream step skipped — the exact failure the flag
         # exists to prevent, arriving silently.
+        #
+        # 2, not 1: nothing was measured and no answer was reached. 1 is the
+        # code that means "a shallow clone; this cannot proceed", and the two
+        # sharing a number is what teaches a caller to read only "non-zero" —
+        # a habit `backpressure`'s gate cannot afford. See `cli.py`'s docstring.
         self.spec_commit()
         code, out = run_cli(["mint", str(self.repo), "--emit", ""])
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 2)
         self.assertIn("GITHUB_OUTPUT", out)
+
+    def test_an_unwritable_emit_path_is_a_cli_error_not_a_traceback(self):
+        # `$GITHUB_OUTPUT` is the one step every downstream `if:` reads its
+        # answer from, so "that path is wrong" has to arrive as this command's
+        # own failure rather than as an OSError traceback and a Python exit
+        # code.
+        self.spec_commit()
+        code, out = run_cli(
+            ["mint", str(self.repo), "--emit", str(Path(self.tmp.name) / "no" / "such" / "dir")]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("emitted step outputs", out)
 
     def test_a_value_spanning_lines_is_refused_rather_than_forging_a_key(self):
         from vellum.cli import _emit
@@ -429,6 +528,32 @@ class TestInvocationErrors(MintCase):
         # from a bad checkout reads the code, not the message.
         code, _ = run_cli(["mint", str(Path(self.tmp.name) / "nowhere")])
         self.assertEqual(code, 2)
+
+    def test_a_ref_that_names_no_commit_raises_spec_tree_error(self):
+        self.spec_commit()
+        with self.assertRaises(SpecTreeError):
+            mint(self.repo, ref="no-such-ref")
+
+    def test_the_cli_exits_two_for_a_ref_that_names_no_commit(self):
+        # 2, not 1. "You asked about a commit that is not here" is no answer;
+        # 1 is reserved for an answer the caller will not like — the shallow
+        # refusal — and `backpressure` needs that line to stay clean.
+        self.spec_commit()
+        code, out = run_cli(["mint", str(self.repo), "--ref", "no-such-ref"])
+        self.assertEqual(code, 2)
+        self.assertIn("no-such-ref", out)
+
+    def test_a_repository_it_cannot_walk_is_still_exit_one(self):
+        # The other side of the split the test above draws: a shallow clone is
+        # an answer, and it keeps 1.
+        self.spec_commit()
+        clone = Path(self.tmp.name) / "shallow"
+        subprocess.run(
+            ["git", "clone", "-q", "--depth", "1", f"file://{self.repo}", str(clone)],
+            check=True, capture_output=True,
+        )
+        code, _ = run_cli(["mint", str(clone)])
+        self.assertEqual(code, 1)
 
 
 if __name__ == "__main__":

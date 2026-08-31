@@ -19,7 +19,8 @@ Exit codes, in the one place they are all visible:
 * ``1`` — the command answered, and the answer is bad news: a fence that drops
   scenarios, a shallow clone, a divergence window at its cap.
 * ``2`` — the command could not answer: the path is not a spec tree, the sha is
-  not a sha, the pin file is not a pin file, the config has no cap.
+  not a sha, the pin file is not a pin file, the config has no cap, a ``--ref``
+  names no commit, ``--emit`` was handed an empty path.
 
 The line is between *an answer you will not like* and *no answer*, and it is
 load-bearing for ``vellum backpressure`` in particular: the moment its
@@ -27,11 +28,19 @@ load-bearing for ``vellum backpressure`` in particular: the moment its
 nothing else, or a renamed ``.vellum/config.yaml`` reads as backpressure and
 the gate blocks for a reason nobody can find. Tests assert the number rather
 than "non-zero".
+
+The split is the CLI's, not each command's. ``mint`` used to report both of its
+invocation failures — an unresolvable ``--ref``, an empty ``--emit`` — as 1,
+which is the code that means "a shallow clone; this cannot proceed". Two
+different things sharing a number is how a caller learns to read only
+"non-zero", and the moment that habit sets in the paragraph above stops being
+true of ``backpressure`` too.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from vellum import __version__
@@ -267,7 +276,12 @@ def _mint(args: argparse.Namespace) -> int:
         # was asked for" takes the whole job green with every downstream step
         # skipped — the failure this flag exists to prevent, arriving silently.
         if not args.emit:
-            raise MintError(
+            # Exit 2, not 1. Nothing was measured and no answer was reached —
+            # the command was told to write somewhere and given nowhere, which
+            # is the same class as `pin advance` with no intent checkout below.
+            # 1 is reserved for an answer the caller will not like, and
+            # `backpressure` is the reason that line has to stay clean.
+            raise SpecTreeError(
                 "--emit was given an empty path. If this is "
                 '`--emit "$GITHUB_OUTPUT"`, the variable is unset.'
             )
@@ -291,14 +305,20 @@ def _emit(path: str, pairs: dict[str, str]) -> None:
     bad = sorted(k for k, v in pairs.items() if "\n" in v or "\r" in v)
     if bad:
         raise MintError(f"refusing to emit {bad}: a value spanning lines would forge a key")
-    with open(path, "a", encoding="utf-8") as fh:
-        for key, value in pairs.items():
-            fh.write(f"{key}={value}\n")
+    # An unwritable `$GITHUB_OUTPUT` is a failure of this command, reported the
+    # way its other failures are. Letting `OSError` out printed a traceback and
+    # a Python exit code into the one step every downstream `if:` reads its
+    # answer from, which is the least legible place in the pipeline to be told
+    # that a path is wrong.
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            for key, value in pairs.items():
+                fh.write(f"{key}={value}\n")
+    except OSError as exc:
+        raise MintError(f"{path}: cannot write the emitted step outputs: {exc}") from exc
 
 
 def _pin(args: argparse.Namespace) -> int:
-    import os
-
     intent = args.intent or os.environ.get(INTENT_ENV)
     if not intent:
         # An invocation problem, not a repository one: nothing was pointed at.

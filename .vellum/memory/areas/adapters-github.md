@@ -57,7 +57,7 @@ copy instructions.
 
 | File | Trigger |
 |---|---|
-| `adapters/github/spec-ci.yml` | `pull_request` touching `spec/**` |
+| `adapters/github/spec-ci.yml` | `pull_request` touching `spec/**`, `ledger/**`, `.vellum/config.yaml`, or the workflow file |
 | `adapters/github/on-spec-merge.yml` | `push` to `main` touching `spec/**` |
 
 ## Landmines

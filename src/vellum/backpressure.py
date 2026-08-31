@@ -39,12 +39,14 @@ so rather than implying the whole window was measured.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
 
 from vellum.config import ConfigError, config_path, divergence_cap
+from vellum.gitver import TAG_RE
 from vellum.ledger import SHA_RE
 
 #: States a version has left the divergence window in. Everything else counts.
@@ -120,6 +122,38 @@ class Window:
         return "\n".join(lines)
 
 
+# =====================================================================
+# `report()` is printed, and `spec-ci.yml` pipes it straight into
+# $GITHUB_STEP_SUMMARY. Both fields below arrive from the intent repo's
+# `ledger/`, which anyone who can land a merge there writes, so both are
+# narrowed here rather than at the point of printing: a newline in either
+# forges a `::error` / `::notice` / `::add-mask` workflow command on its own
+# line, and `::add-mask` in particular is how a forged line reaches beyond
+# cosmetics. `sha` needs no such treatment — `SHA_RE` above already accepts
+# nothing but hex.
+# =====================================================================
+
+
+def _first_word(state: str) -> str:
+    """A record's ``state``, narrowed to the one token a state can be."""
+    words = state.split()
+    return words[0] if words else "(no state)"
+
+
+def _decorative_name(value) -> str | None:
+    """A record's ``name``, if it is one worth printing.
+
+    `spec-v<N>` or nothing, the same rule `pin.py` applies to the same field
+    for the same reason. A name is decoration — nothing here reads it to
+    decide anything — so a malformed one is dropped and the row prints without
+    it, rather than raising and taking the whole measurement down.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text if TAG_RE.match(text) else None
+
+
 def ledger_dir_for(checkout: str | Path) -> Path:
     return Path(checkout) / "ledger"
 
@@ -181,8 +215,12 @@ def measure(
         state = str(data.get("state") or "").strip()
         if state in SETTLED_STATES:
             continue
-        name = data.get("name")
-        unshipped.append((sha, state or "(no state)", str(name) if name else None))
+        # Settled-ness is decided on the WHOLE value, and only then is the
+        # value narrowed for display. A record whose state is `shipped` with
+        # anything after it has not shipped, and collapsing before the test
+        # would drop it from the window — a gate opening on a crafted record,
+        # which is the one direction this must never fail in.
+        unshipped.append((sha, _first_word(state), _decorative_name(data.get("name"))))
 
     if unreadable and strict:
         raise BackpressureError(
@@ -208,8 +246,6 @@ def run(
     only speaks when it fails tells a passing run nothing about how much room
     is left, and the margin is the useful half of a backpressure signal.
     """
-    import sys
-
     stream = out if out is not None else sys.stdout
     window = measure(
         checkout, ledger_dir=ledger_dir, cap=cap, pending=pending, strict=strict

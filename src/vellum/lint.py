@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
@@ -321,8 +322,6 @@ def lint_tree(spec_dir: str | Path) -> list[Finding]:
 
 def run(spec_dir: str, as_json: bool = False, out=None) -> int:
     """Print findings and return the process exit code."""
-    import sys
-
     stream = out or sys.stdout
     findings = lint_tree(spec_dir)
     if as_json:

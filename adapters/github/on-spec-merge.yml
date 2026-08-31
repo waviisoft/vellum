@@ -288,8 +288,17 @@ jobs:
             [ -n "$title" ] || continue
             full="${LABEL}: ${title}"
 
-            existing="$(gh issue list --state all --search "\"${full}\" in:title" \
-              --json number,title --jq ".[] | select(.title == \"${full}\") | .number" | head -1)"
+            # The title travels as an environment variable and the `--jq`
+            # program is a fixed string. Pasting `$full` into the program made
+            # an attacker-supplied title into jq *source*: a work-item title
+            # of `x") | $ENV.GH_TOKEN | (.` closed the comparison and read the
+            # environment, and the environment on this step holds GH_TOKEN —
+            # `contents: write` and `issues: write` on the intent repo. Titles
+            # come from `workplan.yaml`, which the planner writes into a repo
+            # anyone who can land a merge can write. `env.FULL` is a value jq
+            # looks up, never text it parses.
+            existing="$(FULL="$full" gh issue list --state all --search "\"${full}\" in:title" \
+              --json number,title --jq 'map(select(.title == env.FULL)) | .[0].number // empty')"
 
             if [ -n "$existing" ]; then
               number="$existing"
@@ -304,21 +313,28 @@ jobs:
               echo "::notice title=Filed issue::#${number} ${full}"
             fi
 
-            satisfies_args=""
+            # An array, expanded quoted — not a string expanded bare. The
+            # `${satisfies_args}` this replaces was word-split by the shell, so
+            # a `satisfies` entry of `auth-one --state shipped` did not arrive
+            # as one slice: it arrived as argv, and `--state shipped` is
+            # precisely the flag that drops a version out of the backpressure
+            # window. The entries come from `workplan.yaml`, so this is a trust
+            # boundary and not tidying. (The `# shellcheck disable=SC2086` that
+            # used to sit here was suppressing the warning for this exact bug.)
+            satisfies_args=()
             if [ -n "$satisfies" ]; then
               IFS=',' read -ra slices <<< "$satisfies"
               for slice in "${slices[@]}"; do
-                satisfies_args="${satisfies_args} --satisfies ${slice}"
+                satisfies_args+=(--satisfies "$slice")
               done
             fi
 
-            # shellcheck disable=SC2086
             vellum ledger advance \
               --version "$SHA" \
               --item "$number" \
               --title "$title" \
               --repo "$repo" \
-              ${satisfies_args} \
+              "${satisfies_args[@]}" \
               --ledger-dir ledger
           done < items.txt
 

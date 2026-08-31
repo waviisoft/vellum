@@ -254,6 +254,10 @@ jobs:
   # the `continue-on-error` line to arm it** — once release pointers are
   # maintained and shipped versions actually leave the window. Nothing else
   # needs to change.
+  #
+  # Arming is TRACKED, not merely intended: `waviisoft/vellum-intent#41`
+  # schedules it into Wave F, behind the release machinery that has to exist
+  # first. This comment is not the only record of the hold.
   # ------------------------------------------------------------------
   backpressure:
     name: Backpressure check (reporting only)
@@ -309,7 +313,8 @@ jobs:
       # approved-but-unlanded spec PRs alongside it; those are forge state, and
       # `--pending <n>` is where that count goes once something here can see it.
       #
-      # Remove `continue-on-error` to make this block a merge. See above.
+      # Remove `continue-on-error` to make this block a merge. See above, and
+      # `waviisoft/vellum-intent#41` for when.
       #
       # `set -o pipefail` is load-bearing and not style: without it the step's
       # status is `tee`'s, which is always 0, so deleting the

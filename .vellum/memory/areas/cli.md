@@ -456,6 +456,16 @@ shims will be.
 `find_record()` skips a record it cannot parse; treating that as "no record"
 would mint straight over it. `_existing()` checks the direct path too.
 
+**Its invocation failures exit 2, not 1.** An unresolvable `--ref` and an empty
+`--emit` both used to report as 1 — the code that means "a shallow clone; this
+cannot proceed". They are "no answer", which is 2 everywhere else in this CLI,
+and `resolve()` is now called on its own so the two cases can be told apart
+from a history that genuinely cannot be walked. The split is not pedantry: two
+different things sharing a number is how a caller learns to read only
+"non-zero", and `backpressure`'s gate is the thing that cannot survive that
+habit. The shallow refusal keeps 1, and there is a test either side of the
+line.
+
 ### `vellum backpressure`
 
 Counts ledger records whose state is neither `shipped` nor `superseded` —
@@ -478,7 +488,9 @@ eleven records on intent `main` count as unshipped against a cap of 3.
 `spec-ci.yml` therefore runs the real command with `continue-on-error: true`
 and reports; arming it before releases exist would block the very merge that
 lands the release machinery. Delete that line when shipped versions actually
-leave the window. The `set -o pipefail` beside it is load-bearing: without it
+leave the window — tracked as `waviisoft/vellum-intent#41`, which schedules
+arming into Wave F. The hold is a scheduled item, not an intention living in a
+comment. The `set -o pipefail` beside it is load-bearing: without it
 the step takes `tee`'s status and arming the gate produces a check that can
 never close.
 
@@ -488,6 +500,21 @@ this CLI recognises; counting one would let a pre-commit-era leftover hold the
 gate closed. The intent repo's own migration is done
 (`waviisoft/vellum-intent#22`) — measured on `main`, all eleven records are
 sha-keyed — so this guard is protecting a fresh installation, not that one.
+
+**Its report is a workflow-command channel, so two fields are narrowed
+before they reach it.** `spec-ci.yml` pipes `report()` straight into
+`$GITHUB_STEP_SUMMARY`, and a record's `state` and `name` come from the intent
+repo's `ledger/`, which anyone who can land a merge there writes. A newline in
+either starts a line of its own, and a line of its own is all `::error`,
+`::notice` or `::add-mask` needs. `name` now goes through the same `TAG_RE`
+check `pin.py` gives the same field, and `state` is narrowed to its first
+whitespace-separated token. Order matters in one place: **settled-ness is
+decided on the whole value and only then is the value narrowed**, so a state of
+`shipped` plus junk still counts as unshipped. Collapsing first would let a
+crafted record walk out of the divergence window, which is the one direction a
+gate must not fail in. `TestTheReportIsNotAWorkflowCommandChannel` covers both
+fields and that ordering. `sha` needs nothing: `SHA_RE` already accepts only
+hex.
 
 **`--strict` is for wherever the gate blocks.** By default a ledger file that
 cannot be read is reported and *not counted*, which makes the window narrower
@@ -532,6 +559,41 @@ the word `name:` in its prose got that line rewritten — and **every check in
 The fix is two halves and both are load-bearing: `_rewrite` matches only at the
 block's own indent, and `advance()` now compares the pin's other *values*, not
 just its keys. `TestTheRewriteCannotReachNestedContent` covers it.
+
+**A ledger record's `spec_version` is the load-bearing field, and it was the
+unchecked one.** `verify_version` validated `name` and not `commit` — the
+field that becomes `pin.commit`, which product CI hands to `git checkout`. Two
+things let it through: `find_record` returns an exact filename hit *without
+parsing it*, so the `SHA_RE` check on its glob branch never ran; and
+`verify_version` returned `full or recorded`, so whenever the intent checkout
+could not resolve the sha itself the record's own text became the answer. A
+crafted `ledger/<sha>.yaml` holding `spec_version: "$(id > /tmp/pwned)"`
+reached `pin.commit` verbatim, at exit 0. Found by the bench with a working
+repro, on both reviewers' lists independently. `_from_record()` now asks two
+things of the field — that it parses as a sha, and that it agrees by prefix
+with the sha that reached it — and refuses either way. The disagreement half is
+not decoration: `find_record`'s glob branch matches on prefix and so cannot
+disagree, but the filename branch never compared them, so `ledger/<A>.yaml`
+saying `spec_version: <B>` pinned B while the operator asked for A. Both
+refusals are `PinError`, exit 1, matching every other malformed-record refusal
+in that block — a record being malformed is one answer, not two exit codes
+depending on which field is wrong.
+
+**The pin file's newlines and the pin block's end are both preserved
+literally.** Two smaller ones from the same review. `read_text`/`write_text`
+translate newlines, so advancing the pin in a CRLF file reflowed the *whole
+file* to LF — a one-value change arriving as a whole-file diff, which is
+exactly what the line-at-a-time edit exists to avoid; the read and the write
+now go through `open(..., newline="")` and `_split()` keeps each line's `\r`
+off the match and puts it back on the rewrite. (`open`, not `Path.read_text`:
+that only grew a `newline` argument in 3.13 and the floor here is 3.10.) And
+the scan used to end the block on `^[A-Za-z_][\w-]*:` — a *Python identifier*,
+not a YAML key. `2024-report:` and `"quoted":` are both valid at column zero
+and matched neither, so the scan ran on into the next block and refused a
+well-formed file with `pin.commit appears twice`, naming a `commit:` belonging
+to something else. It ends on indent now: content at column zero ends the
+block, whatever it is called. `TestFilesThatAreNotWhatTheScanAssumed` covers
+all four.
 
 **A ledger record's `name` is not trusted, because `ledger/` is not ours.**
 It is interpolated into YAML by f-string, and it arrives from the intent repo's

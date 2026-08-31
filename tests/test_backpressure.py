@@ -253,6 +253,66 @@ class TestTheReport(BackpressureCase):
         self.assertIn("nothing unshipped", measure(self.repo).report())
 
 
+class TestTheReportIsNotAWorkflowCommandChannel(BackpressureCase):
+    """`spec-ci.yml` pipes `report()` straight into `$GITHUB_STEP_SUMMARY`.
+
+    Both fields printed per row come from the intent repo's `ledger/`, which
+    anyone who can land a merge there writes. A newline in either one starts a
+    line of its own in that stream, and a line of its own is all a
+    `::error` / `::notice` / `::add-mask` workflow command needs.
+    """
+
+    def crafted(self, sha, **fields):
+        import yaml as _yaml
+
+        from vellum.ledger import new_record, record_path
+
+        self.ledger.mkdir(parents=True, exist_ok=True)
+        record = new_record(sha)
+        record.update(fields)
+        path = record_path(self.ledger, sha)
+        path.write_text(_yaml.safe_dump(record, sort_keys=False), encoding="utf-8")
+        return path
+
+    def test_a_state_carrying_a_forged_annotation_is_narrowed_to_one_word(self):
+        self.crafted(SHAS[0], state="approved\n::add-mask::hunter2")
+
+        out = measure(self.repo).report()
+
+        self.assertIn("approved", out)
+        self.assertNotIn("::add-mask", out)
+        self.assertNotIn("hunter2", out)
+        # One record, one row: the forged second line is gone rather than
+        # merely unrecognised.
+        rows = [line for line in out.split("\n") if SHAS[0][:12] in line]
+        self.assertEqual(len(rows), 1)
+
+    def test_a_name_that_is_not_a_spec_vn_never_reaches_the_report(self):
+        self.crafted(SHAS[0], state="approved", name="spec-v9\n::error title=Blocked::forged")
+
+        out = measure(self.repo).report()
+
+        self.assertNotIn("::error", out)
+        self.assertNotIn("forged", out)
+
+    def test_a_well_formed_name_is_still_printed(self):
+        # The narrowing drops what is malformed; it does not drop the field.
+        self.crafted(SHAS[0], state="approved", name="spec-v9")
+        self.assertIn("spec-v9", measure(self.repo).report())
+
+    def test_a_state_of_shipped_plus_junk_has_not_shipped(self):
+        # Settled-ness is decided on the whole value, then the value is
+        # narrowed for display. Collapsing first would let a crafted record
+        # leave the divergence window — the one direction a gate must not fail
+        # in.
+        self.crafted(SHAS[0], state="shipped\n::notice::gone")
+
+        window = measure(self.repo)
+
+        self.assertEqual(window.count, 1)
+        self.assertNotIn("::notice", window.report())
+
+
 class TestInvocationErrors(BackpressureCase):
     def test_a_checkout_with_no_ledger_is_an_error_not_an_empty_window(self):
         # An empty window is the answer that lets every merge through, so
