@@ -19,7 +19,7 @@ intent:
 # loud wave closed; its decorative name arrives when the intent workflow tags it.
 #
 pin:
-  commit: 2f46a686a4bca15a944ee48d633d33a942a42a66
+  commit: 8dc25f803517698f03243263e9fe7e614ad902ff
   name: null
 
 # This repo's entry in the intent repo's .vellum/workspace.yaml.
