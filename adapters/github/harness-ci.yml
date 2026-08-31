@@ -151,13 +151,19 @@ jobs:
       # here has one meaning, and a mistyped role or a missing config arrives
       # as a different colour of red rather than as a boundary crossing.
       #
-      # This one BLOCKS from the day it lands. Unlike the backpressure gate in
-      # spec-ci.yml it has nothing to deadlock on: the boundary is already the
-      # rule, the harness tree already holds only harness files, and every
-      # harness merge on main to date passes it (measured — see the PR that
-      # added this file). A guard that would be red on arrival earns a
-      # `continue-on-error` and a note saying when to remove it. This one does
-      # not, so it does not have one.
+      # This one BLOCKS meaningfully from the day the intent repo declares its
+      # boundaries — the `write_boundaries` block in `.vellum/config.yaml` that
+      # the paired spec change adds. Unlike the backpressure gate in spec-ci.yml
+      # it has nothing to deadlock on: the boundary is already the rule, the
+      # harness tree already holds only harness files, and against that block
+      # every harness merge on main to date passes it (measured — see the PR
+      # that added this file). Before the block exists it does not pass green on
+      # a harness PR either: with nothing to check against it exits 2 ("I could
+      # not answer"), the fail-closed colour of red — so this file must not be
+      # installed into the intent repo ahead of that block. A guard that would
+      # be red on arrival for lack of a rule earns a `continue-on-error` and a
+      # note saying when to remove it; this one's rule lands with it, so it does
+      # not have one.
       - name: vellum verify boundaries
         if: steps.harness.outputs.touched == 'yes'
         env:

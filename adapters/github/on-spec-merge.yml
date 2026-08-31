@@ -402,7 +402,20 @@ jobs:
               exit 0
             fi
             echo "::notice title=Push raced::main moved while this run was working; rebasing and retrying (attempt ${attempt})"
-            git pull --rebase origin main
+            # A conflict must redden and stop HERE, before any further push. The
+            # default `bash -eo pipefail` shell already exits the step on a
+            # failed rebase, but this guarantee — never push main's tip back
+            # with the ledger record silently dropped — is too load-bearing to
+            # rest on an ambient shell flag a reader of this loop cannot see. So
+            # the rebase failure is handled explicitly: abort the paused rebase
+            # (HEAD would otherwise be detached at main's tip, without the
+            # record) and fail loudly. The record stays committed locally for a
+            # hand-written recovery; it is never lost to a green run.
+            if ! git pull --rebase origin main; then
+              git rebase --abort 2>/dev/null || true
+              echo "::error title=Rebase conflict::the ledger record for ${TAG} did not rebase cleanly onto main; it is committed locally but NOT pushed. Recover by hand with 'vellum mint'."
+              exit 1
+            fi
           done
           git push origin HEAD:main
 
