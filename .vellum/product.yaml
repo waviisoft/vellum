@@ -15,11 +15,11 @@ intent:
 # `name` is decoration (spec/decisions/2026-08-28-versions-are-commits.md).
 # Nothing reads it to decide anything, so it may be absent, late or wrong
 # without changing behavior — a commit that carries no `spec-v*` tag simply has
-# no name yet. This pin is the spec version the memory relocation landed
-# with; its decorative name arrives when the intent workflow tags it.
+# no name yet. This pin is the spec version current when the extract-fails-
+# loud wave closed; its decorative name arrives when the intent workflow tags it.
 #
 pin:
-  commit: 666df3d3bf60413412627535f8727d32d39145dd
+  commit: 0e9f3f57fd94fa0cbbda6602da9a79c609e1c231
   name: null
 
 # This repo's entry in the intent repo's .vellum/workspace.yaml.
