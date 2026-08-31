@@ -203,11 +203,23 @@ def parse_time(value) -> datetime.datetime | None:
     return moment.astimezone(datetime.timezone.utc)
 
 
-def _ordered(data: dict, keys: tuple[str, ...]) -> dict:
-    """Reorder *data* by *keys*, keeping any unrecognised keys at the end."""
+def ordered(data: dict, keys: tuple[str, ...]) -> dict:
+    """Reorder *data* by *keys*, keeping any unrecognised keys at the end.
+
+    Public because ``release.py`` orders ``releases.yaml`` and each cut inside
+    it the same way, for the same reason ``RECORD_KEYS`` and ``ITEM_KEYS``
+    exist: a state change is then a one-line diff and a read/write round-trip
+    is byte-stable. Keeping unrecognised keys is half the contract — these are
+    the intent repo's files and an installation may carry keys this version
+    does not model.
+    """
     out = {k: data[k] for k in keys if k in data}
     out.update({k: v for k, v in data.items() if k not in out})
     return out
+
+
+#: The private spelling this module has always used internally.
+_ordered = ordered
 
 
 def _ordered_present(item: dict, key: str, keys: tuple[str, ...]) -> None:

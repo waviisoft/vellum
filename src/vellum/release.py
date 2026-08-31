@@ -81,6 +81,7 @@ from vellum.ledger import (
     dump,
     find_record,
     load,
+    ordered as _ordered,
     parse_time,
     parse_version,
 )
@@ -277,6 +278,16 @@ def parse_versions(pairs: list[str], declared: dict[str, str], where: Path) -> d
                 f"or a repo slug"
             )
         name = product if product in declared else by_repo.get(product)
+        # A name reached through the repo slug comes out of the workspace file
+        # rather than off the command line, so it has not been through
+        # `_PRODUCT_RE`. It becomes a key in the cut's `versions` mapping, and a
+        # mapping key is the half of this file a reader keys off — so it is held
+        # to the same shape as one a caller types.
+        if name is not None and not _PRODUCT_RE.match(name):
+            raise ReleaseError(
+                f"{where} declares a product named {name!r}, which is not a "
+                f"usable product name; a cut keys its version set by that name."
+            )
         if name is None:
             known = ", ".join(sorted(declared)) or "(none)"
             raise ReleaseError(
@@ -475,12 +486,6 @@ def _require_full_history(checkout: str | Path) -> Path:
     return repo
 
 
-def _ordered(data: dict, keys: tuple[str, ...]) -> dict:
-    out = {k: data[k] for k in keys if k in data}
-    out.update({k: v for k, v in data.items() if k not in out})
-    return out
-
-
 def _cut_matches(existing: dict, waves: list[str], versions: dict[str, str], channel: str) -> bool:
     """Whether an already-recorded cut is *this* cut being replayed."""
     recorded = existing.get("waves")
@@ -626,7 +631,22 @@ def cut(
                 f"would record it as not promoted. A promotion that happened is "
                 f"not un-recorded by re-running the cut."
             )
-        replayed = was_promoted == promote
+        # A cut recorded with no result may gain one — the suite genuinely runs
+        # elsewhere and its answer genuinely arrives later, which is the whole
+        # reason `--suite-result` is a separate invocation's worth of
+        # information. A result that is already recorded is not overwritten:
+        # `red` quietly becoming `null` on a re-run would lose the only record
+        # that the candidate was tested and failed.
+        recorded_result = existing.get("suite_result")
+        recorded_result = str(recorded_result) if recorded_result is not None else None
+        if recorded_result is not None and recorded_result != suite_result:
+            raise ReleaseRefused(
+                f"{cut_id} already records suite_result {recorded_result!r} and "
+                f"this invocation reports {suite_result!r}. A recorded result is "
+                f"not overwritten; a new run against the same candidate is a new "
+                f"cut, so pass a different --at."
+            )
+        replayed = was_promoted == promote and recorded_result == suite_result
 
     record_entry = _ordered(
         {

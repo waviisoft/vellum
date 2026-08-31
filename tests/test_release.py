@@ -444,6 +444,24 @@ class TestReplay(ReleaseCase):
         self.assertIn("already recorded as promoted", out)
         self.assertEqual(self.pointer(), self.first)
 
+    def test_a_red_result_arriving_later_is_recorded_onto_the_cut(self):
+        self.cut("--wave", self.first, "--versions", f"core={FULL}")
+        self.assertIsNone(self.released()["cuts"][0]["suite_result"])
+        code, _ = self.cut(
+            "--wave", self.first, "--versions", f"core={FULL}", "--suite-result", "red"
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(self.released()["cuts"][0]["suite_result"], "red")
+        self.assertEqual(len(self.released()["cuts"]), 1)
+
+    def test_a_recorded_suite_result_is_not_overwritten(self):
+        """A `red` quietly becoming `null` loses the only record of the failure."""
+        self.cut("--wave", self.first, "--versions", f"core={FULL}", "--suite-result", "red")
+        code, out = self.cut("--wave", self.first, "--versions", f"core={FULL}")
+        self.assertEqual(code, 1)
+        self.assertIn("not overwritten", out)
+        self.assertEqual(self.released()["cuts"][0]["suite_result"], "red")
+
     def test_a_different_cut_under_the_same_id_is_refused(self):
         self.cut("--wave", self.first, "--versions", f"core={FULL}")
         code, out = self.cut("--wave", self.second, "--versions", f"core={FULL}")
