@@ -159,6 +159,89 @@ class TestValidation(PinCase):
         self.assertEqual(advance(self.product, sha[:8], self.intent).now, sha)
         self.assertEqual(self.pin()["commit"], sha)
 
+    def test_a_record_whose_spec_version_is_not_a_sha_is_refused(self):
+        # The blocking defect. `find_record` returns an exact filename hit
+        # WITHOUT parsing it, so `SHA_RE` on its glob branch never ran — and
+        # `verify_version` then used the record's `spec_version` as its answer
+        # whenever the intent checkout could not resolve the sha itself. A
+        # crafted `ledger/<sha>.yaml` therefore put arbitrary text into
+        # `pin.commit`, at exit 0, and `pin.commit` is what product CI hands to
+        # `git checkout` in a `run:` body.
+        sha = "b" * 40
+        self.ledger.mkdir(parents=True, exist_ok=True)
+        (self.ledger / f"{sha}.yaml").write_text(
+            'spec_version: "$(id > /tmp/pwned)"\nname: spec-v1\nstate: approved\n',
+            encoding="utf-8",
+        )
+        before = self.pin_file.read_text(encoding="utf-8")
+
+        with self.assertRaises(PinError) as caught:
+            advance(self.product, sha, self.intent)
+
+        self.assertIn("not a commit sha", str(caught.exception))
+        self.assertEqual(self.pin_file.read_text(encoding="utf-8"), before)
+
+    def test_a_record_whose_spec_version_is_not_a_sha_is_refused_on_a_real_commit_too(self):
+        # Same record, reached the other way — the sha resolves, so the old
+        # code ignored `spec_version` entirely rather than trusting it. The
+        # field is still junk and the record still does not vouch for anything.
+        sha = commit_area(self.intent, BLOCK)
+        self.ledger.mkdir(parents=True, exist_ok=True)
+        (self.ledger / f"{sha}.yaml").write_text(
+            "spec_version: spec-v1\nname: spec-v1\nstate: approved\n", encoding="utf-8"
+        )
+
+        with self.assertRaises(PinError) as caught:
+            advance(self.product, sha, self.intent)
+        self.assertIn("not a commit sha", str(caught.exception))
+
+    def test_a_record_whose_spec_version_disagrees_with_its_filename_is_refused(self):
+        # `find_record`'s glob branch matches on prefix, so a record it finds
+        # by content cannot disagree with what was asked. The filename branch
+        # never compared the two, so `ledger/<A>.yaml` holding `spec_version:
+        # <B>` pinned B while the operator asked for A. A record contradicting
+        # its own name vouches for neither.
+        sha = commit_area(self.intent, BLOCK)
+        other = "b" * 40
+        self.ledger.mkdir(parents=True, exist_ok=True)
+        (self.ledger / f"{sha}.yaml").write_text(
+            f"spec_version: {other}\nname: spec-v1\nstate: approved\n", encoding="utf-8"
+        )
+        before = self.pin_file.read_text(encoding="utf-8")
+
+        with self.assertRaises(PinError) as caught:
+            advance(self.product, sha, self.intent)
+
+        self.assertIn("disagrees", str(caught.exception))
+        self.assertIn(other, str(caught.exception))
+        self.assertEqual(self.pin_file.read_text(encoding="utf-8"), before)
+
+    def test_a_record_written_under_the_full_forty_still_vouches_for_an_abbreviation(self):
+        # The reconciliation is prefix-either-way, not equality: the record may
+        # hold the full sha where the caller typed eight. Refusing that would
+        # refuse the ordinary case.
+        sha = commit_area(self.intent, BLOCK)
+        write_record(self.ledger, sha, name="spec-v1")
+
+        result = advance(self.product, sha[:8], self.intent)
+
+        self.assertEqual(result.now, sha)
+        self.assertIn("ledger record", result.evidence)
+
+    def test_the_cli_exits_one_for_a_crafted_record(self):
+        sha = "b" * 40
+        self.ledger.mkdir(parents=True, exist_ok=True)
+        (self.ledger / f"{sha}.yaml").write_text(
+            'spec_version: "$(id > /tmp/pwned)"\n', encoding="utf-8"
+        )
+
+        code, out = run_cli(
+            ["pin", "advance", str(self.product), "--to", sha, "--intent", str(self.intent)]
+        )
+
+        self.assertEqual(code, 1)
+        self.assertIn("spec_version", out)
+
     def test_a_refusal_leaves_the_file_exactly_as_it_was(self):
         commit_area(self.intent, BLOCK)
         stray = commit_elsewhere(self.intent, "ledger: open spec-v1")
@@ -319,6 +402,75 @@ class TestMalformedPinFiles(PinCase):
         )
         with self.assertRaises(PinError):
             advance(self.product, self.sha, self.intent)
+
+
+class TestFilesThatAreNotWhatTheScanAssumed(PinCase):
+    """Two shapes of well-formed pin file the rewrite used to mishandle."""
+
+    def setUp(self):
+        super().setUp()
+        self.sha = commit_area(self.intent, BLOCK)
+
+    def test_a_crlf_file_stays_crlf(self):
+        # `read_text`/`write_text` translate newlines, so a CRLF pin file came
+        # back LF *throughout* — every line rewritten in a change to one value,
+        # which is the whole-file diff the line-at-a-time edit exists to avoid.
+        self.pin_file.write_bytes(
+            b"intent:\r\n  repo: a/b\r\n\r\npin:\r\n  commit: " + b"c" * 40
+            + b"\r\n  name: null\r\n"
+        )
+
+        advance(self.product, self.sha, self.intent)
+
+        raw = self.pin_file.read_bytes()
+        self.assertEqual(self.pin(), {"commit": self.sha, "name": None})
+        self.assertNotIn(b"\n", raw.replace(b"\r\n", b""))
+        self.assertEqual(raw.count(b"\r\n"), 6)
+
+    def test_an_lf_file_stays_lf(self):
+        # The other direction, so "preserve what you found" is asserted both
+        # ways rather than inferred from one.
+        self.pin_file.write_bytes(b"pin:\n  commit: " + b"c" * 40 + b"\n  name: null\n")
+
+        advance(self.product, self.sha, self.intent)
+
+        self.assertNotIn(b"\r", self.pin_file.read_bytes())
+
+    def test_a_top_level_key_that_is_not_an_identifier_ends_the_block(self):
+        # The scan used to end the pin block on `^[A-Za-z_][\w-]*:`, which is a
+        # Python identifier and not a YAML key. `2024-report:` is valid and
+        # matched nothing, so the scan ran on into the next block and refused a
+        # well-formed file — with `pin.commit appears twice`, naming a
+        # `commit:` that belongs to something else entirely.
+        self.pin_file.write_text(
+            "pin:\n  commit: " + "c" * 40 + "\n  name: null\n"
+            "\n2024-report:\n  commit: keep-me\n",
+            encoding="utf-8",
+        )
+
+        advance(self.product, self.sha, self.intent)
+
+        self.assertEqual(self.pin()["commit"], self.sha)
+        text = self.pin_file.read_text(encoding="utf-8")
+        self.assertIn("  commit: keep-me", text)
+        self.assertEqual(
+            yaml.safe_load(text)["2024-report"], {"commit": "keep-me"}
+        )
+
+    def test_a_quoted_top_level_key_ends_the_block_too(self):
+        self.pin_file.write_text(
+            "pin:\n  commit: " + "c" * 40 + "\n"
+            '\n"quoted":\n  name: keep-me\n',
+            encoding="utf-8",
+        )
+
+        advance(self.product, self.sha, self.intent)
+
+        self.assertEqual(self.pin()["commit"], self.sha)
+        self.assertEqual(
+            yaml.safe_load(self.pin_file.read_text(encoding="utf-8"))["quoted"],
+            {"name": "keep-me"},
+        )
 
 
 class TestTheRewriteCannotReachNestedContent(PinCase):

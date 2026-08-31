@@ -119,8 +119,20 @@ jobs:
 
       - name: Move the intent checkout to the pin
         if: steps.cred.outputs.available == 'yes'
+        # Through `env`, never `${{ }}` inside the script — the same rule the
+        # two steps below already follow, and the one step that most needed it.
+        # `${{ }}` pastes its value into the script *before* the shell parses
+        # the line, so a pin carrying a quote and a `;` runs as this step's own
+        # code on a job holding SPEC_TOKEN, a credential that reads the private
+        # intent repo. And `pin.commit` is not typed here: it is read out of
+        # `.vellum/product.yaml`, which `vellum pin advance` writes from a
+        # ledger record in the intent repo — attacker-writable by anyone who
+        # can land a merge there. As an `env` value it is data the shell reads
+        # out of the environment, never source it executes.
+        env:
+          PIN: ${{ steps.pin.outputs.commit }}
         run: |
-          git -C intent checkout --quiet --detach "${{ steps.pin.outputs.commit }}"
+          git -C intent checkout --quiet --detach "$PIN"
           git -C intent log --oneline -1
 
       - uses: actions/setup-python@v5

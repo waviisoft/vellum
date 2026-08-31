@@ -100,10 +100,9 @@ _FIELD_RE = re.compile(
     r"(?P<comment>[ \t]+#.*)?$"
 )
 
-#: A blank line, or one holding only a comment. Neither sets the block's indent.
+#: A blank line, or one holding only a comment. Neither sets the block's indent,
+#: and neither ends the block.
 _SKIP_RE = re.compile(r"^\s*(#.*)?$")
-#: Any other key at column zero ends the pin block.
-_TOP_LEVEL_RE = re.compile(r"^[A-Za-z_][\w-]*:")
 
 
 class PinError(Exception):
@@ -192,8 +191,7 @@ def verify_version(intent: str | Path, sha: str) -> tuple[str, str | None, str]:
             raise PinError(f"{record}: cannot read the ledger record: {exc}") from exc
         if not isinstance(data, dict):
             raise PinError(f"{record}: ledger record is not a YAML mapping")
-        recorded = str(data.get("spec_version") or "").strip().lower()
-        return (full or recorded), _decorative_name(data.get("name")), f"ledger record {record.name}"
+        return _from_record(record, data, full, sha)
 
     if full is None:
         raise PinError(
@@ -229,6 +227,58 @@ def verify_version(intent: str | Path, sha: str) -> tuple[str, str | None, str]:
     return full, None, "spec-touching commit in the intent checkout's ancestry"
 
 
+def _from_record(
+    record: Path, data: dict, full: str | None, sha: str
+) -> tuple[str, str | None, str]:
+    """What a ledger record vouches for, having been made to say it properly.
+
+    `spec_version` is the load-bearing field: it becomes `pin.commit`, which is
+    the sha the product's CI fetches the spec tree at. It arrives from the
+    intent repo's `ledger/`, which anyone who can land a merge there writes, so
+    it gets the check `_decorative_name` gives the decorative field one
+    function down — and then some, because a name that is wrong is dropped
+    while a commit that is wrong is *used*.
+
+    Two things are asked of it, and neither was asked before:
+
+    * **It is a sha.** `find_record`'s glob branch already runs `SHA_RE` over
+      every record it parses, but the exact-filename branch returns before
+      parsing anything — so `ledger/<sha>.yaml` holding
+      `spec_version: "$(id > /tmp/pwned)"` reached `pin.commit` verbatim, exit
+      0, and from there a `run:` body in product CI.
+    * **It agrees with the sha that reached it.** The glob branch matches on
+      prefix in either direction and so cannot disagree; the filename branch
+      never compared them, so a record *named* for one version could name
+      another inside and the pin would follow the inside one. A record that
+      contradicts its own filename is not a record to pick a side of.
+
+    Refused as a `PinError` rather than letting `parse_version`'s `LedgerError`
+    out: everything else wrong with a *record* in this block — unreadable YAML,
+    not a mapping — is a `PinError` and exits 1, and "the ledger record is
+    malformed" is one answer, not two exit codes depending on which field.
+    """
+    recorded = str(data.get("spec_version") or "").strip().lower()
+    try:
+        recorded = parse_version(recorded)
+    except LedgerError as exc:
+        raise PinError(
+            f"{record}: the record's `spec_version` is not a commit sha ({exc}). "
+            f"That field is what becomes `pin.commit`, and the pin is what CI "
+            f"fetches the spec at, so it is not written from a record that does "
+            f"not name a version."
+        ) from exc
+    asked = (full or sha).strip().lower()
+    # Prefix either way: the record may hold the full forty where the caller
+    # typed eight, or the other way round. What is refused is disagreement.
+    if not (asked.startswith(recorded) or recorded.startswith(asked)):
+        raise PinError(
+            f"{record}: the record says `spec_version: {recorded}` but it was "
+            f"reached as {asked}. A record that disagrees with the sha naming it "
+            f"vouches for neither; fix the ledger rather than pinning a guess."
+        )
+    return (full or recorded), _decorative_name(data.get("name")), f"ledger record {record.name}"
+
+
 def _decorative_name(value) -> str | None:
     """A ledger record's ``name``, if it is one this will write into the pin.
 
@@ -246,10 +296,23 @@ def _decorative_name(value) -> str | None:
     return text if TAG_RE.match(text) else None
 
 
+def _split(line: str) -> tuple[str, str]:
+    """A line and its terminator, kept apart.
+
+    The file is read without newline translation (see `advance`), so on a CRLF
+    pin file every element of `text.split("\n")` still carries its `\r`. Left
+    on, that `\r` lands inside `_FIELD_RE`'s `value` group and the rewritten
+    line comes back *without* it — one LF line in a CRLF file, which is a
+    whole-file reflow's worth of confusion in a single line. Split it off for
+    matching and put it back when writing.
+    """
+    return (line[:-1], "\r") if line.endswith("\r") else (line, "")
+
+
 def _rewrite(text: str, commit: str, name: str | None) -> str:
     """Replace ``pin.commit`` and ``pin.name`` in *text*, touching nothing else."""
     lines = text.split("\n")
-    starts = [i for i, line in enumerate(lines) if _PIN_BLOCK_RE.match(line)]
+    starts = [i for i, line in enumerate(lines) if _PIN_BLOCK_RE.match(_split(line)[0])]
     if len(starts) != 1:
         raise PinError(
             f"expected exactly one top-level `pin:` block, found {len(starts)}; "
@@ -264,15 +327,24 @@ def _rewrite(text: str, commit: str, name: str | None) -> str:
     # rewrote a line in the middle of someone's prose and every check below
     # passed: `drifted` skips `pin` entirely, and comparing key sets cannot see
     # a changed value.
+    #
+    # The *end* of the block is an indent test for the same reason, and it used
+    # to be a key-syntax one (`^[A-Za-z_][\w-]*:`). YAML keys are not Python
+    # identifiers: `2024-report:` and `"quoted":` are both valid at column
+    # zero, and neither matched — so the scan ran on past the end of the pin
+    # block into whatever followed, and a well-formed file was refused with
+    # `pin.commit appears twice` naming a `commit:` that belongs to another
+    # block entirely. Content at column zero ends the block, whatever it is
+    # called; nothing indented under `pin:` can reach column zero.
     block_indent: str | None = None
     seen: dict[str, int] = {}
     for i in range(start + 1, len(lines)):
-        line = lines[i]
-        if _TOP_LEVEL_RE.match(line):
-            break
+        line, eol = _split(lines[i])
         if _SKIP_RE.match(line):
             continue
         indent = line[: len(line) - len(line.lstrip())]
+        if not indent:
+            break
         if block_indent is None:
             block_indent = indent
         if indent != block_indent:
@@ -292,7 +364,7 @@ def _rewrite(text: str, commit: str, name: str | None) -> str:
         # so this is a boundary and not a formality.
         if "\n" in value or "\r" in value:
             raise PinError(f"refusing to write a `pin.{key}` that spans lines: {value!r}")
-        lines[i] = f"{field.group('indent')}{key}: {value}{field.group('comment') or ''}"
+        lines[i] = f"{field.group('indent')}{key}: {value}{field.group('comment') or ''}{eol}"
 
     if "commit" not in seen:
         raise PinError("no `pin.commit` under the `pin:` block; this is not a pin file")
@@ -306,7 +378,15 @@ def advance(product_checkout: str | Path, to: str, intent: str | Path) -> Advanc
     # is the same answer as "this is not a pin file" below and takes the same
     # code. A caller should not have to tell those apart by reading the text.
     try:
-        text = path.read_text(encoding="utf-8")
+        # `newline=""` on both the read and the write below. Python's universal
+        # newlines would hand this function a CRLF file translated to LF and
+        # then write LF back — a one-value change arriving as a whole-file
+        # reflow, which is exactly the diff the line-at-a-time edit exists to
+        # avoid, and the noisiest possible way to advance a pin. (`open`, not
+        # `Path.read_text`: `read_text` only grew a `newline` argument in 3.13
+        # and this package supports 3.10.)
+        with open(path, encoding="utf-8", newline="") as fh:
+            text = fh.read()
     except OSError as exc:
         raise SpecTreeError(f"{path}: cannot read the pin of record: {exc}") from exc
     try:
@@ -366,7 +446,8 @@ def advance(product_checkout: str | Path, to: str, intent: str | Path) -> Advanc
 
     changed = updated != text
     if changed:
-        path.write_text(updated, encoding="utf-8")
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(updated)
     return Advance(
         path=path,
         was=was,
