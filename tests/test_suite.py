@@ -16,10 +16,19 @@ from support import (
     pinned_commit,
     pinned_gherkin_file_count,
     pinned_scenario_count,
+    run_cli,
     write_area,
 )
 from vellum.gherkin_blocks import Step, parse_block, split_documents
-from vellum.suite import extract, fingerprint, scenarios_in, to_dict
+from vellum.lint import lint_tree
+from vellum.specfile import find_fences
+from vellum.suite import (
+    UnparseableBlocks,
+    extract,
+    fingerprint,
+    scenarios_in,
+    to_dict,
+)
 
 ONE = """Feature: Login
   @id:login-good-password
@@ -37,6 +46,15 @@ TWO = ONE + """
     Then they see an error"""
 
 TWO_CHANGED = TWO.replace("Then they see the dashboard", "Then they see the dashboard in 400ms")
+
+#: A block the Cucumber parser refuses: the docstring is never closed.
+BROKEN = """Feature: Unreadable
+  @id:never-closed
+  Scenario: The quote is never closed
+    Given a payload
+      \"\"\"
+      {"still": "open"
+    Then it is rejected"""
 
 #: The same two scenarios as TWO, before ids existed — the spec-v1 shape.
 TWO_WITHOUT_IDS = "\n".join(
@@ -141,11 +159,93 @@ class TestScenarioCollection(unittest.TestCase):
         keys = [(s["file"], s["line"]) for s in self.suite["scenarios"]]
         self.assertEqual(keys, sorted(keys))
 
-    def test_unparseable_blocks_are_skipped_not_raised(self):
-        # lint is where a broken block fails a run; extraction still describes
-        # the rest of the tree.
-        suite = extract(FIXTURES / "bad-gherkin")
-        self.assertEqual(suite.entries, [])
+
+class TestUnparseableBlocksAreRefused(unittest.TestCase):
+    """A fence that does not parse fails the extraction (waviisoft/vellum#7).
+
+    It used to be skipped, with lint left as the only thing that faulted it.
+    That made the two commands disagree about the same tree, and the direction
+    of the disagreement was the dangerous one: ``extract`` exited 0 and emitted
+    a suite short exactly the scenarios nobody could see were missing.
+    """
+
+    FIXTURE = FIXTURES / "bad-gherkin-mixed"
+
+    def broken_fence(self):
+        """The fixture's failing fence, located by reading the file.
+
+        Not written out as a line number here: a hard-coded fact about a
+        fixture fails on every edit to it, which is noise rather than a defect.
+        """
+        text = (self.FIXTURE / "features" / "mixed.md").read_text(encoding="utf-8")
+        return next(
+            f
+            for f in find_fences(text.split("\n"))
+            if f.info == "gherkin" and "Unreadable" in f.body
+        )
+
+    def test_extract_raises_naming_the_file_and_the_block(self):
+        with self.assertRaises(UnparseableBlocks) as caught:
+            extract(self.FIXTURE)
+        errors = caught.exception.errors
+        self.assertEqual([e.relpath for e in errors], ["features/mixed.md"])
+        self.assertEqual(errors[0].block_line, self.broken_fence().start_line)
+        # The fault is located inside the block it names, not at its opening.
+        self.assertGreater(errors[0].line, errors[0].block_line)
+
+    def test_the_cli_exits_non_zero_and_says_which_block(self):
+        code, output = run_cli(["suite", "extract", str(self.FIXTURE), "-o", "-"])
+        self.assertNotEqual(code, 0)
+        self.assertIn("features/mixed.md", output)
+        self.assertIn(f"line {self.broken_fence().start_line}", output)
+
+    def test_no_suite_is_written_when_the_tree_is_refused(self):
+        # There is no partial extraction: the good block in this fixture reads
+        # cleanly, and emitting it alone is precisely the quietly-wrong suite
+        # the refusal exists to stop.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "suite.json"
+            code, _ = run_cli(["suite", "extract", str(self.FIXTURE), "-o", str(out)])
+            self.assertNotEqual(code, 0)
+            self.assertFalse(out.exists())
+
+    def test_lint_and_extract_now_agree_about_the_same_tree(self):
+        # The defect was the disagreement itself, so it is asserted as one.
+        self.assertEqual(
+            [f.code for f in lint_tree(self.FIXTURE) if f.code == "GH001"], ["GH001"]
+        )
+        self.assertNotEqual(run_cli(["lint", str(self.FIXTURE)])[0], 0)
+        self.assertNotEqual(
+            run_cli(["suite", "extract", str(self.FIXTURE), "-o", "-"])[0], 0
+        )
+
+    def test_every_failing_block_is_reported_not_just_the_first(self):
+        # bad-gherkin holds two unparseable fences; one run names both, so a
+        # repair does not have to be discovered one command at a time.
+        with self.assertRaises(UnparseableBlocks) as caught:
+            extract(FIXTURES / "bad-gherkin")
+        self.assertEqual(len(caught.exception.errors), 2)
+
+
+class TestHistoryStillToleratesABrokenBlock(unittest.TestCase):
+    """Dating re-parses old trees, and refusing there would be a different rule.
+
+    ``version_history`` reads every spec-touching commit in the checkout's
+    ancestry through ``scenarios_in``. A fence that failed to parse at some past
+    commit is a tree nobody can go back and fix, so one bad commit would
+    otherwise make every descendant of it permanently unextractable. Extraction
+    refuses the tree it was pointed at; the walk behind it keeps skipping.
+    """
+
+    def test_a_broken_block_in_an_earlier_commit_does_not_fail_extraction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_spec_repo(Path(tmp))
+            commit_area(repo, BROKEN)
+            good = commit_area(repo, ONE)
+            suite = extract(repo / "spec")
+            self.assertEqual([e.id for e in suite.entries], ["login-good-password"])
+            self.assertEqual(suite.entries[0].version, good)
+            self.assertFalse(suite.entries[0].pending)
 
 
 class TestFingerprint(unittest.TestCase):

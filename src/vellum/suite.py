@@ -6,6 +6,13 @@ the spec version that introduced or last changed it. A version is a commit
 is a sha and "newer" is ancestry. The suite is the contract: "product X conforms
 to spec version C" is defined as suite@C passing against a deployment of X
 (``spec/features/scenarios-and-harness.md``).
+
+Extraction refuses a tree it cannot read whole. A ``gherkin`` fence that does
+not parse is scenarios that would be missing from the suite with nothing
+recording their absence, and every consumer downstream reads the suite as the
+whole intent — so a failing block raises ``UnparseableBlocks`` here rather than
+being skipped past (waviisoft/vellum#7). Walking *history* stays tolerant: see
+``scenarios_in``.
 """
 
 from __future__ import annotations
@@ -110,23 +117,76 @@ class Suite:
     shallow: bool = False
 
 
-def scenarios_in(relpath: str, text: str) -> list[Scenario]:
-    """Every scenario in one spec file's ``gherkin`` fences.
+@dataclass
+class BlockError:
+    """A ``gherkin`` fence that did not parse, located in its spec file."""
 
-    Blocks that fail to parse are skipped, not raised: ``vellum lint`` is where
-    an unparseable block fails a run, and extraction must still describe the
-    rest of the tree.
+    relpath: str
+    #: 1-based line of the fence's opening ``` — which block failed.
+    block_line: int
+    #: 1-based line the parser faulted on, inside that block.
+    line: int
+    message: str
+
+    def format(self) -> str:
+        return (
+            f"{self.relpath}:{self.line}: gherkin block at line "
+            f"{self.block_line} does not parse: {self.message}"
+        )
+
+
+class UnparseableBlocks(Exception):
+    """Extraction refused: at least one fence in the tree did not parse.
+
+    Raised rather than skipped past, because the scenarios in an unparseable
+    block are exactly the ones a consumer of the suite cannot see are missing
+    (waviisoft/vellum#7). ``errors`` carries every failing block, not just the
+    first, so one run names the whole repair list the way ``lint_tree`` does.
+    """
+
+    def __init__(self, errors: list[BlockError]):
+        self.errors = list(errors)
+        super().__init__(f"{len(self.errors)} unparseable gherkin block(s)")
+
+
+def scan_file(relpath: str, text: str) -> tuple[list[Scenario], list[BlockError]]:
+    """One spec file's scenarios, and every fence of its that did not parse.
+
+    Both halves, because the two callers want different things from the same
+    walk: ``extract`` refuses a tree with any failing block, while the history
+    walk reads old trees it cannot ask anyone to fix and takes the scenarios
+    alone.
     """
     sf = parse_spec_text(relpath, text)
     found: list[Scenario] = []
+    failed: list[BlockError] = []
     for fence in sf.fences:
         if fence.info != "gherkin":
             continue
         try:
             found.extend(parse_block(fence.body, fence.body_line).scenarios)
-        except GherkinParseError:
-            continue
-    return found
+        except GherkinParseError as exc:
+            failed.append(
+                BlockError(
+                    relpath=relpath,
+                    block_line=fence.start_line,
+                    line=exc.line,
+                    message=exc.message,
+                )
+            )
+    return found, failed
+
+
+def scenarios_in(relpath: str, text: str) -> list[Scenario]:
+    """Every scenario in one spec file's ``gherkin`` fences, broken ones skipped.
+
+    This is the tolerant half of ``scan_file``, and what walking *history*
+    needs: a commit that is already in the past cannot be repaired, and a block
+    that failed to parse there is a fact about an old tree rather than a defect
+    in the one being extracted. The tree the caller actually named goes through
+    ``extract``, which refuses it — see ``UnparseableBlocks``.
+    """
+    return scan_file(relpath, text)[0]
 
 
 def _normalized(step: Step) -> list[str]:
@@ -239,7 +299,28 @@ def version_history(repo: Path, prefix: str, ref: str = "HEAD") -> History:
 
 
 def extract(spec_dir: str | Path) -> Suite:
+    """The suite for the tree at *spec_dir*.
+
+    Raises ``UnparseableBlocks`` when any ``gherkin`` fence in the tree fails to
+    parse. Extraction of a tree ``vellum lint`` rejects does not succeed: the
+    scenarios in a broken block would otherwise be absent from ``suite.json``
+    with nothing saying so, and every consumer — the harness, a briefing
+    assembler, the ledger's armed-scenario accounting — would read the smaller
+    suite as the whole intent (waviisoft/vellum#7).
+    """
     root = resolve_spec_root(spec_dir)
+
+    # The tree is read and judged before any git work: a refusal costs no
+    # history walk, and every failing block in the tree is named at once
+    # rather than one per run.
+    scanned: list[tuple[str, list[Scenario]]] = []
+    failures: list[BlockError] = []
+    for sf in iter_spec_files(root):
+        found, failed = scan_file(sf.relpath, sf.text)
+        scanned.append((sf.relpath, found))
+        failures.extend(failed)
+    if failures:
+        raise UnparseableBlocks(failures)
 
     history = History()
     head = None
@@ -257,15 +338,15 @@ def extract(spec_dir: str | Path) -> Suite:
         pass
 
     entries: list[SuiteEntry] = []
-    for sf in iter_spec_files(root):
-        for sc in scenarios_in(sf.relpath, sf.text):
+    for relpath, found in scanned:
+        for sc in found:
             version = history.by_id.get(sc.id) if sc.id else None
             if version is None:
                 version = history.by_fingerprint.get(fingerprint(sc))
             entries.append(
                 SuiteEntry(
                     scenario=sc,
-                    relpath=sf.relpath,
+                    relpath=relpath,
                     version=version,
                     pending=version is None,
                 )
@@ -330,10 +411,29 @@ def to_dict(suite: Suite) -> dict:
 
 
 def run(spec_dir: str, out_path: str = "suite.json", out=None) -> int:
-    """Write ``suite.json`` (or stdout when *out_path* is ``-``)."""
+    """Write ``suite.json`` (or stdout when *out_path* is ``-``).
+
+    Exits 1 without writing anything when a fence in the tree does not parse,
+    naming each failing block on stderr. 1 rather than 2 for the same reason
+    ``lint`` uses it: the path was a spec tree, the tree is the problem.
+    """
     import sys
 
-    payload = json.dumps(to_dict(extract(spec_dir)), indent=2) + "\n"
+    try:
+        suite = extract(spec_dir)
+    except UnparseableBlocks as exc:
+        for err in exc.errors:
+            print(f"vellum: {err.format()}", file=sys.stderr)
+        print(
+            f"vellum: {len(exc.errors)} unparseable gherkin block(s) in "
+            f"{spec_dir}; no suite written. Their scenarios would be absent "
+            f"from it with nothing saying so. `vellum lint {spec_dir}` reports "
+            f"the same blocks as GH001.",
+            file=sys.stderr,
+        )
+        return 1
+
+    payload = json.dumps(to_dict(suite), indent=2) + "\n"
     if out_path == "-":
         (out or sys.stdout).write(payload)
     else:

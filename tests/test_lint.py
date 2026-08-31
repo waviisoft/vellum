@@ -1,7 +1,5 @@
 """``vellum lint``: frontmatter schema, cross-references, gherkin parsing."""
 
-import contextlib
-import io
 import unittest
 from pathlib import Path
 
@@ -11,19 +9,12 @@ from support import (
     intent_checkout,
     intent_spec_tree,
     pinned_scenario_count,
+    run_cli,
 )
-from vellum.cli import main
 from vellum.gherkin_blocks import parse_block
 from vellum.lint import lint_tree
 from vellum.specfile import SpecTreeError, iter_spec_files, resolve_spec_root
 from vellum.suite import scenarios_in
-
-
-def run_cli(argv):
-    """Run the CLI, swallowing its output so the test log stays quiet."""
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-        return main(argv), buf.getvalue()
 
 
 def codes(name):

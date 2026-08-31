@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import re
 import subprocess
@@ -42,6 +44,20 @@ since: spec-v1
 {block}
 ```
 """
+
+
+def run_cli(argv):
+    """Run the CLI, swallowing its output so the test log stays quiet.
+
+    Returns ``(exit_code, output)`` with stdout and stderr interleaved into the
+    one buffer: a caller asserting on a failure message should not have to know
+    which stream the command chose.
+    """
+    from vellum.cli import main
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        return main(argv), buf.getvalue()
 
 
 class WrongPin(Exception):

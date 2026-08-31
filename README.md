@@ -100,6 +100,15 @@ the checkout does not contain cannot affect it, however new. Decorative names
 are reported alongside every sha (`version_name`, `spec_version_name`) and read
 for nothing.
 
+**A tree `vellum lint` rejects does not extract.** A `gherkin` fence that fails
+to parse exits 1 and writes nothing, naming each failing block on stderr —
+`<file>:<line>: gherkin block at line <n> does not parse: …`, the same blocks
+lint reports as `GH001`. There is no partial-extraction flag: the scenarios in
+a broken block are exactly the ones a consumer of `suite.json` cannot see are
+missing, so a smaller suite is never emitted in place of an error. Dating is
+the one place a broken block is still skipped, because it reads commits that
+are already in the past and nobody can go back and fix them.
+
 ```sh
 vellum suite extract "$VELLUM_INTENT_REPO" --output suite.json   # - writes to stdout
 ```
