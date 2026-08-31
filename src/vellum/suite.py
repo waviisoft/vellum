@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -491,8 +492,6 @@ def run(spec_dir: str, out_path: str = "suite.json", out=None) -> int:
     stdout carries the suite and nothing else, so ``extract … -o - | jq`` sees
     an empty stream rather than diagnostics parsed as JSON.
     """
-    import sys
-
     try:
         suite = extract(spec_dir)
     except DroppedScenarios as exc:

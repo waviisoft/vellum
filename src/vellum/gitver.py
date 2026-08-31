@@ -141,3 +141,35 @@ def is_shallow(repo: Path) -> bool:
         return _git(repo, "rev-parse", "--is-shallow-repository").strip() == "true"
     except GitUnavailable:
         return False
+
+
+def resolve(repo: Path, ref: str) -> str:
+    """*ref* as a full 40-character commit sha.
+
+    ``rev-parse`` alone would happily resolve a tree or a tag object, and the
+    pipeline commands key ledger records on what this returns — so the ``^{commit}``
+    peel is not decoration. A ref that names no commit raises ``GitUnavailable``.
+    """
+    return _git(repo, "rev-parse", f"{ref}^{{commit}}").strip()
+
+
+def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
+    """True when *ancestor* is reachable from *descendant*.
+
+    ``merge-base --is-ancestor`` exits 1 for "no" and >1 for "I could not
+    tell" — an unknown sha, a corrupt object — and collapsing the two would
+    turn "I cannot see that commit" into a confident "not a version". So the
+    return code is read directly rather than through ``_git``, and anything
+    above 1 is raised.
+    """
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", ancestor, descendant],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode > 1:
+        raise GitUnavailable(
+            " ".join(proc.stderr.split()) or f"merge-base --is-ancestor {ancestor} {descendant} failed"
+        )
+    return proc.returncode == 0

@@ -57,7 +57,7 @@ copy instructions.
 
 | File | Trigger |
 |---|---|
-| `adapters/github/spec-ci.yml` | `pull_request` touching `spec/**` |
+| `adapters/github/spec-ci.yml` | `pull_request` touching `spec/**`, `ledger/**`, `.vellum/config.yaml`, or the workflow file |
 | `adapters/github/on-spec-merge.yml` | `push` to `main` touching `spec/**` |
 
 ## Landmines
@@ -72,16 +72,23 @@ sat unfolded while a wave's worth of review happened here against files that
 were not what ran. If you must change the installed copy first to unbreak CI,
 fold it back in the same wave.
 
-**Measured again at the start of this wave, and they were still not identical.**
-waviisoft/vellum#5 folded the change back and dropped the note *upstream*, and
-recorded "the two sides are byte-identical" — but nobody removed the note from
-the installed copies, so both still carry a seven-line `INSTALLED COPY` header
-asking for a fold-back that has already happened. Only comments differ; the
-steps are the same. Two lessons, and the second is the one that costs: a
-fold-back is not done until the installed side is also edited, and **"they are
-identical now" is a claim with a short shelf life — run the `diff`, do not
-read the note.** The header is doubly stale as of this wave, since it explains
-itself by the private `spec` submodule, which no longer exists.
+**The `INSTALLED COPY` headers are gone, and this note about them was itself
+stale.** The history: waviisoft/vellum#5 folded the installed edits back and
+dropped the note *upstream*, recording "the two sides are byte-identical" while
+the installed copies still carried a seven-line `INSTALLED COPY` header. This
+paragraph then said so — and `waviisoft/vellum-intent#21` ("workflows: sync the
+installed copies with upstream adapters") fixed it, after which the paragraph
+went on asserting a drift that no longer existed.
+
+Measured at the start of *this* wave: `.github/workflows/spec-ci.yml` and
+`on-spec-merge.yml` in the intent repo were **byte-identical** to
+`adapters/github/` at vellum `main`, and neither carries the header.
+
+So the lesson survives its own example twice over: a fold-back is not done
+until the installed side is edited, and **"they are identical now" — or "they
+differ" — is a claim with a short shelf life. Run the `diff`, do not read the
+note.** This wave rewrites both upstream files; the architect syncs the
+installed copies at landing, and the `diff` is how you will know it happened.
 
 **The CLI is checked out, not `pip install`ed from its git URL, and that shape
 is load-bearing.** `waviisoft/vellum` is private, so the intent repo's own job
@@ -97,23 +104,94 @@ submodule with no credentials and failed. That submodule is gone
 its job — so do not cite it as a live constraint, and do not read its removal
 as permission to "simplify" this back into a one-line pip install.
 
+**Backpressure is real now and deliberately not blocking.** `vellum
+backpressure` counts records that are neither `shipped` nor `superseded`, and
+nothing has ever set a record to `shipped` because releases do not exist yet
+(`ledger/releases.yaml`: `spec_conformed: null`, no cuts). So every record
+counts as unshipped — measured, 11 against a cap of 3. Arming the gate in that
+state blocks every spec merge in the repository, including the one that would
+land the release machinery: a deadlock, not backpressure. The step carries
+`continue-on-error: true` and reports into the job summary; **delete that one
+line to arm it** once shipped versions actually leave the window.
+
+`set -o pipefail` in that step is load-bearing, not style. Without it the step
+takes `tee`'s status, which is always 0, so deleting `continue-on-error` would
+arm a gate that can never close — a guard that silently does nothing, which is
+worse than none.
+
+Two more things the armed gate depends on. It runs with **`--strict`**, so a
+ledger file that cannot be read refuses the measurement instead of shrinking
+the window; failing open on corruption is the wrong direction for a gate. And
+**`1` from `vellum backpressure` means blocked and nothing else** — every other
+non-zero exit is `2` — so a renamed `.vellum/config.yaml` can never present as
+backpressure once the hold comes off.
+
+**The job triggers on what it measures.** `spec-ci.yml`'s `paths:` carries
+`.vellum/config.yaml` and `ledger/**` beside `spec/**`. Without them a PR could
+raise `divergence_cap`, or add unshipped versions, without the gate that reads
+them ever running.
+
+**Only the pushing checkout keeps its credential.** `persist-credentials: false`
+is on every `actions/checkout` in both files except `on-spec-merge.yml`'s
+`Check out main`, which pushes the tag and the ledger commit. `actions/checkout`
+defaults to persisting, and `spec-ci.yml`'s jobs run on `pull_request` in a
+workspace rooted at the PR's merged tree — `VELLUM_TOKEN` reads a private repo
+and has no reason to sit in `.git/config` there. If you add a checkout, decide
+which of the two it is.
+
 **The stubs pass vacuously.** Coherence review, coverage review, impact report
-(job `agent-review` in `spec-ci.yml`), the `backpressure` job, and the "Plan the
-wave" step in `on-spec-merge.yml` all `echo` and exit 0. A green `spec-ci` in
-v0.1 means the spec lints and every scenario parses — nothing more. Each stub
-carries a `STUB — NOT IMPLEMENTED (v0.2)` banner and emits a `::warning` so it
-is visible in the run, not just in the file.
+(job `agent-review` in `spec-ci.yml`) and the "Plan the wave" step in
+`on-spec-merge.yml` all `echo` and exit 0. A green `spec-ci` in
+v0.1 means the spec lints, every scenario parses, and the divergence window was
+reported — nothing more. Each stub carries a `STUB — NOT IMPLEMENTED (v0.2)`
+banner and emits a `::warning` so it is visible in the run, not just in the
+file.
+
+**The bodies are shims over the CLI, and that is a spec requirement.**
+`spec/features/spec-pipeline.md`: "Pipeline logic lives in the product CLI, and
+forge workflow bodies are single-command shims over it." The four steps that
+held the version guard, the baseline walk, the name derivation and the ledger
+write are one `vellum mint` call; the `backpressure` stub is one `vellum
+backpressure` call. The reason is testability — logic in a workflow body can
+only be exercised by running this forge, and the same logic in a command is
+driven in a sandbox, which is what makes pipeline behavior PASS-able rather
+than a deployment property (`spec/features/scenarios-and-harness.md`). Do not
+move a guard back into a `run:` body to "keep it visible"; it becomes
+ungradeable there.
+
+**A no-op still raises a `::notice`, and that is a separate step now.** The old
+guard step emitted `::notice title=Not a spec version` / `::notice
+title=Already recorded`, which is how a no-op showed up in the run summary
+rather than only in a log nobody opens. `vellum mint` prints prose — it has no
+business knowing this forge's annotation syntax — so `Say why nothing was
+recorded` re-raises the annotation from `steps.mint.outputs.reason`. Delete it
+and the two most common outcomes of this workflow become invisible.
+
+**Gate on `steps.mint.outputs.minted`, never on the exit code.** `vellum mint`
+exits 0 on both no-ops — a commit that does not touch `spec/`, and a replay —
+exactly as `proceed=no` left the job green before. The guard's job is to skip
+the steps that are *not* idempotent (tagging, filing issues, pushing), not to
+redden a re-run of an idempotent one (decision D11).
 
 **There is no minting step, and there must not be one again.** The merge commit
 IS the version (`spec/decisions/2026-08-28-versions-are-commits.md`), so the
 next-integer arithmetic and the already-tagged guard are both gone. What is
-left is bookkeeping about a version that already exists. The replay guard is
-now `[ -f "ledger/${sha}.yaml" ]` — the record either exists for this commit or
-it does not — and `vellum ledger open` is idempotent besides, so a replay is
-harmless even if the guard is wrong. Do not reintroduce a "compute the next
-version" step: two of the old machinery's failure modes (lexical `sort -n`
-hazards, a tag pushed out of order re-dating every scenario under it) existed
-only because a second version system was maintained beside git.
+left is bookkeeping about a version that already exists — which is what `vellum
+mint` does. The replay guard is a ledger record existing for this commit, and
+`open_record()` is idempotent besides, so a replay is harmless even if the
+guard is wrong. Do not reintroduce a "compute the next version" step: two of
+the old machinery's failure modes (lexical `sort -n` hazards, a tag pushed out
+of order re-dating every scenario under it) existed only because a second
+version system was maintained beside git.
+
+**Two `run:` bodies still hold logic, and leaving them was the call.** Issue
+filing here, and "Summarise the suite" in `spec-ci.yml`. Neither is one of the
+three commands the spec names, and absorbing them means CLI surface no spec
+change has asked for — a forge issue API in one case, a reporting flag on
+`suite extract` in the other. Issue filing is also dead today: its gate is
+`hashFiles('workplan.yaml')` and only the stub planner would write that file.
+Both carry an in-file note saying this, so the next reader does not take them
+for oversights.
 
 **The name is derived from history, and its push is allowed to fail.** The
 `Name the version` step computes
@@ -125,10 +203,20 @@ step is `continue-on-error: true` **on purpose**: a name is decoration, and a
 failed tag push must never fail a run that has already recorded the version.
 Do not "fix" that by making it fatal.
 
-It runs *before* `Open the ledger record` for a mundane Actions reason —
-`steps.name.outputs.tag` is empty if referenced from an earlier step — and the
-record's `--name` comes from it. The output is written before the push, so the
-record still gets its name when the push fails.
+**It runs *after* minting now, and the old ordering constraint is gone.** The
+name used to travel from this step into `--name`, which forced it earlier
+(`steps.name.outputs.tag` is empty if referenced from an earlier step). It
+travels the other way now: `vellum mint` derives the name and writes it into
+the record, and this step reads `steps.mint.outputs.name` to tag. Mint reports
+the name on a replay too, so a version recorded by a run whose tag push failed
+can still be named later without recomputing the count by hand.
+
+**The head commit message stays in this file, and that is the security
+boundary.** It is attacker-supplied text and its only use is the tag
+annotation, so it is passed through `env` here and never reaches the CLI at
+all. The only message `vellum mint` writes is `ledger: open <name>`, derived
+from what it computed itself. Do not "tidy" tagging into the CLI — that hands
+an injection surface to the process that writes the ledger.
 
 **Issue filing is keyed by title, not by position.** The filing loop searches
 for an existing issue titled `<label>: <work item title>` — the decorative name
@@ -160,9 +248,17 @@ section used to carry (during the spec-v2 wave `spec-v2` was pushed before
 `spec-v1` and every scenario briefly reported as version 2). What replaced it
 is truncation: see `fetch-depth: 0` above.
 
-**The installed ledger records are still name-keyed.** `ledger/spec-v1.yaml`
-.. `spec-v11.yaml` in the intent repo carry `spec_version: spec-vN`, and this
-CLI keys records by sha — so it does not see them. Every record written from
-now on is sha-keyed and nothing here depends on the old ones, but the
-architect will want to rewrite those `spec_version` fields when re-syncing the
-installed workflows.
+**The ledger migration is done — this section used to ask for it.** The entry
+here said `ledger/spec-v1.yaml`..`spec-v11.yaml` still carried
+`spec_version: spec-vN` and wanted rewriting. `waviisoft/vellum-intent#22`
+("ledger: key the records by commit sha") did it. Measured on intent `main`
+while this wave was written: eleven records, every filename a sha, no
+`spec_version: spec-v*` anywhere. This is the second time in this file a
+"someone should do this" note outlived the doing of it — see the `INSTALLED
+COPY` header above — so the lesson repeats: **run the check, do not read the
+note.**
+
+It matters more than housekeeping now. `vellum backpressure` counts these
+records, and a name-keyed leftover is not a version the CLI recognises: it is
+reported as unreadable and not counted, so a half-migrated ledger would have
+measured the divergence window short and let a merge through.

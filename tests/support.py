@@ -17,7 +17,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 #: intent repo for us and the checkout has to be supplied. CI's conformance job
 #: sets this; ``./spec`` is honoured too, since the decision keeps a manual
 #: mount as a developer convenience.
-INTENT_ENV = "VELLUM_INTENT_REPO"
+#:
+#: Re-exported from the CLI rather than spelled again here. ``vellum pin
+#: advance`` reads the same variable to find an intent checkout, and two
+#: definitions of one environment variable is how the tests and the command
+#: come to disagree about where the intent repo is.
+from vellum.config import INTENT_ENV  # noqa: E402  (re-exported, see above)
 
 INDEX = """---
 id: index
@@ -290,3 +295,77 @@ def write_area(repo: Path, block: str) -> None:
     (repo / "spec" / "features" / "auth.md").write_text(
         AREA_TEMPLATE.format(block=block), encoding="utf-8"
     )
+
+
+#: A minimal installation config. Only `budgets.divergence_cap` is read by any
+#: command today, but the surrounding keys are kept so a sandbox config has the
+#: shape of a real one and a reader that starts consulting a second key does
+#: not silently find nothing.
+CONFIG = """version_prefix: spec-v
+budgets:
+  per_item_usd: 10
+  divergence_cap: {cap}
+"""
+
+PRODUCT = """# A product repo's backref and pin of record.
+intent:
+  repo: waviisoft/vellum-intent
+  url: https://github.com/waviisoft/vellum-intent
+
+# The pin of record. This comment exists to be preserved.
+pin:
+  commit: {commit}
+  name: {name}
+
+product:
+  name: core
+  trees: [src]
+
+write_boundaries:
+  implementer: [src, tests]
+"""
+
+
+def make_intent_repo(root: Path, cap: int = 3) -> Path:
+    """A sandbox intent repo: git, a ``spec/`` tree, a config, a ledger.
+
+    The shape ``vellum mint`` and ``vellum backpressure`` expect of a real
+    intent checkout, built small enough that a test can state its whole history
+    in three lines. ``make_spec_repo`` supplies the spec half; this adds the
+    two directories the pipeline commands read.
+    """
+    make_spec_repo(root)
+    (root / ".vellum").mkdir(parents=True, exist_ok=True)
+    (root / ".vellum" / "config.yaml").write_text(CONFIG.format(cap=cap), encoding="utf-8")
+    (root / "ledger").mkdir(exist_ok=True)
+    return root
+
+
+def make_product_repo(root: Path, commit: str = "0" * 40, name: str = "null") -> Path:
+    """A sandbox product repo: just ``.vellum/product.yaml``, the pin of record.
+
+    No git. ``vellum pin advance`` reads and rewrites one file and asks the
+    *intent* repo the only question that needs history, so a product checkout
+    needs nothing else to be one.
+    """
+    (root / ".vellum").mkdir(parents=True, exist_ok=True)
+    (root / ".vellum" / "product.yaml").write_text(
+        PRODUCT.format(commit=commit, name=name), encoding="utf-8"
+    )
+    return root
+
+
+def write_record(ledger: Path, sha: str, state: str = "approved", name: str | None = None) -> Path:
+    """A ledger record in the real emission shape, for tests about counting.
+
+    Goes through ``ledger.dump`` rather than a hand-written string so a change
+    to the record's key order or quoting cannot leave these fixtures behind.
+    """
+    from vellum.ledger import dump, new_record, record_path
+
+    ledger.mkdir(parents=True, exist_ok=True)
+    record = new_record(sha, name=name)
+    record["state"] = state
+    path = record_path(ledger, sha)
+    path.write_text(dump(record), encoding="utf-8")
+    return path

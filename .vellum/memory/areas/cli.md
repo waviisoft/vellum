@@ -1,7 +1,8 @@
 # Area: the `vellum` CLI
 
-`src/vellum/`. Three commands — `lint`, `suite extract`, `ledger open|advance`
-— dispatched from `build_parser()` in `src/vellum/cli.py`. Every claim below
+`src/vellum/`. Six commands — `lint`, `suite extract`, `ledger open|advance`,
+and the three pipeline commands `mint`, `backpressure`, `pin advance` —
+dispatched from `build_parser()` in `src/vellum/cli.py`. Every claim below
 names a file or symbol you can grep for.
 
 ## Module map
@@ -16,6 +17,10 @@ names a file or symbol you can grep for.
 | `src/vellum/suite.py` | `extract()`, `scan_file()`, `scenarios_in()`, `BlockError`, `DroppedScenarios`, `fingerprint()`, `version_history()`, `History`, `to_dict()`. |
 | `src/vellum/gitver.py` | `spec_commits()`, `names()`, `is_shallow()`, `markdown_at()`, `show()`. All subprocess git lives here. |
 | `src/vellum/ledger.py` | `open_record()`, `advance()`, `find_record()`, `dump()`, `RECORD_KEYS`, `ITEM_KEYS`. |
+| `src/vellum/mint.py` | `mint()` -> `Mint`, `_commit_record()`. The `on-spec-merge` bookkeeping. |
+| `src/vellum/backpressure.py` | `measure()` -> `Window`, `run()`, `SETTLED_STATES`. The divergence gate. |
+| `src/vellum/pin.py` | `advance()` -> `Advance`, `verify_version()`, `_rewrite()`. The pin close. |
+| `src/vellum/config.py` | `load()`, `divergence_cap()`, `INTENT_ENV`. Reads `.vellum/config.yaml`. |
 
 ## Scenario identity
 
@@ -373,6 +378,258 @@ keyword has the same hole waiting: `Example` is a synonym of `Scenario`, and
 in `tests/test_lint.py` covers both spellings and keeps a runnable template as a
 negative control, so the rule cannot regress into faulting the keyword instead of
 the unrunnability.
+
+## The pipeline commands
+
+`spec/features/spec-pipeline.md`: "Pipeline logic lives in the product CLI, and
+forge workflow bodies are single-command shims over it — minting is `vellum
+mint`, the divergence gate is `vellum backpressure`, the pin close is `vellum
+pin advance`." All three arrived in one wave, absorbing what
+`adapters/github/on-spec-merge.yml` and `spec-ci.yml` used to run as shell.
+
+The reason is testability, and it is the whole reason: logic in a workflow body
+can only be exercised by running that forge, so the pipeline's behavior was a
+deployment property nothing could grade. Driven as commands it is a PASS-able
+one (`spec/features/scenarios-and-harness.md`). That the forge's trigger
+*causes* the invocation stays a deployment property, and no harness may
+re-implement the workflow to grade it.
+
+**Exit codes are a contract: 1 is an answer you will not like, 2 is no
+answer.** 0 worked or decided there was nothing to do. `suite` already used 1
+for "the tree is the problem" and `SpecTreeError`/`LedgerError` already meant
+2, and the pipeline commands were fitted to that rather than inventing a third
+scheme — which is why `vellum pin advance --to spec-v1` exits 2 (that is
+`LedgerError`, unwrapped on purpose) while `--to <a commit that is not a
+version>` exits 1.
+
+The line matters most for `backpressure`, and it is why `BackpressureError`
+exits **2** rather than 1: the moment `spec-ci.yml` drops its
+`continue-on-error`, 1 has to mean "blocked" and nothing else. Sharing it with
+"I could not find the config" would make a renamed `.vellum/config.yaml` block
+every spec merge while reading as backpressure — a red nobody can find the
+cause of. `test_blocked_is_the_only_thing_that_exits_one` pins it. Tests assert
+the number, not "non-zero".
+
+### `vellum mint`
+
+**Three questions, one `rev-list`.** `spec_commits()` is `rev-list
+--first-parent --reverse <ref> -- <prefix>`, and mint reads its last two
+entries and its length: is this a version (the list's last entry), what is its
+baseline (the one before), what is it called (`spec-v<len>`). The workflow ran
+that walk twice and reasoned about the relationship in a prose comment; reading
+all three off one list makes the guard and the baseline agree by construction.
+Do not "optimise" this into a `-1` query plus a separate count — that is the
+shape whose disagreement the comment was worrying about.
+
+**Both no-ops exit 0, and that is preserved behavior, not a softening.** A
+commit that does not touch `spec/` (a `workflow_dispatch` on a ledger commit, a
+racing merge) and a replay both exit 0 having written nothing, exactly as the
+guard step's `proceed=no` left the job green. The guard exists so the steps
+that are *not* idempotent — tagging, filing issues, pushing — are skipped, not
+so the run reddens; reddening a re-run of a deliberately idempotent job
+(decision D11) trains people to ignore red. **A caller reads `minted`/`reason`
+from `--emit`, never the exit code.** `adapters/github/on-spec-merge.yml` gates
+every downstream step on `steps.mint.outputs.minted == 'yes'`.
+
+**A shallow clone is the one refusal, and it is exit 1.** Measured, not
+reasoned: a `--depth 3` clone of the real intent repo counts **1** spec commit
+where the full history counts 16, so the sixteenth version would be minted as
+`spec-v1` — a name already used by the seed commit — with a baseline naming the
+truncation point. All three answers are wrong below the graft, which is why the
+check is asked before anything is decided.
+
+**The head commit message never reaches the CLI.** It is attacker-supplied text
+— anyone who can land a commit on main writes it — and its only use is
+annotating the decorative tag, so tagging stayed in the workflow where the
+message is already passed through `env` rather than `${{ }}`. `vellum mint`
+does not read it, and the only message it writes (`ledger: open <name>`) is
+derived from what it computed itself. Do not "simplify" by having mint tag.
+
+**`--commit` exists and the adapter does not use it.** It stages and commits
+under the fixed message and never pushes. `on-spec-merge.yml` commits itself
+instead, because the `suite-<sha>.json` extracted after minting belongs in the
+same commit as the record it describes. The flag is the right contract for a
+caller that mints and does nothing else, which is what the `workflow_call`
+shims will be.
+
+**An unreadable record at the sha's own filename counts as a replay.**
+`find_record()` skips a record it cannot parse; treating that as "no record"
+would mint straight over it. `_existing()` checks the direct path too.
+
+**Its invocation failures exit 2, not 1.** An unresolvable `--ref` and an empty
+`--emit` both used to report as 1 — the code that means "a shallow clone; this
+cannot proceed". They are "no answer", which is 2 everywhere else in this CLI,
+and `resolve()` is now called on its own so the two cases can be told apart
+from a history that genuinely cannot be walked. The split is not pedantry: two
+different things sharing a number is how a caller learns to read only
+"non-zero", and `backpressure`'s gate is the thing that cannot survive that
+habit. The shallow refusal keeps 1, and there is a test either side of the
+line.
+
+### `vellum backpressure`
+
+Counts ledger records whose state is neither `shipped` nor `superseded` —
+those two are the only ways a version leaves the window — and exits 1 at or
+past `budgets.divergence_cap`. **At, not past**: the question is "may another
+version land", and `@id:backpressure-blocks-merge` states a cap of 3 with 3
+unshipped versions blocking the next merge.
+
+**It cannot see the whole window the spec describes.**
+`spec/features/spec-pipeline.md` counts approved-but-unlanded spec *PRs*
+alongside landed-but-unshipped versions. An open PR is forge state, not
+repository state, so `--pending <n>` takes that count from a caller that can
+see the forge, and the report says plainly when only the ledger half was
+measured. Do not reach for a forge API here to close the gap.
+
+**It reads states, not release pointers, and today that means it blocks
+everything.** Nothing has ever set a record to `shipped` — releases do not
+exist yet, `ledger/releases.yaml` carries `spec_conformed: null` — so all
+eleven records on intent `main` count as unshipped against a cap of 3.
+`spec-ci.yml` therefore runs the real command with `continue-on-error: true`
+and reports; arming it before releases exist would block the very merge that
+lands the release machinery. Delete that line when shipped versions actually
+leave the window — tracked as `waviisoft/vellum-intent#41`, which schedules
+arming into Wave F. The hold is a scheduled item, not an intention living in a
+comment. The `set -o pipefail` beside it is load-bearing: without it
+the step takes `tee`'s status and arming the gate produces a check that can
+never close.
+
+**A name-keyed record is reported, not counted.** `ledger/spec-v1.yaml` style
+records carry `spec_version: spec-v1`, which is not a sha and not a version
+this CLI recognises; counting one would let a pre-commit-era leftover hold the
+gate closed. The intent repo's own migration is done
+(`waviisoft/vellum-intent#22`) — measured on `main`, all eleven records are
+sha-keyed — so this guard is protecting a fresh installation, not that one.
+
+**Its report is a workflow-command channel, so two fields are narrowed
+before they reach it.** `spec-ci.yml` pipes `report()` straight into
+`$GITHUB_STEP_SUMMARY`, and a record's `state` and `name` come from the intent
+repo's `ledger/`, which anyone who can land a merge there writes. A newline in
+either starts a line of its own, and a line of its own is all `::error`,
+`::notice` or `::add-mask` needs. `name` now goes through the same `TAG_RE`
+check `pin.py` gives the same field, and `state` is narrowed to its first
+whitespace-separated token. Order matters in one place: **settled-ness is
+decided on the whole value and only then is the value narrowed**, so a state of
+`shipped` plus junk still counts as unshipped. Collapsing first would let a
+crafted record walk out of the divergence window, which is the one direction a
+gate must not fail in. `TestTheReportIsNotAWorkflowCommandChannel` covers both
+fields and that ordering. `sha` needs nothing: `SHA_RE` already accepts only
+hex.
+
+**`--strict` is for wherever the gate blocks.** By default a ledger file that
+cannot be read is reported and *not counted*, which makes the window narrower
+than the truth — a gate failing open on corruption. That is the right default
+for a report (a name-keyed leftover is a migration to do, not a merge to
+block) and the wrong one for a gate, so `spec-ci.yml` passes `--strict` and
+gets a refusal instead. "I could not read three records" must never arrive as
+"there is room for three more versions".
+
+### `vellum pin advance`
+
+**Two sufficient answers, not one checked twice.** A sha is a version if a
+ledger record exists for it *or* it is a spec-touching commit in the intent
+checkout's first-parent ancestry. The ancestry half is what makes paired
+landing work — the pin advances to a commit whose record may still be a minute
+away — and the ledger half is what lets a shallow or stale checkout still
+vouch. There is no `--force`: a pin naming a non-version is the failure the
+command exists to prevent.
+
+**The file is edited a line at a time, and the edit is verified.**
+`.vellum/product.yaml` is mostly load-bearing comments; a `safe_load`/`safe_dump`
+round-trip deletes every one of them and reflows what it keeps. `_rewrite()`
+replaces the value on the `commit:` (and `name:`) line inside the `pin:` block
+and touches nothing else, then `advance()` re-parses the result and compares
+every top-level field against the original, raising with the file unchanged if
+anything outside `pin` moved. Two `pin:` blocks, or two `commit:` lines, refuse
+rather than guess.
+
+**`pin.name` follows the commit.** Decoration, but a `name` reading `spec-v16`
+beside a commit that is a different version is decoration that has become a
+lie, and the reader it misleads is the reader it was for. It is set from the
+ledger record's name, or `null` when there is none. A pin file with no `name:`
+key is not given one — only lines already in the block are rewritten.
+
+**The rewrite is scoped to the pin block's own indent, and it has to be.**
+`_rewrite()` walks from `pin:` to the next column-zero key, and it used to
+rewrite *any* line matching `^\s+(commit|name):` at any depth. YAML requires a
+block scalar's body to be indented deeper than its key, so a `note: |` holding
+the word `name:` in its prose got that line rewritten — and **every check in
+`advance()` passed**: `drifted` skips `pin` entirely, and comparing the pin's
+*key set* cannot see a changed value. Found in review, with a working repro.
+The fix is two halves and both are load-bearing: `_rewrite` matches only at the
+block's own indent, and `advance()` now compares the pin's other *values*, not
+just its keys. `TestTheRewriteCannotReachNestedContent` covers it.
+
+**A ledger record's `spec_version` is the load-bearing field, and it was the
+unchecked one.** `verify_version` validated `name` and not `commit` — the
+field that becomes `pin.commit`, which product CI hands to `git checkout`. Two
+things let it through: `find_record` returns an exact filename hit *without
+parsing it*, so the `SHA_RE` check on its glob branch never ran; and
+`verify_version` returned `full or recorded`, so whenever the intent checkout
+could not resolve the sha itself the record's own text became the answer. A
+crafted `ledger/<sha>.yaml` holding `spec_version: "$(id > /tmp/pwned)"`
+reached `pin.commit` verbatim, at exit 0. Found by the bench with a working
+repro, on both reviewers' lists independently. `_from_record()` now asks two
+things of the field — that it parses as a sha, and that it agrees by prefix
+with the sha that reached it — and refuses either way. The disagreement half is
+not decoration: `find_record`'s glob branch matches on prefix and so cannot
+disagree, but the filename branch never compared them, so `ledger/<A>.yaml`
+saying `spec_version: <B>` pinned B while the operator asked for A. Both
+refusals are `PinError`, exit 1, matching every other malformed-record refusal
+in that block — a record being malformed is one answer, not two exit codes
+depending on which field is wrong.
+
+**The pin file's newlines and the pin block's end are both preserved
+literally.** Two smaller ones from the same review. `read_text`/`write_text`
+translate newlines, so advancing the pin in a CRLF file reflowed the *whole
+file* to LF — a one-value change arriving as a whole-file diff, which is
+exactly what the line-at-a-time edit exists to avoid; the read and the write
+now go through `open(..., newline="")` and `_split()` keeps each line's `\r`
+off the match and puts it back on the rewrite. (`open`, not `Path.read_text`:
+that only grew a `newline` argument in 3.13 and the floor here is 3.10.) And
+the scan used to end the block on `^[A-Za-z_][\w-]*:` — a *Python identifier*,
+not a YAML key. `2024-report:` and `"quoted":` are both valid at column zero
+and matched neither, so the scan ran on into the next block and refused a
+well-formed file with `pin.commit appears twice`, naming a `commit:` belonging
+to something else. It ends on indent now: content at column zero ends the
+block, whatever it is called. `TestFilesThatAreNotWhatTheScanAssumed` covers
+all four.
+
+**A ledger record's `name` is not trusted, because `ledger/` is not ours.**
+It is interpolated into YAML by f-string, and it arrives from the intent repo's
+`ledger/`, which anyone who can land a merge there writes. A `name` of
+`"spec-v9\n  ref: forged"` wrote a *second key* into the pin block, and neither
+check caught it — the key set grew by one the comparison was not looking for,
+and the pin is what the product's CI fetches the spec at. `_decorative_name()`
+now validates against `TAG_RE` and drops anything else (a name is decoration,
+so dropping beats raising), and `_rewrite` refuses a multi-line value outright.
+Two layers on purpose: the second is what protects a future caller that reaches
+`_rewrite` another way.
+
+**`find_record` short-circuits without parsing, so `pin` must guard the read.**
+An exact filename hit returns immediately (`ledger.py`), so a corrupt
+`ledger/<sha>.yaml` arrives at `verify_version` unparsed and `yaml.safe_load`
+raised straight out of `main()` — a traceback, not one of the two exit codes.
+`mint.py` already handled the same case; `pin.py` did not until review.
+
+**A test that unsets `VELLUM_INTENT_REPO` disarms the conformance job.**
+`run_cli` calls `main()` **in-process** and `_candidate()` reads the variable at
+call time, so a bare `os.environ.pop` leaks into every module discovered after
+it — and discovery is alphabetical, so `test_pin` precedes `test_suite`.
+Measured: `test_suite` alone with the variable set runs 77 tests in 14s with
+zero skips; with a leaking `test_pin` in front of it, 8 skip in 3s. The whole
+point of running the suite inside the `conformance` job is that those skips are
+not a hole, so this made the job green and hollow. `addCleanup(os.environ.pop,
+...)` is the same bug by another route — it *deletes* rather than restores, so
+it only bites in the shape where the variable was set. Use
+`unittest.mock.patch.dict`. `PinCase` now asserts `os.environ` is unchanged
+after every test in the file, which is what caught the second instance.
+
+**`VELLUM_INTENT_REPO` has one definition now.** It lives in
+`src/vellum/config.py` and `tests/support.py` re-exports it. `pin advance`
+reads the same variable the pinned-tree tests do, deliberately: an installation
+should have one answer to "where is the intent repo checked out", and two
+spellings is how the tests and the command come to disagree.
 
 ## Patterns worth keeping
 

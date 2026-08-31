@@ -20,6 +20,27 @@
 # is nothing to compute, nothing to allocate, and no registry that has to be
 # written before the version exists. What is left is bookkeeping about a
 # version that already exists.
+#
+# ---------------------------------------------------------------------------
+# The bookkeeping is `vellum mint`, not a shell script in this file.
+#
+# spec/features/spec-pipeline.md: "Pipeline logic lives in the product CLI, and
+# forge workflow bodies are single-command shims over it." The four steps that
+# used to hold the version guard, the baseline walk, the name derivation and
+# the ledger write are one command now. That is not tidying: logic in a
+# workflow body can only be tested by running this forge, and the same logic in
+# a command is driven in a sandbox — which is what makes the pipeline's
+# behavior a PASS-able property rather than a deployment one
+# (spec/features/scenarios-and-harness.md). The guards did not move house
+# unaccompanied; see tests/test_mint.py in waviisoft/vellum, which names each
+# one after what it protects.
+#
+# What is left in this file is the part that is genuinely the forge's: checking
+# out, tagging, pushing, filing issues. Read `steps.mint.outputs.minted` to
+# know whether there is anything to do — `vellum mint` exits 0 on both of its
+# no-ops (a commit that is not a version, a replay) exactly as the old guard
+# step did, so the exit code is not that signal and never was.
+# ---------------------------------------------------------------------------
 
 name: on-spec-merge
 
@@ -60,7 +81,10 @@ jobs:
           # the history is the data `vellum suite extract` reads. A shallow
           # clone truncates it and silently re-dates every scenario below the
           # graft. (Under tags this said "a shallow clone has no tags"; the
-          # requirement did not change, only the reason.)
+          # requirement did not change, only the reason.) `vellum mint` now
+          # refuses a shallow clone outright — it cannot tell whether a commit
+          # is a version, what it descends from, or what to call it — but that
+          # is the backstop for this line, not a substitute for it.
           fetch-depth: 0
 
       - name: Set up Python
@@ -89,87 +113,77 @@ jobs:
           ref: ${{ env.VELLUM_REF }}
           token: ${{ secrets.VELLUM_TOKEN }}
           path: vellum-cli
+          # VELLUM_TOKEN reads the private product repo and nothing here pushes
+          # to it, so it has no reason to outlive this step in `.git/config`.
+          # (The `Check out main` above is the one checkout that must keep its
+          # credential — it pushes the tag and the ledger commit.)
+          persist-credentials: false
 
       - name: Install the vellum CLI
         run: pip install --quiet ./vellum-cli
 
-      # Two questions, one gate: is this commit a spec version at all, and does
-      # it already have a ledger record? Everything below runs only on a `yes`.
+      # The whole of what used to be four steps. `--emit "$GITHUB_OUTPUT"`
+      # writes `key=value` lines — the shape a runner already reads step
+      # outputs in, and plain enough that a different runner can read it too.
       #
-      # The replay half: this commit either has a record or it does not.
-      # `vellum ledger open` is itself idempotent, so re-running is harmless;
-      # the guard exists so the steps that are NOT idempotent (filing issues,
-      # pushing a commit) are skipped on a replay rather than repeated.
-      #
-      # The version half: `workflow_dispatch` reaches any commit, and only the
-      # `push` trigger carries a `paths: spec/**` filter. The likeliest hand-run
-      # is the one just after this job pushes its own ledger commit — a commit
-      # that touches `ledger/` and not `spec/`. That is not a spec version
-      # (spec/decisions/2026-08-28-versions-are-commits.md: the version is the
-      # commit whose diff touches spec/), and recording it would not merely add
-      # a stray file: the baseline step below reads `sed -n 2p` of this same
-      # rev-list, which is the previous spec version ONLY when line 1 is this
-      # commit. For a non-version, line 2 is the second-newest version, so the
-      # record would claim a baseline one version too old — wrong, silent, and
-      # written by automation, the ledger's only trusted writer.
-      #
-      # Hence the test: this sha is a version iff it is the newest spec-touching
-      # commit in its own first-parent history. `rev-list` rather than
-      # `diff-tree` because it is the command the baseline step already runs
-      # (so the guard asserts exactly that step's assumption), and because it
-      # needs no special-casing for merge commits — a PR merge commit, which is
-      # what a spec version usually IS, reports an empty diff under a plain
-      # `diff-tree --first-parent`.
-      - name: Is this a spec version, and is it already recorded?
-        id: guard
+      # `--ref` is passed explicitly rather than left at HEAD so that a
+      # `workflow_dispatch` run mints the commit the event names, which is what
+      # the old guard read. Everything downstream keys off `outputs.minted`:
+      # `no` means the command decided there was nothing to record — a commit
+      # that does not touch spec/, or a replay — and the steps that are NOT
+      # idempotent (tagging, filing issues, pushing) must be skipped rather
+      # than repeated. `sha` and `name` come back either way.
+      - name: Mint the version
+        id: mint
         env:
           SHA: ${{ github.sha }}
+        run: vellum mint . --ref "$SHA" --emit "$GITHUB_OUTPUT"
+
+      # The old guard step emitted `::notice title=Not a spec version` and
+      # `::notice title=Already recorded`, which is how a no-op showed up in the
+      # run summary rather than only in a log nobody opens. `vellum mint` prints
+      # prose — it has no business knowing this forge's annotation syntax — so
+      # the annotation is re-raised here from the reason it reported.
+      - name: Say why nothing was recorded
+        if: steps.mint.outputs.minted != 'yes'
+        env:
+          REASON: ${{ steps.mint.outputs.reason }}
+          SHA: ${{ steps.mint.outputs.sha }}
         run: |
-          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
-
-          if [ "$(git rev-list --first-parent -1 "$SHA" -- spec)" != "$SHA" ]; then
-            echo "proceed=no" >> "$GITHUB_OUTPUT"
-            echo "::notice title=Not a spec version::${SHA} does not change spec/, so there is no version here to record. This run is a no-op."
-            exit 0
-          fi
-
-          if [ -f "ledger/${SHA}.yaml" ]; then
-            echo "proceed=no" >> "$GITHUB_OUTPUT"
-            echo "::notice title=Already recorded::ledger/${SHA}.yaml exists; this run is a replay"
+          if [ "$REASON" = "replay" ]; then
+            echo "::notice title=Already recorded::${SHA} already has a ledger record; this run is a replay"
           else
-            echo "proceed=yes" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Not a spec version::${SHA} does not change spec/, so there is no version here to record. This run is a no-op."
           fi
 
       - name: Verify the spec still lints
-        if: steps.guard.outputs.proceed == 'yes'
+        if: steps.mint.outputs.minted == 'yes'
         run: vellum lint spec/
 
-      # The previous spec version: the commit before this one whose diff
-      # touches spec/. Ancestry, not arithmetic — there is no sequence to
-      # decrement and nothing to be missing from.
-      - name: Find the baseline version
-        if: steps.guard.outputs.proceed == 'yes'
-        id: baseline
-        run: |
-          previous="$(git rev-list --first-parent "${{ steps.guard.outputs.sha }}" -- spec | sed -n 2p)"
-          echo "commit=${previous}" >> "$GITHUB_OUTPUT"
-
       # =================================================================
-      # Decoration only. The name is `spec-v<count of spec versions in this
-      # commit's ancestry>` — derived from the history rather than read back
-      # out of a tag registry, so it cannot be missing, late or out of order
-      # the way `max(spec-v*) + 1` could. Nothing reads it: a wrong or absent
-      # name changes no scenario's version and no record's identity
+      # Decoration only, and the tag is the forge's to push. `vellum mint`
+      # computes the name — `spec-v<count of spec versions in this commit's
+      # ancestry>`, derived from the history rather than read back out of a tag
+      # registry, so it cannot be missing, late or out of order the way
+      # `max(spec-v*) + 1` could — and this step does the pushing.
+      #
+      # Nothing reads the name: a wrong or absent one changes no scenario's
+      # version and no record's identity
       # (spec/decisions/2026-08-28-versions-are-commits.md). Which is why the
       # whole step is `continue-on-error` — a name that fails to push must
-      # never fail a run that has already recorded the version.
+      # never fail a run that has already recorded the version. Do not "fix"
+      # that by making it fatal.
+      #
+      # It may now run AFTER the record is written, because the name no longer
+      # travels from this step into the record; it travels the other way. The
+      # old ordering was a mundane Actions constraint (`steps.name.outputs.tag`
+      # is empty if referenced from an earlier step) and is simply gone.
       # =================================================================
       - name: Name the version (decoration)
-        id: name
-        if: steps.guard.outputs.proceed == 'yes'
+        if: steps.mint.outputs.minted == 'yes'
         continue-on-error: true
         env:
-          SHA: ${{ steps.guard.outputs.sha }}
+          TAG: ${{ steps.mint.outputs.name }}
           # Through `env`, never `${{ }}` inside the script. A commit message is
           # attacker-supplied text: anyone who can land a commit on main writes
           # it, and `${{ }}` pastes it into the script *before* the shell parses
@@ -179,40 +193,27 @@ jobs:
           # `continue-on-error` bounds only whether the step reddens the run —
           # not what injected code can reach. As an `env` value it is data the
           # shell reads out of the environment and never source it executes.
-          # (`LABEL` below is the same pattern.)
+          #
+          # This is also why the message never reached the CLI: `vellum mint`
+          # does not read it, and the only message it writes is one it derived
+          # itself. The attacker-supplied text stays here, in the one step that
+          # genuinely needs it, passed the one way that is safe.
           HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
         run: |
-          count="$(git rev-list --first-parent --count "$SHA" -- spec)"
-          tag="spec-v${count}"
-          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
-            echo "::notice title=Name already used::${tag} exists; leaving it alone"
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "::notice title=Name already used::${TAG} exists; leaving it alone"
             exit 0
           fi
           git config user.name  "vellum-orchestrator"
           git config user.email "orchestrator@vellum.invalid"
-          git tag -a "${tag}" -m "${tag}: ${HEAD_COMMIT_MESSAGE}"
-          git push origin "${tag}"
-
-      # spec/features/ledger.md: one YAML record per spec version, keyed by the
-      # version's commit sha, opened in state `approved`, written only by
-      # automation.
-      - name: Open the ledger record
-        if: steps.guard.outputs.proceed == 'yes'
-        run: |
-          args=(--version "${{ steps.guard.outputs.sha }}" --ledger-dir ledger)
-          if [ -n "${{ steps.baseline.outputs.commit }}" ]; then
-            args+=(--baseline "${{ steps.baseline.outputs.commit }}")
-          fi
-          if [ -n "${{ steps.name.outputs.tag }}" ]; then
-            args+=(--name "${{ steps.name.outputs.tag }}")
-          fi
-          vellum ledger open "${args[@]}"
+          git tag -a "${TAG}" -m "${TAG}: ${HEAD_COMMIT_MESSAGE}"
+          git push origin "${TAG}"
 
       - name: Extract the suite at the new version
-        if: steps.guard.outputs.proceed == 'yes'
-        run: |
-          vellum suite extract spec/ --output "ledger/suite-${{ steps.guard.outputs.sha }}.json"
+        if: steps.mint.outputs.minted == 'yes'
+        env:
+          SHA: ${{ steps.mint.outputs.sha }}
+        run: vellum suite extract spec/ --output "ledger/suite-${SHA}.json"
 
       # =================================================================
       # ==============  STUB — NOT IMPLEMENTED (v0.2)  ==================
@@ -232,25 +233,44 @@ jobs:
       # exercisable. With no workplan.yaml present, no issues are filed.
       # =================================================================
       - name: Plan the wave (STUB — writes nothing)
-        if: steps.guard.outputs.proceed == 'yes'
+        if: steps.mint.outputs.minted == 'yes'
+        env:
+          SHA: ${{ steps.mint.outputs.sha }}
         run: |
           echo "::warning title=Stub::planner is not implemented (v0.2)"
-          echo "STUB: would write workplan.yaml for ${{ steps.guard.outputs.sha }}"
+          echo "STUB: would write workplan.yaml for ${SHA}"
 
+      # =================================================================
+      # STILL A LOGIC BODY, DELIBERATELY. This is the one `run:` in either
+      # adapter that the CLI has not absorbed, and it is not an oversight.
+      #
+      # spec/features/spec-pipeline.md names exactly three commands the
+      # workflow bodies become shims over — `vellum mint`, `vellum
+      # backpressure`, `vellum pin advance` — and issue filing is none of them.
+      # Absorbing it would mean a fourth command that talks to the forge's
+      # issue API, which is a different kind of thing from the three: those
+      # read a checkout and write files, this needs a credential and a
+      # provider. Inventing that surface ahead of a spec change that asks for
+      # it is how a CLI acquires a GitHub dependency nobody decided on.
+      #
+      # It is also dead today: the gate is `hashFiles('workplan.yaml')`, and
+      # the only thing that would write workplan.yaml is the stub above.
+      #
       # spec/features/orchestration.md: "The plan is committed to the ledger
       # record, then filed as issues." Issue numbers are only known after
       # filing, so the issue is created first and the record updated with its
       # number — which also makes a replay idempotent, because an existing
       # issue with the same title is reused rather than duplicated.
+      # =================================================================
       - name: File work-item issues from workplan.yaml
-        if: steps.guard.outputs.proceed == 'yes' && hashFiles('workplan.yaml') != ''
+        if: steps.mint.outputs.minted == 'yes' && hashFiles('workplan.yaml') != ''
         env:
           GH_TOKEN: ${{ github.token }}
-          SHA: ${{ steps.guard.outputs.sha }}
+          SHA: ${{ steps.mint.outputs.sha }}
           # The issue title carries the decorative name when there is one, and
           # the short sha otherwise — a title is for people to read, and this
           # is the one place a name may appear without anything reading it back.
-          LABEL: ${{ steps.name.outputs.tag || format('spec-{0}', steps.guard.outputs.sha) }}
+          LABEL: ${{ steps.mint.outputs.name || format('spec-{0}', steps.mint.outputs.sha) }}
         run: |
           python - <<'PY' > items.txt
           import yaml
@@ -268,8 +288,17 @@ jobs:
             [ -n "$title" ] || continue
             full="${LABEL}: ${title}"
 
-            existing="$(gh issue list --state all --search "\"${full}\" in:title" \
-              --json number,title --jq ".[] | select(.title == \"${full}\") | .number" | head -1)"
+            # The title travels as an environment variable and the `--jq`
+            # program is a fixed string. Pasting `$full` into the program made
+            # an attacker-supplied title into jq *source*: a work-item title
+            # of `x") | $ENV.GH_TOKEN | (.` closed the comparison and read the
+            # environment, and the environment on this step holds GH_TOKEN —
+            # `contents: write` and `issues: write` on the intent repo. Titles
+            # come from `workplan.yaml`, which the planner writes into a repo
+            # anyone who can land a merge can write. `env.FULL` is a value jq
+            # looks up, never text it parses.
+            existing="$(FULL="$full" gh issue list --state all --search "\"${full}\" in:title" \
+              --json number,title --jq 'map(select(.title == env.FULL)) | .[0].number // empty')"
 
             if [ -n "$existing" ]; then
               number="$existing"
@@ -284,35 +313,50 @@ jobs:
               echo "::notice title=Filed issue::#${number} ${full}"
             fi
 
-            satisfies_args=""
+            # An array, expanded quoted — not a string expanded bare. The
+            # `${satisfies_args}` this replaces was word-split by the shell, so
+            # a `satisfies` entry of `auth-one --state shipped` did not arrive
+            # as one slice: it arrived as argv, and `--state shipped` is
+            # precisely the flag that drops a version out of the backpressure
+            # window. The entries come from `workplan.yaml`, so this is a trust
+            # boundary and not tidying. (The `# shellcheck disable=SC2086` that
+            # used to sit here was suppressing the warning for this exact bug.)
+            satisfies_args=()
             if [ -n "$satisfies" ]; then
               IFS=',' read -ra slices <<< "$satisfies"
               for slice in "${slices[@]}"; do
-                satisfies_args="${satisfies_args} --satisfies ${slice}"
+                satisfies_args+=(--satisfies "$slice")
               done
             fi
 
-            # shellcheck disable=SC2086
             vellum ledger advance \
               --version "$SHA" \
               --item "$number" \
               --title "$title" \
               --repo "$repo" \
-              ${satisfies_args} \
+              "${satisfies_args[@]}" \
               --ledger-dir ledger
           done < items.txt
 
           vellum ledger advance --version "$SHA" --state planning --ledger-dir ledger
 
-      - name: Commit the ledger record
-        if: steps.guard.outputs.proceed == 'yes'
+      # Branchless, because `minted == 'yes'` means `vellum mint` wrote a
+      # record that was not there before. The old step tested `git diff
+      # --cached --quiet` for a "nothing to commit" case that its fuzzier guard
+      # could still reach; this one cannot.
+      #
+      # `vellum mint --commit` would do the staging and the commit itself, and
+      # is the right shape for a caller that mints and does nothing else. It is
+      # not used here because the suite extracted above belongs in the same
+      # commit as the record it describes, and one `git add ledger/` is a
+      # smaller thing than two commits.
+      - name: Commit and push the ledger record
+        if: steps.mint.outputs.minted == 'yes'
+        env:
+          TAG: ${{ steps.mint.outputs.name || steps.mint.outputs.sha }}
         run: |
           git config user.name  "vellum-orchestrator"
           git config user.email "orchestrator@vellum.invalid"
           git add ledger/
-          if git diff --cached --quiet; then
-            echo "::notice title=No ledger change::nothing to commit"
-          else
-            git commit -m "ledger: open ${{ steps.name.outputs.tag || steps.guard.outputs.sha }}"
-            git push origin HEAD:main
-          fi
+          git commit -m "ledger: open ${TAG}"
+          git push origin HEAD:main
