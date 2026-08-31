@@ -173,3 +173,63 @@ def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
             " ".join(proc.stderr.split()) or f"merge-base --is-ancestor {ancestor} {descendant} failed"
         )
     return proc.returncode == 0
+
+
+def merge_base(repo: Path, a: str, b: str) -> str | None:
+    """The best common ancestor of *a* and *b*, or None when there is none.
+
+    None is a real answer here, not a failure: a shallow clone can hold both
+    commits and none of their shared history. ``git merge-base`` exits 1 for
+    "there is no merge base" and >1 for "I could not tell", and the two are not
+    collapsed for the reason `is_ancestor` gives about the same distinction.
+    """
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", a, b],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode == 1:
+        return None
+    if proc.returncode != 0:
+        raise GitUnavailable(
+            " ".join(proc.stderr.split()) or f"merge-base {a} {b} failed"
+        )
+    return proc.stdout.strip() or None
+
+
+def changed_paths(repo: Path, base: str, head: str) -> tuple[list[str], str]:
+    """Repo-relative paths a branch changed, and how the comparison was made.
+
+    Returns ``(paths, basis)`` where *basis* is ``merge-base`` or ``two-dot``.
+
+    The merge base is what a forge means by "what this PR changed": diffing the
+    two refs directly also reports, inverted, everything that landed on *base*
+    since the branch left it. For a guard that is not merely imprecise — it
+    faults an implementer for a harness commit somebody else pushed to main.
+
+    When there is no merge base to be had (a shallow CI clone; two unrelated
+    histories) the comparison falls back to the direct diff and says so. That
+    direction is deliberate: the direct diff is a *superset* of the branch's own
+    changes, so a guard reading it can report a path the branch did not touch,
+    but can never miss one it did. A guard may be wrong loudly; it may not be
+    wrong quietly.
+
+    ``--no-renames`` is load-bearing. With rename detection on, moving a file
+    out of a protected tree is reported only under its new name, and the write
+    to the tree it left — a deletion — disappears from the diff a boundary check
+    reads.
+    """
+    basis = "merge-base"
+    start = merge_base(repo, base, head)
+    if start is None:
+        basis = "two-dot"
+        start = base
+    out = _git(
+        repo, "diff", "--name-only", "--no-renames", "-z", start, head
+    )
+    # -z: a path with a newline or a quote in it is otherwise emitted quoted and
+    # escaped, and a guard that unquotes it wrongly reads a path that is not the
+    # one in the tree. NUL cannot appear in a path, so this parse cannot be
+    # confused by one.
+    return sorted({p for p in out.split("\0") if p}), basis

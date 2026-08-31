@@ -1,11 +1,19 @@
 """``vellum`` — the v0.1 command line.
 
 Commands, one per feature spec: ``lint`` (spec-pipeline), ``suite extract``
-(scenarios-and-harness), ``ledger open|advance`` (ledger), and the three
-pipeline commands the forge workflows are shims over — ``mint``,
-``backpressure`` and ``pin advance``. Each returns a process exit code; failure
-detail goes to stderr and nothing else is printed on success beyond what was
-asked for.
+(scenarios-and-harness), ``ledger open|advance`` (ledger), the three pipeline
+commands the forge workflows are shims over — ``mint``, ``backpressure`` and
+``pin advance`` — and the mechanical guards: ``verify boundaries``, ``verify
+deps``, ``verify exit-duty``, ``ledger verify`` and ``budget``. Each returns a
+process exit code; failure detail goes to stderr and nothing else is printed on
+success beyond what was asked for.
+
+A guard is a command that reads neutral inputs — a checkout, two refs, a role —
+and answers one question about them. None of them writes anything, and none of
+them reaches a forge: where a guard needs a number only a forge or a
+not-yet-built runner can supply, the caller passes it (``backpressure
+--pending``, ``budget --projected``) and the report says plainly when it was not
+supplied.
 
 Pipeline logic lives here rather than in a workflow body
 (``spec/features/spec-pipeline.md``): a forge job that holds logic can only be
@@ -46,7 +54,19 @@ import sys
 from vellum import __version__
 from vellum.backpressure import BackpressureError
 from vellum.backpressure import run as backpressure_run
+from vellum.boundaries import BoundaryError
+from vellum.boundaries import run as boundaries_run
+from vellum.budget import BudgetError
+from vellum.budget import run as budget_run
+from vellum.chain import ChainError
+from vellum.chain import run as chain_run
 from vellum.config import INTENT_ENV
+from vellum.budget import PERIODS as BUDGET_PERIODS
+from vellum.budget import parse_time
+from vellum.deps import DEFAULT_MANIFESTS, DependencyError
+from vellum.deps import run as deps_run
+from vellum.exitduty import AREAS_TREE, DEFAULT_SOURCE_TREES, ExitDutyError
+from vellum.exitduty import run as exitduty_run
 from vellum.ledger import LedgerError, advance, load_plan, open_record, parse_version
 from vellum.lint import run as lint_run
 from vellum.mint import MintError, mint as mint_run
@@ -112,9 +132,32 @@ def build_parser() -> argparse.ArgumentParser:
     adv.add_argument("--usd", type=float, default=0.0, help="usd to add to cost")
     adv.add_argument("--executor", help="executor that performed the work")
 
+    ver = ledger_sub.add_parser(
+        "verify",
+        help="resolve every link in the ledger chain",
+        description=(
+            "Exits 1 naming the first broken link: a work item with no PR, a "
+            "satisfies: entry naming a scenario the suite at that version does not "
+            "have, a cut naming a wave with no record or one that has not reached "
+            "verified, or a criterion a cut wave arms and no work item claims. "
+            "Records whose suite-<sha>.json is absent are reported unchecked, not "
+            "passed; --strict refuses instead."
+        ),
+    )
+    ver.add_argument("checkout", help="the intent repo checkout")
+    ver.add_argument("--ledger-dir", help="ledger directory (default: <checkout>/ledger)")
+    ver.add_argument(
+        "--strict",
+        action="store_true",
+        help="refuse to pronounce the chain sound when any record's scenario "
+             "references could not be resolved; belongs wherever the guard blocks",
+    )
+
     _add_mint(sub)
     _add_backpressure(sub)
     _add_pin(sub)
+    _add_budget(sub)
+    _add_verify(sub)
 
     return parser
 
@@ -207,6 +250,122 @@ def _add_pin(sub) -> None:
     )
 
 
+def _add_budget(sub) -> None:
+    b = sub.add_parser(
+        "budget",
+        help="sum recorded spend against the installation's caps",
+        description=(
+            "Exits 1 when a cap parks something: an item past budgets.per_item_usd, "
+            "or committed spend at or past budgets.period_usd for the current "
+            "budgets.period. Spend is attributed to a period by its record's "
+            "`approved` time, the only clock the ledger has. Certification does not "
+            "exist yet, so the next item's cost is an input: pass --projected to ask "
+            "whether it would exceed the cap. Writes nothing — the park marker and "
+            "the spend report are for the caller that can file an issue."
+        ),
+    )
+    b.add_argument("checkout", help="the intent repo checkout")
+    b.add_argument("--ledger-dir", help="ledger directory (default: <checkout>/ledger)")
+    b.add_argument(
+        "--projected",
+        type=float,
+        default=0.0,
+        help="what the next work item is expected to cost, from a caller that can "
+             "project it; counted alongside recorded spend",
+    )
+    b.add_argument("--period-cap", type=float, help="override budgets.period_usd")
+    b.add_argument("--item-cap", type=float, help="override budgets.per_item_usd")
+    b.add_argument(
+        "--period",
+        help=f"override budgets.period ({', '.join(BUDGET_PERIODS)})",
+    )
+    b.add_argument(
+        "--as-of",
+        help="measure the period containing this ISO 8601 moment (default: now, UTC)",
+    )
+    b.add_argument("--json", action="store_true", help="emit the measurement as JSON")
+
+
+def _add_verify(sub) -> None:
+    """The mechanical guards that read a *product* checkout.
+
+    Grouped under one verb because that is what they are to a caller: four
+    questions asked of a pull request, none of which needs the intent repo's
+    ledger. ``ledger verify`` and ``budget`` stay where their subject is — the
+    ledger and the installation's caps — rather than being pulled in here for
+    the sake of a tidy noun.
+    """
+    verify = sub.add_parser("verify", help="mechanical guards over a product checkout")
+    verify_sub = verify.add_subparsers(dest="verify_command", required=True)
+
+    bound = verify_sub.add_parser(
+        "boundaries",
+        help="check a diff against write_boundaries.<role> in .vellum/product.yaml",
+        description=(
+            "Exits 1 naming every changed path outside the trees the role may write. "
+            "The boundaries are the data in the product checkout's own "
+            "`.vellum/product.yaml`; a role that file does not declare is refused "
+            "rather than defaulted, either way, because a boundary that can turn "
+            "itself off is not one. Renames are not detected, so a file moved out of "
+            "a protected tree still counts as a write to it."
+        ),
+    )
+    bound.add_argument("product_checkout", help="the product repo checkout")
+    bound.add_argument("--base", required=True, help="the ref the branch left")
+    bound.add_argument("--head", required=True, help="the branch head")
+    bound.add_argument(
+        "--role", default="implementer", help="the role whose boundaries apply"
+    )
+
+    deps = verify_sub.add_parser(
+        "deps",
+        help="check declared dependencies against dependency_policy.registries",
+        description=(
+            "Exits 1 when a declared dependency resolves to a registry the "
+            "installation's `.vellum/config.yaml` does not list. A plain requirement "
+            "resolves to whatever index is in force (pypi.org unless a requirements "
+            "file overrides it); a direct URL or VCS reference resolves to its host; "
+            "a local path resolves to no registry and is not a finding."
+        ),
+    )
+    deps.add_argument("product_checkout", help="the product repo checkout")
+    deps.add_argument(
+        "--intent",
+        help=f"an intent repo checkout holding the policy (default: ${INTENT_ENV})",
+    )
+    deps.add_argument(
+        "--manifest",
+        action="append",
+        default=[],
+        dest="manifests",
+        help="manifest to read, relative to the checkout; repeatable. Default: "
+             f"{', '.join(DEFAULT_MANIFESTS)}",
+    )
+
+    duty = verify_sub.add_parser(
+        "exit-duty",
+        help="check that a diff touching source also updates an area note",
+        description=(
+            "Exits 1 when a diff changes source and nothing under "
+            f"{AREAS_TREE}. Checks that *some* note changed, not that it is the "
+            "right one: an area is an editorial grouping whose name is not derivable "
+            "from a source path, so which note a change belongs in stays the "
+            "verifier's reading of the memory diff."
+        ),
+    )
+    duty.add_argument("product_checkout", help="the product repo checkout")
+    duty.add_argument("--base", required=True, help="the ref the branch left")
+    duty.add_argument("--head", required=True, help="the branch head")
+    duty.add_argument(
+        "--src",
+        action="append",
+        default=[],
+        dest="source_trees",
+        help="source tree exit duty is owed for; repeatable "
+             f"(default: {', '.join(DEFAULT_SOURCE_TREES)})",
+    )
+
+
 def _add_common_ledger_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--version",
@@ -237,6 +396,10 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.command == "pin":
             return _pin(args)
+        if args.command == "budget":
+            return _budget(args)
+        if args.command == "verify":
+            return _verify(args)
     except SpecTreeError as exc:
         print(f"vellum: {exc}", file=sys.stderr)
         return 2
@@ -257,6 +420,17 @@ def main(argv: list[str] | None = None) -> int:
     except PinError as exc:
         print(f"vellum: {exc}", file=sys.stderr)
         return 1
+    # Every guard's own error means the same thing: it was pointed at something
+    # it could not read — a checkout with no product file, a role the file does
+    # not declare, a ref that names no commit, a config with no cap. That is "no
+    # answer", and it must not share a code with the answer each guard exists to
+    # give. A boundary crossing, an unlisted registry, an unmet exit duty, a
+    # broken chain link and a parked queue are all 1, and 1 is what a workflow
+    # blocks a merge on; a mistyped `--role` reaching a caller as "this PR wrote
+    # outside its trees" would be a red nobody can find the cause of.
+    except (BoundaryError, ChainError, BudgetError, DependencyError, ExitDutyError) as exc:
+        print(f"vellum: {exc}", file=sys.stderr)
+        return 2
     return 2
 
 
@@ -330,7 +504,56 @@ def _pin(args: argparse.Namespace) -> int:
     return 0
 
 
+def _budget(args: argparse.Namespace) -> int:
+    as_of = None
+    if args.as_of:
+        as_of = parse_time(args.as_of)
+        if as_of is None:
+            # An unreadable `--as-of` is an invocation problem: the caller asked
+            # for a window and named no moment this can find one from. Answering
+            # for "now" instead would report a window nobody asked about, under a
+            # heading that says otherwise.
+            raise BudgetError(
+                f"--as-of {args.as_of!r} is not an ISO 8601 moment "
+                f"(e.g. 2026-08-31T00:00:00Z)"
+            )
+    return budget_run(
+        args.checkout,
+        ledger_dir=args.ledger_dir,
+        period_cap=args.period_cap,
+        item_cap=args.item_cap,
+        period=args.period,
+        projected=args.projected,
+        as_of=as_of,
+        as_json=args.json,
+    )
+
+
+def _verify(args: argparse.Namespace) -> int:
+    if args.verify_command == "boundaries":
+        return boundaries_run(
+            args.product_checkout, args.base, args.head, args.role
+        )
+    if args.verify_command == "exit-duty":
+        return exitduty_run(
+            args.product_checkout, args.base, args.head, args.source_trees or None
+        )
+    intent = args.intent or os.environ.get(INTENT_ENV)
+    if not intent:
+        # The same refusal `pin advance` makes, for the same reason: the policy
+        # is installation policy and lives in the intent repo, so nothing about
+        # a product checkout alone can answer the question.
+        raise SpecTreeError(
+            f"no intent checkout: pass --intent, or set {INTENT_ENV}. "
+            f"dependency_policy.registries is installation policy and lives in "
+            f"the intent repo's .vellum/config.yaml."
+        )
+    return deps_run(args.product_checkout, intent, args.manifests or None)
+
+
 def _ledger(args: argparse.Namespace) -> int:
+    if args.ledger_command == "verify":
+        return chain_run(args.checkout, ledger_dir=args.ledger_dir, strict=args.strict)
     sha = parse_version(args.version)
     if args.ledger_command == "open":
         baseline = parse_version(args.baseline) if args.baseline else None

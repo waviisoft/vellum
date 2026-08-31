@@ -1,9 +1,11 @@
 # Area: the `vellum` CLI
 
-`src/vellum/`. Six commands — `lint`, `suite extract`, `ledger open|advance`,
-and the three pipeline commands `mint`, `backpressure`, `pin advance` —
-dispatched from `build_parser()` in `src/vellum/cli.py`. Every claim below
-names a file or symbol you can grep for.
+`src/vellum/`. Eleven commands — `lint`, `suite extract`,
+`ledger open|advance|verify`, the three pipeline commands `mint`,
+`backpressure`, `pin advance`, and the five mechanical guards
+`verify boundaries|deps|exit-duty`, `ledger verify` and `budget` — dispatched
+from `build_parser()` in `src/vellum/cli.py`. Every claim below names a file or
+symbol you can grep for.
 
 ## Module map
 
@@ -21,6 +23,12 @@ names a file or symbol you can grep for.
 | `src/vellum/backpressure.py` | `measure()` -> `Window`, `run()`, `SETTLED_STATES`. The divergence gate. |
 | `src/vellum/pin.py` | `advance()` -> `Advance`, `verify_version()`, `_rewrite()`. The pin close. |
 | `src/vellum/config.py` | `load()`, `divergence_cap()`, `INTENT_ENV`. Reads `.vellum/config.yaml`. |
+| `src/vellum/product.py` | `load()`, `write_boundaries()`, `normalise_tree()`, `under()`, `PRODUCT_RELPATH`. Reads `.vellum/product.yaml`. |
+| `src/vellum/boundaries.py` | `check()` -> `Boundaries`, `run()`. The write-boundary guard. |
+| `src/vellum/exitduty.py` | `check()` -> `ExitDuty`, `run()`, `AREAS_TREE`. The memory-update guard. |
+| `src/vellum/deps.py` | `check()` -> `Policy`, `registries()`, `host_of()`, `_scan_toml_arrays()`. The dependency-registry guard. |
+| `src/vellum/chain.py` | `verify()` -> `Chain`, `Finding`, `CERTIFIABLE_STATES`. The ledger guard. |
+| `src/vellum/budget.py` | `measure()` -> `Spend`, `window_for()`, `parse_time()`, `PARK_MARKER`. The spend guard. |
 
 ## Scenario identity
 
@@ -630,6 +638,199 @@ after every test in the file, which is what caught the second instance.
 reads the same variable the pinned-tree tests do, deliberately: an installation
 should have one answer to "where is the intent repo checked out", and two
 spellings is how the tests and the command come to disagree.
+
+## The mechanical guards
+
+Five read-only commands, each reading neutral inputs and answering one
+question: `verify boundaries`, `verify deps`, `verify exit-duty`,
+`ledger verify` and `budget`. None writes anything and none reaches a forge.
+They arrived in one wave against the five scenarios that had no product behind
+them at all — `@id:implementer-cannot-touch-harness`,
+`@id:unlisted-registry-fails`, `@id:exit-duty-required`,
+`@id:chain-resolution-fails-release` and `@id:global-cap-parks-queue`, each of
+which the intent repo's harness reports CANNOT RUN YET against a named
+capability in `harness/support/adapter.py`.
+
+**`.vellum/product.yaml` has two readers now and one writer.**
+`src/vellum/product.py` reads it (`write_boundaries`, and only that — a schema
+written ahead of a reader is a second place for the shape to drift);
+`src/vellum/pin.py` is still the only thing that *writes* it, a line at a time,
+and now imports `product_path` from `product.py` rather than defining it. Do
+not grow a writer in `product.py`: the line-level rewrite in `pin.py` and the
+verification around it are what keep that file's comments, which are its
+documentation.
+
+**A guard's own error is 2, always.** `BoundaryError`, `ChainError`,
+`BudgetError`, `DependencyError` and `ExitDutyError` all map to 2 in `main()`,
+in one `except` clause. 1 is reserved for the finding each guard exists to
+report, because 1 is what a workflow blocks a merge on — a mistyped `--role`
+arriving as "this PR wrote outside its trees" is the same unfindable red the
+`backpressure` split exists to prevent. Every guard's tests assert the number,
+not "non-zero".
+
+**An allowlist has one dangerous direction, and every judgment call leans the
+other way.** For `verify boundaries`: a role `.vellum/product.yaml` does not
+declare is refused rather than defaulted — neither default is safe, an empty
+list faults every honest PR and an unrestricted one passes every dishonest one;
+`normalise_tree()` refuses `""`, `.`, `/` and `../..`, each of which admits
+every path in a diff under a naive prefix test; and `under()` compares path
+*components*, so `src` does not admit `srcs/evil.py`.
+`TestBoundariesThatWouldTurnTheGuardOff` covers the four.
+
+**`changed_paths()` passes `--no-renames`, and that is load-bearing.** With
+rename detection on, `git mv harness/steps.py src/steps.py` is reported as one
+path — the new one — and the write to the tree the file *left* disappears from
+the diff the guard reads.
+`test_moving_a_file_out_of_a_protected_tree_still_names_that_tree` pins it.
+`-z` is there for the same class of reason: a path carrying a newline or a
+quote is otherwise emitted quoted and escaped, and a guard that unquotes it
+wrongly reads a path that is not the one in the tree.
+
+**The comparison goes through the merge base, and falls back *wider*.** Diffing
+two refs directly also reports, inverted, everything that landed on `base`
+since the branch left it — so `main` gaining a harness commit while a PR is
+open faults the implementer for somebody else's work
+(`test_a_commit_landing_on_base_is_not_charged_to_the_branch`). Where no merge
+base exists — a shallow CI clone, unrelated histories — `changed_paths()` reads
+the direct diff, which is a *superset* of the branch's own changes, and returns
+`basis="two-dot"` so the report can say so. A guard may be wrong loudly; it may
+not be wrong quietly.
+
+**`verify exit-duty` deliberately does not check *which* note changed, and this
+area note is the counter-example.** `src/vellum/` is documented by
+`.vellum/memory/areas/cli.md`; there is no derivation from `src/vellum` to
+`cli`. Areas are editorial groupings the librarian names, so a guessed mapping
+would fault correct PRs — the note it wanted exists under another name — and
+pass incorrect ones. The mechanical half is enforced mechanically and the
+editorial half stays where `spec/features/memory-and-briefings.md` puts it: the
+verifier reviewing the memory diff. The report says which of the two it
+checked, so a green run is not misread. A path inside `AREAS_TREE` is never
+also counted as source, so an installation whose source tree is `.` — or one
+that lists `.vellum/memory` in `product.trees`, as this repo does — cannot make
+the memory diff satisfy itself.
+
+**`ledger verify` scopes two checks to the record and three to the cut, because
+the spec's sentence does.** "The ledger guard fails a *release* whose chain does
+not resolve." A work item with no PR, and a `satisfies:` naming a scenario the
+suite does not have, are wrong the moment they are written, so they are asked of
+every record. Coverage — "a criterion no work item claims" — and certification
+are asked only of waves a cut names: an open wave legitimately has criteria
+nothing claims yet, that being what an unplanned wave *is*, and asking it
+everywhere would fault every version between approval and its work plan.
+Measured on intent `main` at the pin: 11 records, 0 cuts, no findings, seven
+records unchecked for want of a suite file.
+
+**Coverage asks only about the criteria the version *armed*.** `armed` is the
+scenarios `ledger/suite-<sha>.json` dates to that very commit
+(`scenario["version"] == sha`). The rest of the suite belongs to earlier waves
+and was claimed — or not — there; re-faulting it at every cut makes the guard
+noisier the longer an installation runs.
+`test_only_the_criteria_this_version_armed_are_asked_about` pins it.
+
+**Certification has no field, so `uncertified-wave` is a proxy and says so.**
+`vellum.ledger.RECORD_KEYS` has no certification key, and
+`harness/support/adapter.py` says the same thing under `certification-runner`:
+"the ledger record schema in vellum.ledger has no certification field at all".
+The check reads `state in CERTIFIABLE_STATES` instead, and both `Finding.kind`
+and `Chain.report()` label it as the proxy it is. **Do not quietly promote it to
+a real certification check** — that needs a spec slice (a `certification:` field
+on the record or the work item), and a guard that inferred one would be
+enforcing its own reading rather than recorded fact.
+
+**An absent `suite-<sha>.json` is *unchecked*, not passed.** Seven of the eleven
+records on intent `main` have no suite beside them, so refusing outright would
+make the command unusable there. A link nobody looked at is not a link that
+resolved, so the report says so and `--strict` refuses instead — the same split
+`backpressure --strict` draws, and for the same reason: "I could not resolve
+three records" must never arrive as "the chain is sound".
+
+**`budget` attributes spend by the record's `approved` time, because that is the
+only clock the ledger has.** `COST_KEYS` is attempts, tokens, usd, executor — no
+timestamp — so a period window has to hang off something, and the record's
+approval is it. A record whose `approved` cannot be read is counted **inside**
+the window: a cost this cannot prove belongs to an earlier period is one the cap
+must not let through, and `Spend.undated` names every record treated that way.
+PyYAML turns an unquoted timestamp into a `datetime` before `parse_time()` sees
+it — the same trap `_is_iso_date()` in `lint.py` exists for — so both shapes are
+handled and both are tested.
+
+**The two caps read two different words in one behavior, and both are read as
+written.** "Exceeding a per-item cap parks the item; **hitting** the global cap
+parks the queue" — so the per-item test is `>` and the queue test is `>=`. The
+queue half is the same reading `backpressure` gives its own cap: the question is
+whether the next work item may run, and the scenario states it as a cap of $100
+with $99 recorded.
+
+**A missing `per_item_usd` leaves that half unchecked and the report says so; a
+missing `period_usd` or `period` is an error.** Not a softening of "missing is an
+error, not a default" but the same rule applied per cap: `period_usd` is the
+command's headline job, and the harness's own sandbox config
+(`harness/support/sandbox.py::write_config`) declares no `per_item_usd` at all,
+so refusing on it would make the ordinary shape unrunnable. The absence is
+stated in the output rather than defaulted in the code.
+
+**`vellum budget --json` puts the payload on stdout and every diagnostic on
+stderr**, so `| jq` still parses a parked run — the property `suite extract -o -`
+already had, asserted directly by
+`test_a_parked_run_writes_nothing_but_json_to_stdout`.
+
+**`--projected` and `--pending` are the same idea twice.** Where a guard needs a
+number only a forge or a not-yet-built runner can supply, the caller passes it
+and the report says plainly when it was not supplied. `budget` cannot project a
+certification cost because certification does not exist. Do not reach for a
+forge API to close either gap.
+
+**`deps` reads `pyproject.toml` without `tomllib` on 3.10, and refuses rather
+than under-reporting.** `tomllib` arrived in 3.11, the floor here is 3.10, and
+the dependency policy is itself the reason not to add `tomli`. So
+`_scan_toml_arrays()` is not a TOML parser with gaps: inside the tables it cares
+about, a key whose value it cannot read *exactly* raises `DependencyError`
+(exit 2, "no answer") rather than being skipped into a shorter answer that reads
+like a pass. `TestTheTomlFallbackAgreesWithTheRealParser` asserts it against
+`tomllib` on 3.11+, including on this repo's own `pyproject.toml`. **Measured,
+not assumed:** the whole suite was run under a real `python3.10` — 458 tests,
+green, with `TestReadingPyproject` executing through the fallback and only the
+five agreement tests skipping — and both readers return byte-identical
+requirement lists for this repo's `pyproject.toml` and `requirements.txt`.
+
+**Registry hosts are compared exactly, after parsing.** `host_of()` goes through
+`urlsplit().hostname` rather than a regex, so it strips userinfo and port:
+`https://pypi.org@evil.invalid/simple` is a request to `evil.invalid`, and
+`pypi.org.evil.invalid` is not `pypi.org`. Both are the shapes a substring test
+lets through, and there is a test for each. A policy entry naming no host is
+refused rather than dropped — dropping shortens the allowlist, which fails
+*closed*, sending a reviewer hunting a supply-chain finding that is really a
+typo in policy.
+
+**`-r` includes are followed, and contained.** The path is text out of the
+repository, so following it unguarded makes the guard a file-read primitive
+aimed by whoever writes the manifest. `_contained()` refuses anything resolving
+outside the checkout, and a cycle of includes terminates on a `seen` set.
+`requirements*.txt` is a glob rather than one filename because a dev dependency
+is executed on a machine holding credentials just as a runtime one is.
+
+**pip options apply to the file, not to the lines below them.** An
+`--index-url` written after a requirement still serves it, so
+`read_requirements_txt()` re-attributes every plain requirement once the whole
+file's options are known. `--extra-index-url` and `--find-links` are counted as
+registries in use for the same reason: every plain requirement in that file may
+be served from them.
+
+**`registries: [npmjs.org]` was founding-template residue, and it is gone.**
+`harness/NOTES.md` finding 2 recorded that the policy admitted npmjs while the
+product it governs is a Python package — so under the policy as written, this
+repo's own dependencies were from an unlisted registry. It reads `[pypi.org]`
+now, and `test_the_governed_products_own_dependencies_pass_the_live_policy` pins
+that this guard's first real run against this repo is not a false red.
+
+**A test that changes `VELLUM_INTENT_REPO` disarms the conformance job, and
+`verify deps` reads it too.** `run_cli` calls `main()` in-process and `_verify`
+reads the variable at call time, so the landmine `test_pin` already documented
+now has a second door. `DepsCase` asserts `os.environ` is unchanged after every
+test in the file, and the one test that needs the variable absent uses
+`unittest.mock.patch.dict` — which restores — never `addCleanup(os.environ.pop)`,
+which deletes.
+
 
 ## Patterns worth keeping
 
