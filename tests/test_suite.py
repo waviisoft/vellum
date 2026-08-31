@@ -13,13 +13,24 @@ from support import (
     intent_checkout,
     intent_spec_tree,
     make_spec_repo,
+    make_tree,
     pinned_commit,
     pinned_gherkin_file_count,
     pinned_scenario_count,
+    run_cli,
+    run_cli_streams,
     write_area,
 )
 from vellum.gherkin_blocks import Step, parse_block, split_documents
-from vellum.suite import extract, fingerprint, scenarios_in, to_dict
+from vellum.lint import lint_tree
+from vellum.specfile import find_fences
+from vellum.suite import (
+    DroppedScenarios,
+    extract,
+    fingerprint,
+    scenarios_in,
+    to_dict,
+)
 
 ONE = """Feature: Login
   @id:login-good-password
@@ -37,6 +48,38 @@ TWO = ONE + """
     Then they see an error"""
 
 TWO_CHANGED = TWO.replace("Then they see the dashboard", "Then they see the dashboard in 400ms")
+
+#: A block the Cucumber parser refuses: the docstring is never closed.
+BROKEN = """Feature: Unreadable
+  @id:never-closed
+  Scenario: The quote is never closed
+    Given a payload
+      \"\"\"
+      {"still": "open"
+    Then it is rejected"""
+
+#: A block that parses perfectly and still hands back one scenario fewer than a
+#: stock runner executes: the Rule's child is not admitted (GH010).
+RULE_NESTED = """Feature: Deletion
+  @id:rule-direct-child
+  Scenario: A direct child
+    Given a signed-in user
+    Then the page renders
+
+  Rule: Only admins may delete
+    @id:rule-nested-child
+    Scenario: A normal user may not delete
+      Given a normal user
+      Then the delete is refused"""
+
+#: A Rule holding nothing. Lint faults it (GH010) and the suite loses nothing,
+#: which is the line the refusal is drawn on.
+RULE_EMPTY = """Feature: Retention
+  Rule: Records older than a year are purged"""
+
+#: A fence that parses and declares no scenarios — GH002, and a complete suite.
+NO_SCENARIOS = """Feature: Nothing yet
+  Some description prose and no scenarios at all."""
 
 #: The same two scenarios as TWO, before ids existed — the spec-v1 shape.
 TWO_WITHOUT_IDS = "\n".join(
@@ -141,11 +184,299 @@ class TestScenarioCollection(unittest.TestCase):
         keys = [(s["file"], s["line"]) for s in self.suite["scenarios"]]
         self.assertEqual(keys, sorted(keys))
 
-    def test_unparseable_blocks_are_skipped_not_raised(self):
-        # lint is where a broken block fails a run; extraction still describes
-        # the rest of the tree.
-        suite = extract(FIXTURES / "bad-gherkin")
-        self.assertEqual(suite.entries, [])
+
+class TestUnparseableBlocksAreRefused(unittest.TestCase):
+    """A fence that does not parse fails the extraction (waviisoft/vellum#7).
+
+    It used to be skipped, with lint left as the only thing that faulted it.
+    That made the two commands disagree about the same tree, and the direction
+    of the disagreement was the dangerous one: ``extract`` exited 0 and emitted
+    a suite short exactly the scenarios nobody could see were missing.
+    """
+
+    FIXTURE = FIXTURES / "bad-gherkin-mixed"
+
+    def broken_fence(self):
+        """The fixture's failing fence, located by reading the file.
+
+        Not written out as a line number here: a hard-coded fact about a
+        fixture fails on every edit to it, which is noise rather than a defect.
+        """
+        text = (self.FIXTURE / "features" / "mixed.md").read_text(encoding="utf-8")
+        return next(
+            f
+            for f in find_fences(text.split("\n"))
+            if f.info == "gherkin" and "Unreadable" in f.body
+        )
+
+    def test_extract_raises_naming_the_file_and_the_block(self):
+        with self.assertRaises(DroppedScenarios) as caught:
+            extract(self.FIXTURE)
+        errors = caught.exception.errors
+        self.assertEqual([e.relpath for e in errors], ["features/mixed.md"])
+        self.assertEqual(errors[0].block_line, self.broken_fence().start_line)
+        self.assertEqual(errors[0].code, "GH001")
+        # The fault is located inside the block it names, not at its opening.
+        self.assertGreater(errors[0].line, errors[0].block_line)
+
+    def test_the_cli_exits_1_and_says_which_block(self):
+        # 1 exactly, not merely non-zero: 2 is what SpecTreeError and
+        # LedgerError mean ("the path you gave me is not a spec tree"), so a
+        # drift that started answering 2 here would tell a caller the wrong
+        # thing about its own invocation and still pass a non-zero assertion.
+        code, output = run_cli(["suite", "extract", str(self.FIXTURE), "-o", "-"])
+        self.assertEqual(code, 1)
+        self.assertIn("features/mixed.md", output)
+        self.assertIn(f"line {self.broken_fence().start_line}", output)
+
+    def test_a_refusal_writes_nothing_to_stdout(self):
+        # `-o -` puts the suite on stdout, so a diagnostic printed there would
+        # be read as part of the JSON — `extract … -o - | jq` would fail on a
+        # tree it should merely have refused, or worse, parse the wrong thing.
+        # Every word of a refusal is on stderr; stdout stays empty.
+        code, out, err = run_cli_streams(
+            ["suite", "extract", str(self.FIXTURE), "-o", "-"]
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("features/mixed.md", err)
+
+    def test_no_suite_is_written_when_the_tree_is_refused(self):
+        # There is no partial extraction: the good block in this fixture reads
+        # cleanly, and emitting it alone is precisely the quietly-wrong suite
+        # the refusal exists to stop.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "suite.json"
+            code, _ = run_cli(["suite", "extract", str(self.FIXTURE), "-o", str(out)])
+            self.assertEqual(code, 1)
+            self.assertFalse(out.exists())
+
+    def test_an_existing_output_file_is_left_exactly_as_it_was(self):
+        # `on-spec-merge.yml` extracts over `ledger/suite-<sha>.json` on a main
+        # that may already carry one. Refusing must leave the last good suite
+        # in place: truncating it, or writing a short one over it, would take
+        # the tree from "no answer" to "a wrong answer already committed".
+        previous = '{"scenario_count": 22, "the": "last good suite"}\n'
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "suite.json"
+            out.write_text(previous, encoding="utf-8")
+            code, _ = run_cli(["suite", "extract", str(self.FIXTURE), "-o", str(out)])
+            self.assertEqual(code, 1)
+            self.assertEqual(out.read_text(encoding="utf-8"), previous)
+
+    def test_lint_and_extract_now_agree_about_the_same_tree(self):
+        # The defect was the disagreement itself, so it is asserted as one.
+        self.assertEqual(
+            [f.code for f in lint_tree(self.FIXTURE) if f.code == "GH001"], ["GH001"]
+        )
+        self.assertEqual(run_cli(["lint", str(self.FIXTURE)])[0], 1)
+        self.assertEqual(
+            run_cli(["suite", "extract", str(self.FIXTURE), "-o", "-"])[0], 1
+        )
+
+    def test_every_failing_block_is_reported_not_just_the_first(self):
+        # bad-gherkin holds two unparseable fences; one run names both, so a
+        # repair does not have to be discovered one command at a time.
+        with self.assertRaises(DroppedScenarios) as caught:
+            extract(FIXTURES / "bad-gherkin")
+        self.assertEqual(len(caught.exception.errors), 2)
+
+
+class TestRuleNestedScenariosAreRefused(unittest.TestCase):
+    """The other silent drop: a `Rule:` parses cleanly and still costs scenarios.
+
+    ``parse_block`` does not descend into a Rule — the construct is banned
+    (``spec/decisions/2026-08-28-no-rules.md``) — so a stock Cucumber runner
+    executes its nested scenarios and ``suite.json`` does not describe them.
+    That is the same harm as an unparseable fence, reached the other way, and
+    it is the class the ban was raised for (waviisoft/vellum-intent#16). The
+    refusal is keyed on the harm, not on ``GherkinParseError``.
+    """
+
+    FIXTURE = FIXTURES / "bad-rules"
+
+    def errors(self):
+        with self.assertRaises(DroppedScenarios) as caught:
+            extract(self.FIXTURE)
+        return caught.exception.errors
+
+    def test_extract_refuses_a_tree_that_nests_scenarios_under_a_rule(self):
+        errors = self.errors()
+        self.assertEqual(
+            sorted(e.relpath for e in errors),
+            ["features/absorbs-what-follows.md", "features/nested.md"],
+        )
+        self.assertEqual({e.code for e in errors}, {"GH010"})
+
+    def test_the_refusal_names_how_many_scenarios_would_be_omitted(self):
+        # The count is what makes this a refusal rather than a style rule, and
+        # it is the same count GH010 reports, from the same field.
+        nested = next(e for e in self.errors() if e.relpath == "features/nested.md")
+        self.assertIn("2 scenario(s)", nested.message)
+        self.assertIn("Only admins may delete", nested.message)
+        self.assertIn("omitted", nested.message)
+
+    def test_the_refusal_points_at_the_rule_inside_the_block_it_names(self):
+        nested = next(e for e in self.errors() if e.relpath == "features/nested.md")
+        rule_line = next(
+            f.line
+            for f in lint_tree(self.FIXTURE)
+            if f.code == "GH010" and f.file == "features/nested.md"
+        )
+        self.assertEqual(nested.line, rule_line)
+        self.assertGreater(nested.line, nested.block_line)
+
+    def test_the_cli_exits_1_and_sends_the_reader_to_gh010(self):
+        code, output = run_cli(["suite", "extract", str(self.FIXTURE), "-o", "-"])
+        self.assertEqual(code, 1)
+        self.assertIn("features/nested.md", output)
+        self.assertIn("GH010", output)
+
+    def test_lint_and_extract_agree_about_this_tree_too(self):
+        self.assertEqual(run_cli(["lint", str(self.FIXTURE)])[0], 1)
+        self.assertEqual(
+            run_cli(["suite", "extract", str(self.FIXTURE), "-o", "-"])[0], 1
+        )
+
+    def test_a_rule_holding_nothing_does_not_refuse(self):
+        # Where the line is drawn. An empty Rule fails lint on its own account
+        # (GH010, and GH002 besides) and costs the suite nothing, so extraction
+        # has no business refusing it: the suite it would emit is complete.
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = make_tree(Path(tmp), {"empty-rule": RULE_EMPTY, "good": ONE})
+            # Lint still rejects the tree; extraction still answers. That the
+            # two disagree here is the point, not an oversight.
+            self.assertEqual(
+                sorted({f.code for f in lint_tree(tree)}), ["GH002", "GH010"]
+            )
+            suite = extract(tree)
+            self.assertEqual([e.id for e in suite.entries], ["login-good-password"])
+
+    def test_a_rule_written_in_prose_does_not_refuse(self):
+        # The negative control GH007 and GH009 both paid for: detection reads
+        # the parsed node, so a `Rule:` inside a docstring is literal text and
+        # one inside a step's text is prose, and neither may cost a tree its
+        # extraction. The block is read out of the fixture lint uses rather
+        # than restated here, so the two controls cannot drift apart.
+        source = FIXTURES / "bad-rules" / "features" / "mentions-a-rule.md"
+        block = next(
+            f.body
+            for f in find_fences(source.read_text(encoding="utf-8").split("\n"))
+            if f.info == "gherkin"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            ids = {e.id for e in extract(make_tree(Path(tmp), {"prose": block})).entries}
+        self.assertEqual(
+            ids,
+            {"rules-in-a-docstring-is-not-a-rule", "rules-in-step-text-is-not-a-rule"},
+        )
+
+
+class TestFindingsThatDropNothingStillExtract(unittest.TestCase):
+    """Extraction refuses a short suite, not a lint-rejected tree.
+
+    Those are different sets, and conflating them would make ``extract`` a
+    second ``lint`` — a tree whose only defect is a broken link or a missing
+    ``@id:`` yields a suite describing every scenario in it, and refusing to
+    hand that over stops the harness for a reason that costs the suite nothing.
+    The rule is the drop, and only the drop.
+    """
+
+    def extracts(self, fixture):
+        code, _ = run_cli(["suite", "extract", str(fixture), "-o", "-"])
+        return code
+
+    def test_a_tree_lint_rejects_for_its_links_still_extracts(self):
+        self.assertEqual(run_cli(["lint", str(FIXTURES / "bad-links")])[0], 1)
+        self.assertEqual(self.extracts(FIXTURES / "bad-links"), 0)
+
+    def test_a_tree_lint_rejects_for_its_ids_still_extracts(self):
+        # GH003/GH005/GH006. An id defect is a defect in how a scenario is
+        # referred to, not in whether the suite carries it.
+        self.assertEqual(run_cli(["lint", str(FIXTURES / "bad-ids")])[0], 1)
+        self.assertEqual(self.extracts(FIXTURES / "bad-ids"), 0)
+        self.assertEqual(len(extract(FIXTURES / "bad-ids").entries), 5)
+
+    def test_a_fence_declaring_no_scenarios_still_extracts(self):
+        # GH002. A block with nothing in it drops nothing: there is no scenario
+        # a runner would execute that the suite fails to describe.
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = make_tree(Path(tmp), {"empty": NO_SCENARIOS, "good": ONE})
+            self.assertEqual(
+                [f.code for f in lint_tree(tree) if f.code == "GH002"], ["GH002"]
+            )
+            self.assertEqual([e.id for e in extract(tree).entries],
+                             ["login-good-password"])
+
+
+class TestRefusalAcrossFiles(unittest.TestCase):
+    """Every dropping block in the tree is found, wherever in the walk it sits.
+
+    ``extract`` scans the whole tree before it judges any of it, so one run
+    names the entire repair list. The three shapes below are the ones a walk
+    that stopped early, or lost a file's failures behind an empty scenario
+    list, would each pass anyway.
+    """
+
+    def refuse(self, blocks):
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = make_tree(Path(tmp), blocks)
+            with self.assertRaises(DroppedScenarios) as caught:
+                extract(tree)
+            return caught.exception.errors
+
+    def test_bad_blocks_in_several_files_are_all_reported(self):
+        errors = self.refuse({"a-bad": BROKEN, "b-good": ONE, "c-bad": RULE_NESTED})
+        self.assertEqual(
+            [e.relpath for e in errors],
+            ["features/a-bad.md", "features/c-bad.md"],
+        )
+        # Both kinds land in the one list, and the summary names both codes.
+        self.assertEqual([e.code for e in errors], ["GH001", "GH010"])
+
+    def test_a_bad_block_in_the_last_file_scanned_is_not_lost(self):
+        # `iter_spec_files` sorts by path, so `features/z-bad.md` is scanned
+        # last. A loop that judged as it went and returned on the first clean
+        # file would still be green on every other shape here.
+        errors = self.refuse({"a-good": ONE, "z-bad": BROKEN})
+        self.assertEqual([e.relpath for e in errors], ["features/z-bad.md"])
+
+    def test_a_file_with_no_good_block_at_all_is_reported(self):
+        # The file contributes zero scenarios, so its failures are the only
+        # thing it hands back — and the good file's scenarios are still not
+        # emitted, because there is no partial extraction.
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = make_tree(Path(tmp), {"a-good": ONE, "b-nothing-good": BROKEN})
+            out = Path(tmp) / "suite.json"
+            code, _ = run_cli(["suite", "extract", str(tree), "-o", str(out)])
+            self.assertEqual(code, 1)
+            self.assertFalse(out.exists())
+            with self.assertRaises(DroppedScenarios) as caught:
+                extract(tree)
+        self.assertEqual(
+            [e.relpath for e in caught.exception.errors], ["features/b-nothing-good.md"]
+        )
+
+
+class TestHistoryStillToleratesABrokenBlock(unittest.TestCase):
+    """Dating re-parses old trees, and refusing there would be a different rule.
+
+    ``version_history`` reads every spec-touching commit in the checkout's
+    ancestry through ``scenarios_in``. A fence that failed to parse at some past
+    commit is a tree nobody can go back and fix, so one bad commit would
+    otherwise make every descendant of it permanently unextractable. Extraction
+    refuses the tree it was pointed at; the walk behind it keeps skipping.
+    """
+
+    def test_a_broken_block_in_an_earlier_commit_does_not_fail_extraction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_spec_repo(Path(tmp))
+            commit_area(repo, BROKEN)
+            good = commit_area(repo, ONE)
+            suite = extract(repo / "spec")
+            self.assertEqual([e.id for e in suite.entries], ["login-good-password"])
+            self.assertEqual(suite.entries[0].version, good)
+            self.assertFalse(suite.entries[0].pending)
 
 
 class TestFingerprint(unittest.TestCase):

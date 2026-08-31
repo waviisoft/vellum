@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import re
 import subprocess
@@ -42,6 +44,33 @@ since: spec-v1
 {block}
 ```
 """
+
+
+def run_cli_streams(argv):
+    """Run the CLI, returning ``(exit_code, stdout, stderr)`` kept apart.
+
+    ``run_cli`` joins the two, which is what most assertions want. This is for
+    the ones whose subject is *which* stream a message went to — ``suite
+    extract … -o -`` writes the suite to stdout, so a diagnostic printed there
+    would corrupt a pipe into ``jq``, and a joined buffer cannot tell.
+    """
+    from vellum.cli import main
+
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = main(argv)
+    return code, out.getvalue(), err.getvalue()
+
+
+def run_cli(argv):
+    """Run the CLI, swallowing its output so the test log stays quiet.
+
+    Returns ``(exit_code, output)`` with stdout and stderr joined into the one
+    buffer: a caller asserting on a failure message should not have to know
+    which stream the command chose.
+    """
+    code, out, err = run_cli_streams(argv)
+    return code, out + err
 
 
 class WrongPin(Exception):
@@ -158,6 +187,49 @@ def pinned_gherkin_file_count(tree: Path) -> int:
         for f in _tree_files(tree)
         if "```gherkin" in f.read_text(encoding="utf-8")
     )
+
+
+FEATURE_TEMPLATE = """---
+id: {name}
+title: {name}
+since: spec-v1
+---
+
+# {name}
+
+## Acceptance
+
+```gherkin
+{block}
+```
+"""
+
+
+def make_tree(root: Path, blocks: dict[str, str]) -> Path:
+    """A spec tree at ``<root>/spec`` holding one ``features/<name>.md`` per entry.
+
+    No git, no commits: for tests whose subject is which files the scan visits
+    and in what order, so the tree's shape is written in the test rather than
+    read out of a fixture. ``iter_spec_files`` sorts by path, so the keys'
+    alphabetical order is the order they are scanned in.
+    """
+    tree = root / "spec"
+    (tree / "features").mkdir(parents=True)
+    # The index lists the files actually written, so a tree built here is
+    # link-clean and a test can assert its findings exactly rather than
+    # filtering an LN001 the helper put there.
+    (tree / "index.md").write_text(
+        INDEX.replace(
+            "features/auth.md",
+            "\n".join(f"- features/{name}.md" for name in blocks),
+        ),
+        encoding="utf-8",
+    )
+    for name, block in blocks.items():
+        (tree / "features" / f"{name}.md").write_text(
+            FEATURE_TEMPLATE.format(name=name, block=block), encoding="utf-8"
+        )
+    return tree
 
 
 def git(repo: Path, *args: str) -> str:

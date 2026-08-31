@@ -6,6 +6,20 @@ the spec version that introduced or last changed it. A version is a commit
 is a sha and "newer" is ancestry. The suite is the contract: "product X conforms
 to spec version C" is defined as suite@C passing against a deployment of X
 (``spec/features/scenarios-and-harness.md``).
+
+Extraction refuses a tree whose blocks would cost the suite scenarios. Two
+constructs do that: a ``gherkin`` fence that does not parse, and a ``Rule:``,
+whose nested scenarios are deliberately not admitted. Either way the scenarios
+are missing from the suite with nothing recording their absence, and every
+consumer downstream reads the suite as the whole intent — so both raise
+``DroppedScenarios`` here rather than being skipped past (waviisoft/vellum#7).
+
+The refusal is scoped to that harm and no wider. A tree can fail ``lint`` for a
+dozen reasons that leave every scenario in the suite — an unresolved link, a
+missing ``@id:``, a fence declaring no scenarios — and ``extract`` goes on
+emitting those trees. It is not a second lint; it declines to answer only where
+the answer would be quietly short. Walking *history* stays tolerant even of the
+two: see ``scenarios_in``.
 """
 
 from __future__ import annotations
@@ -34,7 +48,12 @@ from vellum.gitver import (
     show,
     spec_commits,
 )
-from vellum.specfile import iter_spec_files, parse_spec_text, resolve_spec_root
+from vellum.specfile import (
+    SpecFile,
+    iter_spec_files,
+    parse_spec_text,
+    resolve_spec_root,
+)
 
 #: 2 since versions became commits: ``version`` and ``spec_version`` are shas
 #: rather than integers, ``version_name``/``spec_version_name`` carry the
@@ -110,23 +129,130 @@ class Suite:
     shallow: bool = False
 
 
-def scenarios_in(relpath: str, text: str) -> list[Scenario]:
-    """Every scenario in one spec file's ``gherkin`` fences.
+@dataclass
+class BlockError:
+    """A ``gherkin`` fence that would cost the suite scenarios, located in its file.
 
-    Blocks that fail to parse are skipped, not raised: ``vellum lint`` is where
-    an unparseable block fails a run, and extraction must still describe the
-    rest of the tree.
+    Two kinds, one type, because extraction refuses for one reason and it is
+    not "the block is malformed": scenarios a stock Cucumber runner executes
+    that ``suite.json`` would not describe, with nothing saying so. A fence
+    that does not parse drops all of its; a ``Rule:`` drops the ones nested
+    under it, which the parser reads perfectly well and ``parse_block``
+    deliberately does not admit. ``code`` is the lint finding naming the same
+    block, so the refusal can point at it rather than restate it.
     """
-    sf = parse_spec_text(relpath, text)
+
+    relpath: str
+    #: 1-based line of the fence's opening ``` — which block failed.
+    block_line: int
+    #: 1-based line of the fault inside that block: where the parser gave up,
+    #: or where the ``Rule:`` is written.
+    line: int
+    #: The rest of the sentence after "gherkin block at line <n>".
+    message: str
+    #: ``GH001`` for a parse failure, ``GH010`` for a ``Rule:``.
+    code: str
+
+    def format(self) -> str:
+        return (
+            f"{self.relpath}:{self.line}: gherkin block at line "
+            f"{self.block_line} {self.message}"
+        )
+
+
+class DroppedScenarios(Exception):
+    """Extraction refused: some block in the tree would leave scenarios out.
+
+    Raised rather than skipped past, because the scenarios a block drops are
+    exactly the ones a consumer of the suite cannot see are missing
+    (waviisoft/vellum#7). ``errors`` carries every offending block, not just
+    the first, so one run names the whole repair list the way ``lint_tree``
+    does.
+    """
+
+    def __init__(self, errors: list[BlockError]):
+        self.errors = list(errors)
+        super().__init__(f"{len(self.errors)} gherkin block(s) would drop scenarios")
+
+    @property
+    def codes(self) -> list[str]:
+        """The lint codes covering these blocks, for pointing the reader at them."""
+        return sorted({e.code for e in self.errors})
+
+
+def scan_file(sf: SpecFile) -> tuple[list[Scenario], list[BlockError]]:
+    """One spec file's scenarios, and every fence of its that would drop some.
+
+    Both halves, because the two callers want different things from the same
+    walk: ``extract`` refuses a tree with any dropping block, while the history
+    walk reads old trees it cannot ask anyone to fix and takes the scenarios
+    alone.
+
+    Takes the parsed ``SpecFile`` rather than its text so extraction does not
+    re-split a file it has already read, and — the part worth keeping — so the
+    fences lint judges and the fences extraction judges are the same objects by
+    construction rather than by two calls agreeing.
+    """
     found: list[Scenario] = []
+    failed: list[BlockError] = []
     for fence in sf.fences:
         if fence.info != "gherkin":
             continue
         try:
-            found.extend(parse_block(fence.body, fence.body_line).scenarios)
-        except GherkinParseError:
+            block = parse_block(fence.body, fence.body_line)
+        except GherkinParseError as exc:
+            failed.append(
+                BlockError(
+                    relpath=sf.relpath,
+                    block_line=fence.start_line,
+                    line=exc.line,
+                    message=f"does not parse: {exc.message}",
+                    code="GH001",
+                )
+            )
             continue
-    return found
+        found.extend(block.scenarios)
+        # A Rule is banned and its children are not admitted, so this block
+        # parses cleanly and still hands back fewer scenarios than a stock
+        # runner would execute — the same silent absence as a parse failure,
+        # reached the other way (spec/decisions/2026-08-28-no-rules.md,
+        # waviisoft/vellum-intent#16). The count is what makes it a refusal
+        # rather than a style rule, and it is GH010's count: a Rule holding
+        # nothing costs the suite nothing, fails lint on its own account, and
+        # is not extraction's business.
+        for rule in block.rules:
+            if not rule.scenarios:
+                continue
+            failed.append(
+                BlockError(
+                    relpath=sf.relpath,
+                    block_line=fence.start_line,
+                    line=rule.line,
+                    message=(
+                        f"nests {rule.scenarios} scenario(s) under a banned "
+                        f"{rule.keyword} ('{rule.name}'); they would be "
+                        f"omitted from the suite"
+                    ),
+                    code="GH010",
+                )
+            )
+    return found, failed
+
+
+def scenarios_in(relpath: str, text: str) -> list[Scenario]:
+    """Every scenario in one spec file's ``gherkin`` fences, dropping blocks skipped.
+
+    This is the tolerant half of ``scan_file``, and what walking *history*
+    needs: a commit that is already in the past cannot be repaired, so a block
+    that failed to parse there — or nested scenarios under a ``Rule:`` there —
+    is a fact about an old tree rather than a defect in the one being
+    extracted. The tree the caller actually named goes through ``extract``,
+    which refuses it — see ``DroppedScenarios``.
+
+    Takes text rather than a ``SpecFile`` because its caller has text: the
+    history walk reads blobs out of git, not files off disk.
+    """
+    return scan_file(parse_spec_text(relpath, text))[0]
 
 
 def _normalized(step: Step) -> list[str]:
@@ -239,7 +365,32 @@ def version_history(repo: Path, prefix: str, ref: str = "HEAD") -> History:
 
 
 def extract(spec_dir: str | Path) -> Suite:
+    """The suite for the tree at *spec_dir*.
+
+    Raises ``DroppedScenarios`` when any ``gherkin`` fence in the tree would
+    leave scenarios out of the suite — a fence that does not parse, or one
+    nesting scenarios under a banned ``Rule:``. Those scenarios would otherwise
+    be absent from ``suite.json`` with nothing saying so, and every consumer —
+    the harness, a briefing assembler, the ledger's armed-scenario accounting —
+    would read the smaller suite as the whole intent (waviisoft/vellum#7).
+
+    Lint findings that cost the suite nothing do not reach here: a tree with an
+    unresolved link, a missing ``@id:`` or a fence declaring no scenarios still
+    extracts, because its suite is complete. ``extract`` is not a second lint.
+    """
     root = resolve_spec_root(spec_dir)
+
+    # The tree is read and judged before any git work: a refusal costs no
+    # history walk, and every failing block in the tree is named at once
+    # rather than one per run.
+    scanned: list[tuple[str, list[Scenario]]] = []
+    failures: list[BlockError] = []
+    for sf in iter_spec_files(root):
+        found, failed = scan_file(sf)
+        scanned.append((sf.relpath, found))
+        failures.extend(failed)
+    if failures:
+        raise DroppedScenarios(failures)
 
     history = History()
     head = None
@@ -257,15 +408,15 @@ def extract(spec_dir: str | Path) -> Suite:
         pass
 
     entries: list[SuiteEntry] = []
-    for sf in iter_spec_files(root):
-        for sc in scenarios_in(sf.relpath, sf.text):
+    for relpath, found in scanned:
+        for sc in found:
             version = history.by_id.get(sc.id) if sc.id else None
             if version is None:
                 version = history.by_fingerprint.get(fingerprint(sc))
             entries.append(
                 SuiteEntry(
                     scenario=sc,
-                    relpath=sf.relpath,
+                    relpath=relpath,
                     version=version,
                     pending=version is None,
                 )
@@ -330,10 +481,34 @@ def to_dict(suite: Suite) -> dict:
 
 
 def run(spec_dir: str, out_path: str = "suite.json", out=None) -> int:
-    """Write ``suite.json`` (or stdout when *out_path* is ``-``)."""
+    """Write ``suite.json`` (or stdout when *out_path* is ``-``).
+
+    Exits 1 without writing anything when a block in the tree would drop
+    scenarios, naming each on stderr. 1 rather than 2 for the same reason
+    ``lint`` uses it: the path was a spec tree, the tree is the problem.
+
+    Every word of a refusal goes to stderr, including when *out_path* is ``-``:
+    stdout carries the suite and nothing else, so ``extract … -o - | jq`` sees
+    an empty stream rather than diagnostics parsed as JSON.
+    """
     import sys
 
-    payload = json.dumps(to_dict(extract(spec_dir)), indent=2) + "\n"
+    try:
+        suite = extract(spec_dir)
+    except DroppedScenarios as exc:
+        for err in exc.errors:
+            print(f"vellum: {err.format()}", file=sys.stderr)
+        print(
+            f"vellum: {len(exc.errors)} gherkin block(s) in {spec_dir} would "
+            f"leave scenarios out of the suite; no suite written. They would "
+            f"be absent from it with nothing saying so. `vellum lint "
+            f"{spec_dir}` reports the same blocks as "
+            f"{', '.join(exc.codes)}.",
+            file=sys.stderr,
+        )
+        return 1
+
+    payload = json.dumps(to_dict(suite), indent=2) + "\n"
     if out_path == "-":
         (out or sys.stdout).write(payload)
     else:
