@@ -50,7 +50,7 @@ Two trees, easily confused:
 - **`adapters/github/`** (below) is written *for the intent repo* and never
   runs here.
 
-`adapters/github/`. Two workflows written **for the intent repo**
+`adapters/github/`. Three workflows written **for the intent repo**
 (`waviisoft/vellum-intent`) and kept here so they are reviewed next to the CLI
 they call. Nothing in this repo runs them; `adapters/github/README.md` has the
 copy instructions.
@@ -59,8 +59,46 @@ copy instructions.
 |---|---|
 | `adapters/github/spec-ci.yml` | `pull_request` touching `spec/**`, `ledger/**`, `.vellum/config.yaml`, or the workflow file |
 | `adapters/github/on-spec-merge.yml` | `push` to `main` touching `spec/**` |
+| `adapters/github/harness-ci.yml` | `pull_request`, unfiltered |
 
 ## Landmines
+
+**`harness-ci.yml` runs on every PR *because* a `paths:` filter and a required
+check do not compose.** GitHub never reports a path-filtered job on a PR it
+filters out, and a required check that never reports leaves the PR waiting
+forever. That is also why the check the intent repo most needs could not live in
+`spec-ci.yml`: that file is filtered to `spec/**`, `ledger/**` and
+`.vellum/config.yaml`, and the breach being guarded — a harness session also
+editing `.vellum/memory/` — is a diff that touches none of them.
+
+**The harness job's role comes out of the diff, and the half it leaves open is
+stated rather than hidden.** A PR writing `harness/` is a harness PR and must
+write nothing else; a PR writing no harness path is checked against no role at
+all. Nothing reads a branch name, a title or a label to decide it — that would be
+enforcement derived from decoration, which
+`spec/decisions/2026-08-28-versions-are-commits.md` removed. Closing the other
+half is a different question ("does this diff fit inside *some* declared role's
+trees?") and needs a spec slice before it needs code.
+
+**The boundary data for the intent repo is not in this repo, and the job is red
+until it exists.** `vellum verify boundaries . --boundaries-from config` reads a
+`write_boundaries` block from the intent repo's `.vellum/config.yaml`; this repo
+ships the reader and no data for a repo it does not own. Until the architect
+authors the block, the job exits **2** on any PR writing `harness/` — "I could
+not answer", which is the right colour of red. Do not soften it to a skip: a
+guard with nothing to check against has not passed.
+
+**The conformance-map check cannot compare the whole file, and the reason is
+structural.** `harness/conformance.md` records the commit the suite was
+extracted at, which is `head_commit(repo)` — the checkout's HEAD, not the last
+spec-touching commit. So the committed file names a sha that did not exist when
+it was written, and that line differs on every single run. The step strips that
+one line from both sides and compares everything else exactly. Measured on
+intent `main` at 8d9e228: a fresh run differs from the committed map in that
+line and nothing else. If someone "fixes" the step into a plain `diff`, the
+check becomes impossible rather than strict, and impossible red is how a team
+learns to ignore red. The real fix belongs in `harness/run.py` — an option to
+omit the header — and `harness/` is not a tree this repo may write.
 
 **The two copies drift silently; only a `diff` catches it.** `adapters/github/`
 is the upstream copy and is reviewed here, but `waviisoft/vellum-intent`'s
@@ -261,6 +299,32 @@ step fails — leaving a version with no committed record. This is less bad than
 it was: the version exists whether or not anything is written, because the
 version is the commit. The missing record is bookkeeping to replay, not a
 version that never got minted.
+
+**The push retries behind a rebase, and "replay it later" was never actually
+available.** `waviisoft/vellum-intent#24` item 1: a racing merge makes the push
+non-fast-forward, and nothing re-records the stranded version, because the mint
+step accepts only the branch tip and a `workflow_dispatch` reaches only the head.
+So the retry is not belt-and-braces over an idempotent step — it is the only
+recovery there is short of a hand-written one. Two concurrent runs cannot
+conflict on content: a record's filename is its version's sha.
+
+**The push-range step is a detector and must not be mistaken for a recorder.**
+Item 2 of the same issue: `paths: spec/**` fires on any commit in a push, and the
+job mints the tip, so a spec commit below the tip is a version on `main` with no
+ledger record — in a green run. The step names them and fails; it does not mint
+them, because minting a range is a differently-shaped job and `vellum mint` takes
+one `--ref`. It runs last (so a red cannot cost the tip its push) and
+unconditionally (the case it catches is exactly the one where the tip is *not* a
+spec commit, so `minted` is `no`).
+
+**A work-item title never reaches a search query.** Item 3, second half. The
+`--jq` program was already safe (`env.FULL`, from the injection fix in the
+absorb-the-workflow-bodies wave); what was left was `--search "\"$full\" in:title"`,
+where a title carrying a double quote makes an unbalanced phrase, matches
+nothing, and the run files a duplicate — the exact defect the lookup exists to
+prevent. It lists the `work-item` label and compares exactly in jq instead. The
+label itself is created first, because `gh issue create --label` fails outright
+when the label does not exist and it does not exist in the intent repo.
 
 ## The history is the version sequence
 
