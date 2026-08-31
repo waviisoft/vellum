@@ -56,7 +56,7 @@ import yaml
 from vellum.backpressure import NOT_A_RECORD, ledger_dir_for
 from vellum.config import ConfigError, config_path, load as load_config
 # `parse_time` reads the ledger's own timestamps, and the ledger's lease
-# expiry reads them too. It is defined once, next to the `_now()` that
+# expiry reads them too. It is defined once, next to the `now()` that
 # writes them, and re-exported here: two definitions of how this project
 # reads a recorded moment is how a spend window and a lease come to
 # disagree about when something happened.

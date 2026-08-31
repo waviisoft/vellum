@@ -1,11 +1,11 @@
 # Area: the `vellum` CLI
 
-`src/vellum/`. Fourteen commands — `lint`, `suite extract`,
-`ledger open|advance|verify`, `certify record|check`, `tick`, the three pipeline
-commands `mint`, `backpressure`, `pin advance`, and the five mechanical guards
-`verify boundaries|deps|exit-duty`, `ledger verify` and `budget` — dispatched
-from `build_parser()` in `src/vellum/cli.py`. Every claim below names a file or
-symbol you can grep for.
+`src/vellum/`. Sixteen commands — `lint`, `suite extract|partition`,
+`ledger open|advance|verify`, `certify record|check`, `release cut`, `tick`, the
+three pipeline commands `mint`, `backpressure`, `pin advance`, and the five
+mechanical guards `verify boundaries|deps|exit-duty`, `ledger verify` and
+`budget` — dispatched from `build_parser()` in `src/vellum/cli.py`. Every claim
+below names a file or symbol you can grep for.
 
 ## Module map
 
@@ -31,6 +31,8 @@ symbol you can grep for.
 | `src/vellum/chain.py` | `verify()` -> `Chain`, `Finding`, `CERTIFIABLE_STATES`. The ledger guard. |
 | `src/vellum/budget.py` | `measure()` -> `Spend`, `window_for()`, `parse_time()`, `PARK_MARKER`. The spend guard. |
 | `src/vellum/reconcile.py` | `reconcile()` -> `Tick`, `run()`, `Action`, `Observed`, `read_observed()`, `corpus_answer()`, `question_terms()`, `_Reconciler`, `ACTION_KINDS`. The stateless reconciler. |
+| `src/vellum/release.py` | `cut()` -> `Cut`, `partition()` -> `Partition`, `run_cut()`, `run_partition()`, `load_releases()`, `conformed_pointer()`, `products()`, `parse_versions()`, `ReleaseError`, `ReleaseRefused`. Cuts and the armed/enforced split. |
+| `src/vellum/text.py` | `one_line()`. Flattening an untrusted string before it reaches a report. |
 
 ## Scenario identity
 
@@ -491,18 +493,35 @@ repository state, so `--pending <n>` takes that count from a caller that can
 see the forge, and the report says plainly when only the ledger half was
 measured. Do not reach for a forge API here to close the gap.
 
-**It reads states, not release pointers, and today that means it blocks
-everything.** Nothing has ever set a record to `shipped` — releases do not
-exist yet, `ledger/releases.yaml` carries `spec_conformed: null` — so all
-eleven records on intent `main` count as unshipped against a cap of 3.
-`spec-ci.yml` therefore runs the real command with `continue-on-error: true`
-and reports; arming it before releases exist would block the very merge that
-lands the release machinery. Delete that line when shipped versions actually
-leave the window — tracked as `waviisoft/vellum-intent#41`, which schedules
-arming into Wave F. The hold is a scheduled item, not an intention living in a
-comment. The `set -o pipefail` beside it is load-bearing: without it
-the step takes `tee`'s status and arming the gate produces a check that can
-never close.
+**It reads states, not release pointers, and today that still means it blocks
+everything.** Nothing has ever set a record to `shipped`, so every record on
+intent `main` counts as unshipped against a cap of 3. `spec-ci.yml` therefore
+runs the real command with `continue-on-error: true` and reports. The
+`set -o pipefail` beside it is load-bearing: without it the step takes `tee`'s
+status and arming the gate produces a check that can never close.
+
+**Wave F built the relief and deliberately did not arm the gate.** `vellum
+release cut --suite-result green` writes `state: shipped` onto every wave it
+names, which is exactly what takes a version out of this window — measured on a
+scratch clone of intent `main`: with the records advanced to `verified`, one cut
+naming all 14 moves `backpressure . --strict` from "14 of 3, BLOCKED" to
+"0 of 3, OK". So the machinery is no longer what is missing. Two other things
+are, and both are the orchestrator's:
+
+- **No cut is recorded.** `ledger/releases.yaml` on intent `main` is still
+  `cuts: []` with `spec_conformed: null`, and a cut has to be recorded *there*.
+  A wave landing in this repo cannot record one — an implementer holds no
+  intent-repo credentials.
+- **Every record is `approved`, and a green cut over that ledger is refused.**
+  `release cut` will not promote a wave that has not reached `verified` or
+  `shipped`. Re-measured: 14 records, all `approved`, so the refusal fires on
+  all 14.
+
+`waviisoft/vellum-intent#41` therefore stays **open**, re-scoped from "wait for
+the release machinery" to "wait for a recorded cut". The arming condition is a
+command rather than a judgement: arm when `vellum backpressure . --strict` exits
+0 against intent `main`. The count in this note was 11 when it was first written
+and is 14 now — run the command, do not read the number.
 
 **A name-keyed record is reported, not counted.** `ledger/spec-v1.yaml` style
 records carry `spec_version: spec-v1`, which is not a sha and not a version
@@ -1192,6 +1211,184 @@ records open and writes each once at the end, so it needs the merge without the
 read/write around it. Both go through `_upsert_planned`, so the two cannot come
 to disagree about what committing a plan means.
 
+
+## Releases and conformance monitoring
+
+`vellum release cut` and `vellum suite partition`, both in
+`src/vellum/release.py`. They share a module because they share a subject:
+`ledger/releases.yaml`, which until this wave held a shape and nothing else —
+`spec_head: null`, `spec_conformed: null`, `cuts: []`.
+
+**One spec sentence, two owners, and the seam is a flag.** "A cut pins the
+merged waves and per-repo versions, **runs the FULL enforced suite against the
+composed candidate**, and promotes to its channel"
+(`spec/features/certification-and-releases.md`). Pinning and promoting are
+repository state and are performed. The suite run is not: it needs a deployment
+to compose and a runner to execute, neither of which exists
+(`harness/support/adapter.py`, `release-machinery` beside
+`certification-runner`). So its result is `--suite-result`, the same division
+`backpressure --pending`, `budget --projected` and `certify check --head`
+already draw. **Do not reach for a runner here.** With no `--suite-result` the
+cut is recorded and *not* promoted and the report says so — the pattern is
+"state the absence in the output rather than default it in the code", the same
+one `budget`'s missing `per_item_usd` follows.
+
+**A promoting cut refuses a wave that has not reached `verified`, and that
+refusal is not fussiness.** Promotion writes `state: shipped`, and `shipped` is
+one of `chain.CERTIFIABLE_STATES` — so without the check a cut would satisfy
+`vellum ledger verify`'s own `uncertified-wave` finding *by having been made*,
+which is a guard grading an input the thing it judges wrote. `CERTIFIABLE_STATES`
+is imported from `chain.py` rather than restated, so the command and the guard
+cannot come to disagree about what a certifiable wave is. Note what this is
+still *not*: a certification check. Certification binds to a work item's PR head
+and a cut names waves; nothing joins the two, and `chain.py`'s docstring says so.
+Do not promote the proxy here either.
+
+**The pointer is the newest wave by ancestry, and the reconciler's fallback is
+deliberately not reused.** `_newest()` asks `gitver.is_ancestor` and refuses
+when the waves do not lie on one line. `reconcile._newer()` falls back to the
+records' `approved` times when ancestry cannot answer, and *reports* that it
+did — right for ordering a report, wrong here: this orders a pointer **write**,
+and two records approved in the same second do not order at all.
+
+**The pointer never moves backwards, and that is refused rather than warned
+about.** A `spec_conformed` moving to a commit the current pointer is not an
+ancestor of re-arms every scenario between the two, and an armed scenario is one
+conformance monitoring does not run — regressions that have been caught for as
+long as the pointer has been where it is stop being checked. Same reasoning as
+the shallow-clone refusal below, and the same direction.
+
+**A shallow clone refuses, and it is the same landmine `fetch-depth: 0`
+already carries.** Below the graft `merge-base --is-ancestor` answers "no" for
+commits that really are ancestors, so a truncated history reports an *enforced*
+scenario as armed. `_require_full_history()` asks `is_shallow()` before any
+ancestry question, and `partition` also refuses a supplied `suite.json` whose
+own `shallow` flag is true. Exit 1, following `mint`'s precedent for the same
+class of refusal.
+
+**A channel is not created by cutting to it, and a product is not pinned by
+naming it.** `channel_entry()` refuses a channel `releases.yaml` does not
+declare, and `parse_versions()` refuses a product `.vellum/workspace.yaml` does
+not (by name or by repo slug — a caller composing a candidate may hold either).
+Both are allowlists read the safe way round: the failure a default buys is
+`--channel producton` advancing a pointer nothing reads, and `core=` misspelt
+pinning a phantom repo into the version set a release is composed from.
+`.vellum/workspace.yaml` gets its reader *here* rather than in a module of its
+own, because this is its only reader and a schema written ahead of one is a
+second place for the shape to drift.
+
+**A pinned per-repo version is the whole forty.** `parse_versions()` refuses an
+abbreviation for the reason `parse_certified_sha()` does — a prefix names a set
+of commits, and this is the commit a candidate is built from. Nothing here could
+resolve it anyway: these are commits in a *product* repo and the command is
+reading the intent repo.
+
+**And so is the pointer — the asymmetry the other way round was the bug.**
+`_require_pointer_commit()` holds the sha about to become
+`channels.<c>.spec_conformed` to `FULL_SHA_RE` *and* to `gitver.resolve()`,
+before any write. The value arrives from a wave record's `spec_version`, which
+`_wave_record()` holds only to `SHA_RE` ({7,40}) so a wave can be named the way
+one is named everywhere else — but `--versions`, the *less* load-bearing field,
+was held to the full forty while the pointer was not. `--versions` pins what a
+candidate was built from; `spec_conformed` is what **every later** `suite
+partition` asks `is_ancestor` against, so a 40-hex sha naming no commit does not
+fail at the cut, it fails at every partition afterwards, for good. That is not a
+channel answering wrongly — it is a channel whose regression gate stops
+answering, which is the same direction as the shallow-clone and
+never-backwards refusals above.
+
+Neither existing guard caught it. `_newest()` short-circuits a single-wave cut
+without asking git anything, and the never-backwards check is *skipped entirely*
+when `spec_conformed` is null — which is exactly the cut that writes a channel's
+first pointer. So the check sits before that branch, not inside it. Both shapes
+are pinned: `test_a_wave_pinning_a_sha_that_is_no_commit_is_refused_as_a_pointer`
+and `test_a_wave_pinning_an_abbreviated_version_is_refused_as_a_pointer`, each
+asserting `releases.yaml` is byte-unchanged.
+
+**A cut's id is `<channel>@<at>`, which is what makes it replayable.** Same
+invocation twice writes nothing the second time (`open_record`'s idempotence,
+decision D11). The one asymmetric transition is allowed on purpose: a cut
+recorded without a suite result may later be promoted under the same id, because
+the suite genuinely runs elsewhere and its result genuinely arrives later.
+Promoted -> not-promoted is refused — a promotion that happened is not
+un-recorded by re-running the cut — and a *different* cut under the same id is
+refused outright.
+
+**The spec gives a cut no identifier, so `<channel>@<at>` is this command's
+convention.** Flagged as a spec-slice request rather than settled here. The same
+goes for `stamps: {}`, which is left untouched: friendly-version stamping is
+explicitly out of scope (D13), so nothing writes it.
+
+**`spec_head` is still written by nothing.** `releases.yaml` reserves it and
+`suite.json` computes the same quantity, but no command maintains the pointer —
+minting is the natural owner and does not. Left alone rather than written as a
+side effect of a cut, which would make a release the thing that decides what the
+newest spec version is.
+
+### The partition
+
+**`@id:armed-not-enforced` states the test as ancestry and it is implemented as
+exactly that**: `is_ancestor(scenario.version, spec_conformed)`, inclusive — a
+scenario introduced *at* the pointer is enforced, which `merge-base
+--is-ancestor` already answers for a commit against itself. Nothing reads a
+`spec-v*` name; a pointer that is not a sha is refused rather than resolved.
+
+**Three shapes are armed and they are three different sentences.** No pointer at
+all (a channel that has conformed to nothing enforces nothing); a `pending`
+scenario (carried by no commit in this ancestry, so above every pointer there
+is); and a version that is not an ancestor. The first is stated in the report so
+a run of all-armed is not read as a defect.
+
+**A version the checkout cannot place refuses; it does not default to armed.**
+`is_ancestor` raises `GitUnavailable` above return code 1, and guessing "armed"
+would take a regression check out of conformance monitoring silently. Ancestry
+answers are memoised per version sha — 22 scenarios on the real tree share six
+versions, and a `git` subprocess each would be 22 for no more information.
+
+**A tree that would extract short cannot be partitioned.** `_suite_payload()`
+turns `DroppedScenarios` into a refusal: the missing scenarios would be absent
+from *both* halves with nothing saying so, which is the silent absence
+`extract` refuses for (waviisoft/vellum#7).
+
+**Measured on the real tree, at real pointers.** Intent `main` carries 22
+scenarios at six versions. Pointing `production.spec_conformed` at `6ee23f4f`
+(spec-v7) partitions 19 enforced / 3 armed — `exit-duty-required`,
+`fire-and-collect`, `paired-landing`, exactly the three whose introducing commits
+are not ancestors of it; at `8e5fc8e5` it is 20/2 and at `1ce87cb5` 21/1. The
+suite's own dating does the work, and the partition adds only the ancestry
+question.
+
+**The fixtures give every scenario its own step text, and that is load-bearing.**
+`fingerprint()` hashes steps and nothing else, and `version_history()` matches an
+id-less scenario against an unclaimed one with the same fingerprint — so
+scenarios sharing a step line are interchangeable to the dater. Measured while
+writing `tests/test_release.py`: with every scenario reading `Given a sandbox`,
+an uncommitted third scenario came back **enforced at the first commit** instead
+of pending. A partition fixture built that way tests the ancestry code against
+versions the dater invented.
+
+**`one_line()` moved to `src/vellum/text.py`.** The report prints scenario ids
+and spec-tree paths, which anyone who can land a merge in the intent repo
+writes, and a caller may pipe it into a step summary — the identical property
+`reconcile.py` already had. Two spellings of "how this project flattens an
+untrusted string" is how the two come to disagree, so there is one.
+`test_the_report_is_not_a_workflow_command_channel` asserts no line of the
+report starts with `::`.
+
+**The channel name is an outside string too, and the `PROMOTED:` line missed
+it.** `Cut.report()`'s header flattened the channel and the promotion line two
+frames below interpolated it raw, as did `run_cut()`'s red-path stderr — and a
+channel name is not typed, it is read out of `releases.yaml`'s `channels` map,
+which anyone who can land a merge in the intent repo writes. A channel called
+`production\n::error title=…::…` put a forged workflow command in the step
+summary. Both sites go through `one_line()` now, and so do the refusals
+`_require_pointer_commit()` raises. The rule is the whole report, not the lines
+someone remembered: a value is flattened where it is *printed*, and the header
+already doing it is what made the omission invisible.
+
+**`ledger.now()` is public now**, because a cut is stamped with it. One
+definition of how this project writes a moment, next to the `parse_time()` that
+reads one — the same reason `parse_time` moved out of `budget.py`.
 
 ## Patterns worth keeping
 

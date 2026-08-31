@@ -1,20 +1,24 @@
 """``vellum`` — the v0.1 command line.
 
-Commands, one per feature spec: ``lint`` (spec-pipeline), ``suite extract``
-(scenarios-and-harness), ``ledger open|advance`` and ``certify record|check``
-(ledger, certification-and-releases), ``tick`` (orchestration,
-question-protocol), the three pipeline commands the forge workflows are shims
-over — ``mint``, ``backpressure`` and ``pin advance`` — and the mechanical
-guards: ``verify boundaries``, ``verify deps``, ``verify exit-duty``, ``ledger
-verify`` and ``budget``. Each returns a process exit code; failure detail goes to
-stderr and nothing else is printed on success beyond what was asked for.
+Commands, one per feature spec: ``lint`` (spec-pipeline), ``suite
+extract|partition`` (scenarios-and-harness), ``ledger open|advance``,
+``certify record|check`` and ``release cut`` (ledger,
+certification-and-releases), ``tick`` (orchestration, question-protocol), the
+three pipeline commands the forge workflows are shims over — ``mint``,
+``backpressure`` and ``pin advance`` — and the mechanical guards: ``verify
+boundaries``, ``verify deps``, ``verify exit-duty``, ``ledger verify`` and
+``budget``. Each returns a process exit code; failure detail goes to stderr and
+nothing else is printed on success beyond what was asked for.
 
 A guard is a command that reads neutral inputs — a checkout, two refs, a role —
 and answers one question about them. None of them writes anything, and none of
 them reaches a forge: where a guard needs a number only a forge or a
 not-yet-built runner can supply, the caller passes it (``backpressure
 --pending``, ``budget --projected``) and the report says plainly when it was not
-supplied.
+supplied. ``release cut --suite-result`` is the same division applied to a
+command that *writes*: the enforced suite runs against a composed candidate on
+infrastructure this CLI does not have, so its result arrives as an argument and
+the cut is recorded without promoting when none was supplied.
 
 ``tick`` is the one command here that *writes* and is not a pipeline shim, and it
 keeps the same division rather than escaping it: desired state is the checkout it
@@ -33,12 +37,15 @@ Exit codes, in the one place they are all visible:
 * ``0`` — it worked, or the command decided there was nothing to do.
 * ``1`` — the command answered, and the answer is bad news: a fence that drops
   scenarios, a shallow clone, a divergence window at its cap, a head no green
-  certification covers, a wave parked past the question timebox.
+  certification covers, a wave parked past the question timebox, a cut whose
+  enforced suite was red or whose waves cannot be pinned.
 * ``2`` — the command could not answer: the path is not a spec tree, the sha is
   not a sha, the pin file is not a pin file, the config has no cap, a ``--ref``
   names no commit, ``--emit`` was handed an empty path, ``certify`` was pointed
   at a checkout with no ledger or named a work item that is not in the record,
-  ``tick`` was handed observed state in a shape it could not read.
+  ``tick`` was handed observed state in a shape it could not read, ``release
+  cut`` was pointed at a channel ``releases.yaml`` does not declare or a
+  product ``.vellum/workspace.yaml`` does not.
 
 The line is between *an answer you will not like* and *no answer*, and it is
 load-bearing for ``vellum backpressure`` in particular: the moment its
@@ -91,6 +98,8 @@ from vellum.lint import run as lint_run
 from vellum.mint import MintError, mint as mint_run
 from vellum.pin import PinError, advance as pin_advance
 from vellum.reconcile import DEFAULT_CORPUS_MATCH, DEFAULT_LEASE_MINUTES, TickError
+from vellum.release import SUITE_RESULTS, ReleaseError, ReleaseRefused
+from vellum.release import run_cut, run_partition
 from vellum.reconcile import run as tick_run
 from vellum.specfile import SpecTreeError
 from vellum.suite import run as suite_run
@@ -119,6 +128,29 @@ def build_parser() -> argparse.ArgumentParser:
     extract.add_argument(
         "-o", "--output", default="suite.json", help="output path, or - for stdout"
     )
+    part = suite_sub.add_parser(
+        "partition",
+        help="split the suite into armed and enforced against a channel's pointer",
+        description=(
+            "\"Scenarios above a channel's spec-conformed pointer are armed ...; at "
+            "or below are enforced\" (spec/features/scenarios-and-harness.md). The "
+            "test is ancestry against ledger/releases.yaml's "
+            "channels.<name>.spec_conformed, never a tag or a name "
+            "(spec/decisions/2026-08-28-versions-are-commits.md). A channel that has "
+            "conformed to nothing enforces nothing, and a pending scenario is armed. "
+            "Reports; it does not gate."
+        ),
+    )
+    part.add_argument("checkout", help="the intent repo checkout")
+    part.add_argument("--channel", required=True, help="the channel to partition against")
+    part.add_argument("--ledger-dir", help="ledger directory (default: <checkout>/ledger)")
+    part.add_argument(
+        "--suite",
+        dest="suite_path",
+        help="a suite.json to partition, e.g. a recorded ledger/suite-<sha>.json "
+             "(default: extract from the checkout)",
+    )
+    part.add_argument("--json", action="store_true", help="emit the partition as JSON")
 
     ledger = sub.add_parser("ledger", help="per-version traceability records")
     ledger_sub = ledger.add_subparsers(dest="ledger_command", required=True)
@@ -179,6 +211,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_mint(sub)
     _add_backpressure(sub)
     _add_pin(sub)
+    _add_release(sub)
     _add_budget(sub)
     _add_verify(sub)
 
@@ -442,6 +475,69 @@ def _add_pin(sub) -> None:
     )
 
 
+def _add_release(sub) -> None:
+    """``release cut`` — the bookkeeping half of a cut.
+
+    A subcommand rather than a bare ``vellum release`` because the spec already
+    names more than one act on this file — cuts, promotion, conformance
+    monitoring, the ``spec_head`` pointer nothing writes yet — and a verb-less
+    command is the one that has to grow a ``--mode`` flag later.
+    """
+    release = sub.add_parser("release", help="release cuts and channel pointers")
+    release_sub = release.add_subparsers(dest="release_command", required=True)
+    cut = release_sub.add_parser(
+        "cut",
+        help="record a release cut, and promote the channel when it was green",
+        description=(
+            "Pins the merged waves and the per-repo version set into "
+            "ledger/releases.yaml. Running the full enforced suite against the "
+            "composed candidate needs a deployment this command does not have, so "
+            "its result is supplied: with --suite-result green the channel's "
+            "spec_conformed advances to the cut's newest wave (by ancestry) and "
+            "every wave the cut names goes to shipped; with red the cut is recorded "
+            "and nothing is promoted (exit 1); with neither the cut is recorded and "
+            "the report says the suite result was not supplied. Rollback and the "
+            "regression issue are the deployment's — this writes no forge state."
+        ),
+    )
+    cut.add_argument("checkout", help="the intent repo checkout")
+    cut.add_argument("--ledger-dir", help="ledger directory (default: <checkout>/ledger)")
+    cut.add_argument(
+        "--channel",
+        required=True,
+        help="the channel to cut to; must already be declared in releases.yaml",
+    )
+    cut.add_argument(
+        "--wave",
+        action="append",
+        default=[],
+        dest="waves",
+        required=True,
+        help="a merged wave this cut pins: a spec version (commit sha). Repeatable; "
+             "each must have a ledger record",
+    )
+    cut.add_argument(
+        "--versions",
+        action="append",
+        default=[],
+        help="<product>=<full sha>, the version this cut pins for that product repo. "
+             "Repeatable, and comma-separated entries are accepted. The product must "
+             "be one .vellum/workspace.yaml declares",
+    )
+    cut.add_argument(
+        "--suite-result",
+        choices=SUITE_RESULTS,
+        help="the result of the full enforced suite against the composed candidate, "
+             "from the runner that executed it. Omit it and the cut is recorded "
+             "without promoting",
+    )
+    cut.add_argument(
+        "--at",
+        help="the moment of the cut, ISO 8601 (default: now, UTC). The cut's id is "
+             "<channel>@<at>, so passing one makes a cut replayable",
+    )
+
+
 def _add_budget(sub) -> None:
     b = sub.add_parser(
         "budget",
@@ -575,7 +671,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "lint":
             return lint_run(args.spec_dir, as_json=args.json)
         if args.command == "suite":
-            return suite_run(args.spec_dir, args.output)
+            return _suite(args)
         if args.command == "ledger":
             return _ledger(args)
         if args.command == "certify":
@@ -594,6 +690,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.command == "pin":
             return _pin(args)
+        if args.command == "release":
+            return _release(args)
         if args.command == "budget":
             return _budget(args)
         if args.command == "verify":
@@ -627,9 +725,17 @@ def main(argv: list[str] | None = None) -> int:
     # blocks a merge on; a mistyped `--role` reaching a caller as "this PR wrote
     # outside its trees" would be a red nobody can find the cause of.
     except (BoundaryError, ChainError, BudgetError, DependencyError, ExitDutyError,
-            TickError) as exc:
+            TickError, ReleaseError) as exc:
         print(f"vellum: {exc}", file=sys.stderr)
         return 2
+    # A cut that cannot be made, a pointer that would move backwards, a shallow
+    # clone, a suite the partition cannot place: the command answered, and the
+    # answer is that this cannot proceed. `ReleaseRefused` is a sibling of
+    # `ReleaseError` rather than a subclass precisely so this clause's position
+    # relative to the one above decides nothing.
+    except ReleaseRefused as exc:
+        print(f"vellum: {exc}", file=sys.stderr)
+        return 1
     return 2
 
 
@@ -758,6 +864,43 @@ def _pin(args: argparse.Namespace) -> int:
         )
     print(pin_advance(args.product_checkout, args.to, intent).report())
     return 0
+
+
+def _suite(args: argparse.Namespace) -> int:
+    if args.suite_command == "partition":
+        return run_partition(
+            args.checkout,
+            args.channel,
+            ledger_dir=args.ledger_dir,
+            suite_path=args.suite_path,
+            as_json=args.json,
+        )
+    return suite_run(args.spec_dir, args.output)
+
+
+def _release(args: argparse.Namespace) -> int:
+    return run_cut(
+        args.checkout,
+        args.channel,
+        args.waves,
+        _split_versions(args.versions),
+        ledger_dir=args.ledger_dir,
+        at=args.at,
+        suite_result=args.suite_result,
+    )
+
+
+def _split_versions(values: list[str]) -> list[str]:
+    """``--versions core=a,web=b`` and repeated ``--versions`` mean the same thing.
+
+    A comma is accepted because a caller composing a candidate has the set in
+    one string, and the alternative is that ``--versions core=a,web=b`` is read
+    as one product named ``core`` at a sha containing a comma — which
+    ``parse_versions`` would then refuse with a message about sha length rather
+    than about the comma. Splitting here means the refusal a caller gets names
+    the entry that is actually wrong.
+    """
+    return [part.strip() for value in values for part in str(value).split(",") if part.strip()]
 
 
 def _budget(args: argparse.Namespace) -> int:

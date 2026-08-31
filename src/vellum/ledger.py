@@ -166,7 +166,12 @@ def find_record(ledger_dir: str | Path, sha: str) -> Path | None:
     return matches[0][0] if matches else None
 
 
-def _now() -> str:
+def now() -> str:
+    """The moment this project writes into a record: ISO 8601, UTC, to the second.
+
+    Public because ``release.py`` stamps a cut with it. One definition of how a
+    moment is written is the same discipline that moved ``parse_time`` here from
+    ``budget.py`` — the reader and the writer must not come to disagree."""
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -176,7 +181,7 @@ def parse_time(value) -> datetime.datetime | None:
     PyYAML turns an unquoted timestamp into a ``datetime`` before this is
     reached, and ``vellum.ledger.dump`` writes a quoted string, so both arrive
     here. A naive datetime is read as UTC: every time this file writes is UTC
-    (``ledger._now``), and guessing local would move a record across a period
+    (``ledger.now``), and guessing local would move a record across a period
     boundary depending on where the guard ran.
     """
     if isinstance(value, datetime.datetime):
@@ -198,11 +203,23 @@ def parse_time(value) -> datetime.datetime | None:
     return moment.astimezone(datetime.timezone.utc)
 
 
-def _ordered(data: dict, keys: tuple[str, ...]) -> dict:
-    """Reorder *data* by *keys*, keeping any unrecognised keys at the end."""
+def ordered(data: dict, keys: tuple[str, ...]) -> dict:
+    """Reorder *data* by *keys*, keeping any unrecognised keys at the end.
+
+    Public because ``release.py`` orders ``releases.yaml`` and each cut inside
+    it the same way, for the same reason ``RECORD_KEYS`` and ``ITEM_KEYS``
+    exist: a state change is then a one-line diff and a read/write round-trip
+    is byte-stable. Keeping unrecognised keys is half the contract — these are
+    the intent repo's files and an installation may carry keys this version
+    does not model.
+    """
     out = {k: data[k] for k in keys if k in data}
     out.update({k: v for k, v in data.items() if k not in out})
     return out
+
+
+#: The private spelling this module has always used internally.
+_ordered = ordered
 
 
 def _ordered_present(item: dict, key: str, keys: tuple[str, ...]) -> None:
@@ -237,7 +254,7 @@ def new_record(
     return {
         "spec_version": sha,
         "name": name,
-        "approved": approved or _now(),
+        "approved": approved or now(),
         "spec_pr": spec_pr,
         "line": line,
         "baseline": baseline,
@@ -495,7 +512,7 @@ def new_certification(sha: str, result: str, run: str | None = None, at: str | N
     return {
         "sha": parse_certified_sha(sha),
         "run": run,
-        "at": at or _now(),
+        "at": at or now(),
         "result": result,
     }
 
@@ -599,7 +616,7 @@ def new_lease(executor: str, expires: str, taken: str | None = None) -> dict:
             f"(e.g. 2026-08-31T14:00:00Z). A lease with no readable expiry is "
             f"read as no lease, so writing one would silently claim nothing."
         )
-    return {"executor": str(executor).strip(), "taken": taken or _now(), "expires": expires}
+    return {"executor": str(executor).strip(), "taken": taken or now(), "expires": expires}
 
 
 def active_lease(item: dict, now: datetime.datetime | None = None) -> dict | None:
