@@ -73,7 +73,7 @@ import yaml
 
 from vellum.backpressure import ledger_dir_for
 from vellum.chain import CERTIFIABLE_STATES
-from vellum.gitver import GitUnavailable, is_ancestor, is_shallow, repo_root
+from vellum.gitver import GitUnavailable, is_ancestor, is_shallow, repo_root, resolve
 from vellum.ledger import (
     FULL_SHA_RE,
     SHA_RE,
@@ -360,8 +360,8 @@ class Cut:
         if self.promoted:
             before = self.conformed_before[:12] if self.conformed_before else "(none)"
             lines.append(
-                f"PROMOTED: {self.channel} spec_conformed {before} -> "
-                f"{(self.conformed_after or '')[:12]}"
+                f"PROMOTED: {one_line(self.channel, 40)} spec_conformed "
+                f"{before} -> {(self.conformed_after or '')[:12]}"
             )
             if self.shipped:
                 lines.append(
@@ -465,6 +465,49 @@ def _newest(repo: Path, shas: list[str]) -> str:
         f"there is no pointer to advance to. Cut the waves that were merged onto "
         f"one line, or cut them separately."
     )
+
+
+def _require_pointer_commit(repo: Path, sha: str, channel: str) -> None:
+    """Refuse a ``spec_conformed`` value that is not a full sha naming a commit.
+
+    The sha arrives from a wave record's ``spec_version``, which ``_wave_record``
+    holds to ``SHA_RE`` ({7,40}) so a wave may be named the way one is named
+    everywhere else. What is *written* is held to the rule ``--versions``
+    follows, plus the resolution ``parse_versions`` cannot do — those are
+    commits in a product repo and this one is in the repository being read.
+
+    The asymmetry the other way round is the dangerous one. ``--versions`` pins
+    what a candidate was built from; this is the value **every later** ``suite
+    partition`` asks ``is_ancestor`` against, so a sha naming no commit does not
+    fail here, it fails there — and it fails there for good. That is not a
+    channel answering wrongly, it is a channel whose regression gate stops
+    answering: ``partition`` raises rather than arming or enforcing, so one
+    landed record permanently switches the gate off instead of failing loudly.
+
+    Neither the forward check below nor ``_newest`` catches it. ``_newest``
+    short-circuits a single-wave cut without asking git anything, and the
+    forward check is skipped entirely when the channel has never been cut to
+    (``spec_conformed: null``) — which is exactly when the first pointer is
+    written.
+    """
+    if not FULL_SHA_RE.match(sha):
+        raise ReleaseRefused(
+            f"{one_line(channel, 40)}.spec_conformed would be set to {sha!r}, "
+            f"which is not a full 40-character commit sha. A prefix names a set "
+            f"of commits, and this is the value every later `suite partition` "
+            f"asks ancestry against — so it is refused rather than resolved, the "
+            f"rule `--versions` already follows on the less load-bearing field."
+        )
+    try:
+        resolve(repo, sha)
+    except GitUnavailable as exc:
+        raise ReleaseRefused(
+            f"{one_line(channel, 40)}.spec_conformed would be set to "
+            f"{sha[:12]}, which names no commit in {repo}: {exc}. A pointer is an "
+            f"ancestry endpoint, and one git cannot resolve makes every later "
+            f"`suite partition` on this channel raise instead of partitioning — "
+            f"the regression gate would stop running rather than fail loudly."
+        ) from exc
 
 
 def _require_full_history(checkout: str | Path) -> Path:
@@ -581,6 +624,10 @@ def cut(
             )
         repo = _require_full_history(checkout)
         newest = _newest(repo, shas)
+        # Before the forward check, not inside it: the forward check is what a
+        # channel with a pointer already gets, and the channel with none — the
+        # one whose first pointer this is — would otherwise get nothing.
+        _require_pointer_commit(repo, newest, channel)
         if conformed_before is not None and conformed_before != newest:
             try:
                 forward = is_ancestor(repo, conformed_before, newest)
@@ -726,8 +773,8 @@ def run_cut(
         # `@id:full-suite-at-cut` asks for. `ledger verify`'s findings share
         # this code for the same reason.
         print(
-            f"vellum: the enforced suite at {recorded.cut_id} was red; "
-            f"{channel} was not promoted",
+            f"vellum: the enforced suite at {one_line(recorded.cut_id, 80)} was "
+            f"red; {one_line(channel, 40)} was not promoted",
             file=sys.stderr,
         )
         return 1

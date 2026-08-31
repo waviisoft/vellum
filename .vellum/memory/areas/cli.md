@@ -1283,6 +1283,28 @@ of commits, and this is the commit a candidate is built from. Nothing here could
 resolve it anyway: these are commits in a *product* repo and the command is
 reading the intent repo.
 
+**And so is the pointer — the asymmetry the other way round was the bug.**
+`_require_pointer_commit()` holds the sha about to become
+`channels.<c>.spec_conformed` to `FULL_SHA_RE` *and* to `gitver.resolve()`,
+before any write. The value arrives from a wave record's `spec_version`, which
+`_wave_record()` holds only to `SHA_RE` ({7,40}) so a wave can be named the way
+one is named everywhere else — but `--versions`, the *less* load-bearing field,
+was held to the full forty while the pointer was not. `--versions` pins what a
+candidate was built from; `spec_conformed` is what **every later** `suite
+partition` asks `is_ancestor` against, so a 40-hex sha naming no commit does not
+fail at the cut, it fails at every partition afterwards, for good. That is not a
+channel answering wrongly — it is a channel whose regression gate stops
+answering, which is the same direction as the shallow-clone and
+never-backwards refusals above.
+
+Neither existing guard caught it. `_newest()` short-circuits a single-wave cut
+without asking git anything, and the never-backwards check is *skipped entirely*
+when `spec_conformed` is null — which is exactly the cut that writes a channel's
+first pointer. So the check sits before that branch, not inside it. Both shapes
+are pinned: `test_a_wave_pinning_a_sha_that_is_no_commit_is_refused_as_a_pointer`
+and `test_a_wave_pinning_an_abbreviated_version_is_refused_as_a_pointer`, each
+asserting `releases.yaml` is byte-unchanged.
+
 **A cut's id is `<channel>@<at>`, which is what makes it replayable.** Same
 invocation twice writes nothing the second time (`open_record`'s idempotence,
 decision D11). The one asymmetric transition is allowed on purpose: a cut
@@ -1352,6 +1374,17 @@ writes, and a caller may pipe it into a step summary — the identical property
 untrusted string" is how the two come to disagree, so there is one.
 `test_the_report_is_not_a_workflow_command_channel` asserts no line of the
 report starts with `::`.
+
+**The channel name is an outside string too, and the `PROMOTED:` line missed
+it.** `Cut.report()`'s header flattened the channel and the promotion line two
+frames below interpolated it raw, as did `run_cut()`'s red-path stderr — and a
+channel name is not typed, it is read out of `releases.yaml`'s `channels` map,
+which anyone who can land a merge in the intent repo writes. A channel called
+`production\n::error title=…::…` put a forged workflow command in the step
+summary. Both sites go through `one_line()` now, and so do the refusals
+`_require_pointer_commit()` raises. The rule is the whole report, not the lines
+someone remembered: a value is flattened where it is *printed*, and the header
+already doing it is what made the omission invisible.
 
 **`ledger.now()` is public now**, because a cut is stamped with it. One
 definition of how this project writes a moment, next to the `parse_time()` that

@@ -241,6 +241,28 @@ class TestPromotion(ReleaseCase):
         self.assertIn("re-arm", out)
         self.assertEqual(self.pointer(), self.second)
 
+    def test_the_cut_report_is_not_a_workflow_command_channel(self):
+        """The channel name comes out of `releases.yaml`, which a merge writes.
+
+        The same property `suite partition`'s report carries, for the same
+        reason: the report may be piped into a step summary, where a value
+        carrying a newline starts a line of its own — and a line of its own is
+        all `::error` needs. The promotion line interpolated the channel raw
+        while the header line beside it flattened it.
+        """
+        crafted = "production\n::error title=pwned::forged"
+        self.releases(channels={crafted: {"spec_conformed": None}})
+        code, out = self.cut(
+            "--wave", self.first, "--versions", f"core={FULL}",
+            "--suite-result", "green", channel=crafted,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("PROMOTED", out)
+        self.assertFalse(
+            [line for line in out.splitlines() if line.lstrip().startswith("::")],
+            out,
+        )
+
     def test_a_wave_that_has_not_reached_verified_is_not_promoted(self):
         """Otherwise a cut passes `ledger verify`'s uncertified-wave check by existing.
 
@@ -304,6 +326,44 @@ class TestCutsThatAreRefused(ReleaseCase):
         code, out = self.cut("--wave", self.first, "--versions", f"core={FULL}")
         self.assertEqual(code, 1)
         self.assertIn("does not agree", out)
+        self.assert_wrote_nothing()
+
+    def test_a_wave_pinning_a_sha_that_is_no_commit_is_refused_as_a_pointer(self):
+        """A pointer git cannot resolve is not a wrong answer, it is no answer.
+
+        `spec_conformed` is what every later `suite partition` asks
+        `is_ancestor` against, so a 40-hex sha naming nothing in the repository
+        does not fail here — it fails there, for good, and the channel's
+        regression gate stops running rather than failing loudly. The forward
+        check does not catch it: on a channel that has never been cut to it is
+        skipped entirely, which is exactly when the first pointer is written.
+        """
+        phantom = "f" * 40
+        write_record(self.ledger, phantom, state="verified")
+        code, out = self.cut(
+            "--wave", phantom, "--versions", f"core={FULL}", "--suite-result", "green",
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("names no commit", out)
+        self.assertIsNone(self.pointer())
+        self.assert_wrote_nothing()
+
+    def test_a_wave_pinning_an_abbreviated_version_is_refused_as_a_pointer(self):
+        """The rule `--versions` follows, on the field that matters more.
+
+        A record's `spec_version` may be an abbreviation — `SHA_RE` is {7,40}
+        so an operator can name a wave the way they name one everywhere else —
+        but a prefix names a *set* of commits, and this one is about to become
+        the value a channel's whole regression gate is keyed on.
+        """
+        short = self.first[:12]
+        write_record(self.ledger, short, state="verified")
+        code, out = self.cut(
+            "--wave", short, "--versions", f"core={FULL}", "--suite-result", "green",
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("not a full 40-character commit sha", out)
+        self.assertIsNone(self.pointer())
         self.assert_wrote_nothing()
 
     def test_a_channel_the_file_does_not_declare_is_refused_not_created(self):
