@@ -232,9 +232,15 @@ class Action:
         }
 
     def __str__(self) -> str:
-        where = self.version[:12] if self.version else "-" * 12
-        who = f"item {self.item}" if self.item is not None else ""
-        return f"[{self.kind}] {where} {who} {self.detail}".replace("  ", " ").strip()
+        # Joined from the parts that are there rather than formatted with a gap
+        # and squeezed afterwards: `detail` is narrowed text from outside this
+        # module, and collapsing runs of spaces inside it would edit the very
+        # value the report is quoting.
+        parts = [f"[{self.kind}]", self.version[:12] if self.version else "-" * 12]
+        if self.item is not None:
+            parts.append(f"item {self.item}")
+        parts.append(self.detail)
+        return " ".join(parts)
 
 
 @dataclass
@@ -490,7 +496,14 @@ def _corpus_files(checkout: Path) -> list[Path]:
     """
     spec = checkout / "spec"
     decisions = spec / "decisions"
-    sections = sorted(p for p in spec.rglob("*.md") if p.parent != decisions)
+    sections = sorted(
+        p for p in spec.rglob("*.md")
+        # `not in p.parents` rather than `p.parent != decisions`, so a decision
+        # filed in a subdirectory is still read at the decisions tier and not
+        # ahead of it. The tiers are the ladder's order and a file in the wrong
+        # one changes which reference a question is answered with.
+        if decisions not in p.parents
+    )
     return (
         sections
         + sorted(decisions.glob("*.md"))
