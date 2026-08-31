@@ -71,7 +71,7 @@ import sys
 from vellum import __version__
 from vellum.backpressure import BackpressureError
 from vellum.backpressure import run as backpressure_run
-from vellum.boundaries import BoundaryError
+from vellum.boundaries import SOURCE_CHOICES, BoundaryError
 from vellum.boundaries import run as boundaries_run
 from vellum.budget import BudgetError
 from vellum.budget import run as budget_run
@@ -588,21 +588,37 @@ def _add_verify(sub) -> None:
 
     bound = verify_sub.add_parser(
         "boundaries",
-        help="check a diff against write_boundaries.<role> in .vellum/product.yaml",
+        help="check a diff against the checkout's write_boundaries.<role>",
         description=(
             "Exits 1 naming every changed path outside the trees the role may write. "
-            "The boundaries are the data in the product checkout's own "
-            "`.vellum/product.yaml`; a role that file does not declare is refused "
-            "rather than defaulted, either way, because a boundary that can turn "
-            "itself off is not one. Renames are not detected, so a file moved out of "
-            "a protected tree still counts as a write to it."
+            "The boundaries are data the checkout declares: a product repo in its "
+            "`.vellum/product.yaml`, the intent repo — which has no product file — in "
+            "its `.vellum/config.yaml`. The first of those that exists is the source, "
+            "with no fallback from one to the other, so a repo whose boundaries were "
+            "deleted is refused rather than judged against another repo's policy. A "
+            "role the source does not declare is refused rather than defaulted, for "
+            "the same reason: a boundary that can turn itself off is not one. Renames "
+            "are not detected, so a file moved out of a protected tree still counts "
+            "as a write to it."
         ),
     )
-    bound.add_argument("product_checkout", help="the product repo checkout")
+    bound.add_argument(
+        "checkout", help="the repo checkout to check: a product repo, or the intent repo"
+    )
     bound.add_argument("--base", required=True, help="the ref the branch left")
     bound.add_argument("--head", required=True, help="the branch head")
     bound.add_argument(
         "--role", default="implementer", help="the role whose boundaries apply"
+    )
+    bound.add_argument(
+        "--boundaries-from",
+        choices=SOURCE_CHOICES,
+        default="auto",
+        help=(
+            "which file declares the boundaries (default: auto — the product file "
+            "if there is one, else the installation config). Naming one makes its "
+            "absence an error rather than a silent switch to the other."
+        ),
     )
 
     deps = verify_sub.add_parser(
@@ -931,7 +947,7 @@ def _budget(args: argparse.Namespace) -> int:
 def _verify(args: argparse.Namespace) -> int:
     if args.verify_command == "boundaries":
         return boundaries_run(
-            args.product_checkout, args.base, args.head, args.role
+            args.checkout, args.base, args.head, args.role, args.boundaries_from
         )
     if args.verify_command == "exit-duty":
         return exitduty_run(

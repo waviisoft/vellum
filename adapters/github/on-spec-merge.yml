@@ -272,6 +272,20 @@ jobs:
           # is the one place a name may appear without anything reading it back.
           LABEL: ${{ steps.mint.outputs.name || format('spec-{0}', steps.mint.outputs.sha) }}
         run: |
+          # `gh issue create --label` fails outright when the label does not
+          # exist in the repository, and `work-item` does not exist in the
+          # intent repo (waviisoft/vellum-intent#24, item 3). Creating it here
+          # rather than asking an operator to pre-create it keeps the
+          # activation of this path from depending on a step nobody remembers.
+          # A create that fails because the label is already there is the
+          # ordinary case; one that fails for any other reason is left to
+          # redden the `gh issue create` below, which is the step that actually
+          # needs the label.
+          gh label create work-item \
+            --description "A work item filed from a spec version's work plan" \
+            --color 1d76db 2>/dev/null \
+            || echo "::notice title=Label::'work-item' already exists, or could not be created; see the issue step below"
+
           python - <<'PY' > items.txt
           import yaml
           plan = yaml.safe_load(open("workplan.yaml")) or {}
@@ -297,7 +311,17 @@ jobs:
             # come from `workplan.yaml`, which the planner writes into a repo
             # anyone who can land a merge can write. `env.FULL` is a value jq
             # looks up, never text it parses.
-            existing="$(FULL="$full" gh issue list --state all --search "\"${full}\" in:title" \
+            #
+            # The title no longer reaches the SEARCH QUERY either
+            # (waviisoft/vellum-intent#24, item 3). `--search "\"$full\" in:title"`
+            # pasted it into GitHub's search grammar, where a title carrying a
+            # double quote made an unbalanced phrase — a malformed query
+            # matches nothing, the existing issue is not found, and the run
+            # files a duplicate, which is the exact defect this lookup exists
+            # to prevent. Listing the label instead asks the forge a question
+            # with no user text in it at all, and the exact comparison that
+            # decides the answer stays in jq where it always was.
+            existing="$(FULL="$full" gh issue list --state all --label work-item --limit 200 \
               --json number,title --jq 'map(select(.title == env.FULL)) | .[0].number // empty')"
 
             if [ -n "$existing" ]; then
@@ -350,6 +374,20 @@ jobs:
       # not used here because the suite extracted above belongs in the same
       # commit as the record it describes, and one `git add ledger/` is a
       # smaller thing than two commits.
+      #
+      # THE PUSH RETRIES BEHIND A REBASE (waviisoft/vellum-intent#24, item 1).
+      # `concurrency: on-spec-merge` serialises runs, but it does not serialise
+      # a run against a human — or another workflow — pushing to main while
+      # this one works. A non-fast-forward push here strands the record: the
+      # mint is idempotent and could be replayed, but nothing replays it,
+      # because the guard accepts only the branch tip and a re-dispatch reaches
+      # only the head. Recovery is hand-written, which is why one lost push is
+      # worth three lines.
+      #
+      # The rebase moves this run's single ledger commit onto whatever landed.
+      # It cannot silently lose the record: a conflict aborts the rebase and
+      # reddens the step, and a record's filename is its version's sha, so two
+      # concurrent runs write different files and do not conflict at all.
       - name: Commit and push the ledger record
         if: steps.mint.outputs.minted == 'yes'
         env:
@@ -359,4 +397,72 @@ jobs:
           git config user.email "orchestrator@vellum.invalid"
           git add ledger/
           git commit -m "ledger: open ${TAG}"
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "::notice title=Push raced::main moved while this run was working; rebasing and retrying (attempt ${attempt})"
+            # A conflict must redden and stop HERE, before any further push. The
+            # default `bash -eo pipefail` shell already exits the step on a
+            # failed rebase, but this guarantee — never push main's tip back
+            # with the ledger record silently dropped — is too load-bearing to
+            # rest on an ambient shell flag a reader of this loop cannot see. So
+            # the rebase failure is handled explicitly: abort the paused rebase
+            # (HEAD would otherwise be detached at main's tip, without the
+            # record) and fail loudly. The record stays committed locally for a
+            # hand-written recovery; it is never lost to a green run.
+            if ! git pull --rebase origin main; then
+              git rebase --abort 2>/dev/null || true
+              echo "::error title=Rebase conflict::the ledger record for ${TAG} did not rebase cleanly onto main; it is committed locally but NOT pushed. Recover by hand with 'vellum mint'."
+              exit 1
+            fi
+          done
           git push origin HEAD:main
+
+      # =================================================================
+      # A DETECTOR, NOT A RECORDER (waviisoft/vellum-intent#24, item 2).
+      #
+      # The `paths: spec/**` trigger fires when ANY commit in a push touches
+      # spec/, and everything above mints the tip. A spec-touching commit below
+      # the tip — a multi-commit direct push to main — is therefore never
+      # recorded and never named, in a run that stays green. The silence is the
+      # defect: the version exists on main and the ledger does not know.
+      #
+      # Recording those commits is a different job from this one — it would
+      # mint, tag, extract and file issues per commit, and `vellum mint` is
+      # built around one `--ref` — so this step does not attempt it. It makes
+      # the case LOUD instead, and the recovery stays hand-written until the
+      # architect decides whether the answer is a range-aware job or branch
+      # protection against direct pushes to main.
+      #
+      # It runs last and it runs unconditionally, both deliberately: last so a
+      # red here cannot cost the tip's record its push, and unconditionally
+      # because the case it catches is exactly the one where the TIP is not a
+      # spec commit and `minted` is therefore `no`.
+      # =================================================================
+      - name: Every spec-touching commit in this push was recorded
+        if: github.event_name == 'push'
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            echo "::notice title=Push range unreadable::the previous tip is not in this checkout (a new branch, or a force push), so only ${AFTER} was considered"
+            exit 0
+          fi
+          missed=""
+          for commit in $(git rev-list "${BEFORE}..${AFTER}"); do
+            [ "$commit" = "$AFTER" ] && continue
+            # First-parent diff: for a merge commit that is the spec change the
+            # merge brought to main, and for an ordinary commit it is its own.
+            # A root commit has no `^` and reports nothing, which is the safe
+            # direction here — this step names commits, it does not gate them.
+            if git diff --name-only "${commit}^" "$commit" -- spec 2>/dev/null | grep -q .; then
+              missed="${missed} ${commit}"
+            fi
+          done
+          if [ -n "$missed" ]; then
+            echo "::error title=Unrecorded spec version(s)::this push carried spec-touching commit(s) below the tip and only the tip is minted —${missed}. Each is a spec version with no ledger record; open them by hand with 'vellum mint'. See waviisoft/vellum-intent#24 item 2."
+            exit 1
+          fi

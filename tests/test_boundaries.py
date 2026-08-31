@@ -3,6 +3,13 @@
 The scenario is ``@id:implementer-cannot-touch-harness`` in
 ``spec/behaviors/write-boundaries.md``: an implementation PR containing changes
 under ``harness/`` fails the write-boundary guard.
+
+The same behavior's "CI enforces the same boundaries as a backstop" sentence is
+not about product repos only, and the second half of this file is the intent
+repo: it declares its boundaries in ``.vellum/config.yaml`` because it has no
+product file, and the breach that motivated reading them is the mirror image of
+the scenario — a harness session writing ``.vellum/memory/``, which is the
+librarian's tree, not the harness engineer's.
 """
 
 import tempfile
@@ -10,9 +17,12 @@ import unittest
 from pathlib import Path
 
 from support import (
-    UNSET, branch, commit_files, git, make_git_product_repo, run_cli, write_product,
+    UNSET, branch, commit_files, git, make_git_intent_repo, make_git_product_repo,
+    run_cli, write_intent_config, write_product,
 )
-from vellum.boundaries import BoundaryError, check
+from vellum.boundaries import BoundaryError, check, resolve_source
+from vellum.config import ConfigError
+from vellum.config import write_boundaries as config_boundaries
 from vellum.product import ProductFileError, under, write_boundaries
 
 
@@ -262,3 +272,195 @@ class TestUnder(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IntentCase(BoundaryCase):
+    """A sandbox *intent* repo: boundaries in `.vellum/config.yaml`, no product file."""
+
+    def repo(self, boundaries=UNSET, files=None):
+        intent = make_git_intent_repo(self.root / "intent", boundaries, files)
+        self.base = git(intent, "rev-parse", "HEAD").strip()
+        return intent
+
+    def harness_pr(self, intent, files):
+        branch(intent, "harness")
+        return commit_files(intent, files, "harness change")
+
+
+class TestTheIntentRepoIsGuardedToo(IntentCase):
+    def test_a_harness_pr_touching_the_memory_is_refused(self):
+        # The recurring real breach: harness sessions editing `.vellum/memory/`,
+        # which the librarian owns. `harness-engineer` may write `harness/` and
+        # nothing else, so this crosses.
+        intent = self.repo()
+        self.harness_pr(intent, {
+            "harness/run.py": "# a real harness change\n",
+            ".vellum/memory/areas/pipeline.md": "# Pipeline\n\nedited by the harness\n",
+        })
+        result = check(intent, self.base, "HEAD", "harness-engineer")
+        self.assertTrue(result.crossed)
+        self.assertEqual(result.offending, [".vellum/memory/areas/pipeline.md"])
+
+    def test_the_cli_exits_one_for_it(self):
+        intent = self.repo()
+        self.harness_pr(intent, {".vellum/memory/map.md": "# Map\n\nedited\n"})
+        code, out = run_cli(
+            ["verify", "boundaries", str(intent), "--base", self.base,
+             "--head", "HEAD", "--role", "harness-engineer"]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn(".vellum/memory/map.md", out)
+
+    def test_a_harness_pr_staying_in_harness_passes(self):
+        intent = self.repo()
+        self.harness_pr(intent, {
+            "harness/run.py": "# a real harness change\n",
+            "harness/steps/pipeline.py": "# a new step definition\n",
+        })
+        code, out = run_cli(
+            ["verify", "boundaries", str(intent), "--base", self.base,
+             "--head", "HEAD", "--role", "harness-engineer"]
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("may write: harness", out)
+
+    def test_the_report_names_the_file_the_boundaries_came_out_of(self):
+        # Which trees were considered is half the answer; which file declared
+        # them is the other half, and on a repo that could have two it is the
+        # half that catches the guard reading the wrong one.
+        intent = self.repo()
+        self.harness_pr(intent, {"harness/run.py": "# fine\n"})
+        report = check(intent, self.base, "HEAD", "harness-engineer").report()
+        self.assertIn("config.yaml (config)", report)
+
+    def test_the_ledger_is_not_the_harness_engineers_either(self):
+        intent = self.repo()
+        self.harness_pr(intent, {"ledger/notes.md": "# rewritten by the harness\n"})
+        self.assertEqual(
+            check(intent, self.base, "HEAD", "harness-engineer").offending,
+            ["ledger/notes.md"],
+        )
+
+    def test_the_librarian_may_write_the_memory_the_harness_may_not(self):
+        # One diff, two roles, opposite answers — which is the whole point of
+        # the block being per-role data rather than one list of protected trees.
+        intent = self.repo()
+        self.harness_pr(intent, {".vellum/memory/map.md": "# Map\n\nrewritten\n"})
+        self.assertFalse(check(intent, self.base, "HEAD", "librarian").crossed)
+        self.assertTrue(check(intent, self.base, "HEAD", "harness-engineer").crossed)
+
+
+class TestTheConfigIsReadByTheSameRules(IntentCase):
+    """One block shape, one reader: `product.role_trees` answers for both files."""
+
+    def test_a_role_the_config_does_not_declare_is_refused(self):
+        intent = self.repo(boundaries={"harness-engineer": ["harness"]})
+        with self.assertRaises(BoundaryError) as caught:
+            check(intent, self.base, "HEAD", "librarian")
+        self.assertIn("harness-engineer", str(caught.exception))
+
+    def test_the_cli_exits_two_for_it(self):
+        intent = self.repo(boundaries={"harness-engineer": ["harness"]})
+        code, out = run_cli(
+            ["verify", "boundaries", str(intent), "--base", self.base,
+             "--head", "HEAD", "--role", "librarian"]
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("librarian", out)
+
+    def test_an_entry_that_would_turn_the_guard_off_is_refused_here_too(self):
+        intent = self.repo(boundaries={"harness-engineer": ["../.."]})
+        with self.assertRaises(ConfigError) as caught:
+            config_boundaries(intent, "harness-engineer")
+        self.assertIn("escapes the repository", str(caught.exception))
+
+    def test_a_config_with_no_boundaries_block_is_refused(self):
+        intent = self.repo(boundaries=None)
+        with self.assertRaises(BoundaryError) as caught:
+            check(intent, self.base, "HEAD", "harness-engineer")
+        self.assertIn("no write_boundaries", str(caught.exception))
+
+    def test_the_refusal_names_the_config_rather_than_a_product_file(self):
+        # A message naming `.vellum/product.yaml` would send a harness engineer
+        # looking for a file the intent repo does not have.
+        intent = self.repo(boundaries=None)
+        with self.assertRaises(BoundaryError) as caught:
+            check(intent, self.base, "HEAD", "harness-engineer")
+        self.assertIn("config.yaml", str(caught.exception))
+        self.assertNotIn("product.yaml", str(caught.exception))
+
+
+class TestWhichFileDeclaresTheBoundaries(IntentCase):
+    def test_a_product_file_wins_when_both_exist(self):
+        # A repo carrying a product file is a product repo, whatever else it
+        # also carries; the installation config is the source only where there
+        # is no product file to be the source.
+        intent = self.repo()
+        write_product(intent, boundaries={"harness-engineer": ["harness", "src"]})
+        commit_files(intent, {}, "colocated: a product file too")
+        kind, path = resolve_source(intent)
+        self.assertEqual(kind, "product")
+        self.assertEqual(path.name, "product.yaml")
+
+    def test_naming_the_config_reads_the_config_even_then(self):
+        intent = self.repo()
+        write_product(intent, boundaries={"harness-engineer": ["harness", "src"]})
+        self.base = commit_files(intent, {}, "colocated: a product file too")
+        self.harness_pr(intent, {"src/app.py": "x = 1\n"})
+        # The product file would allow `src`; the config does not, and this is
+        # the run that says which one was asked.
+        self.assertFalse(
+            check(intent, self.base, "HEAD", "harness-engineer", "product").crossed
+        )
+        self.assertEqual(
+            check(intent, self.base, "HEAD", "harness-engineer", "config").offending,
+            ["src/app.py"],
+        )
+
+    def test_a_named_source_that_is_absent_is_an_error_not_a_fallback(self):
+        # The dangerous shape this refuses: a CI job that says `config` and is
+        # quietly answered by some other file's allowlist.
+        intent = self.repo()
+        with self.assertRaises(BoundaryError) as caught:
+            check(intent, self.base, "HEAD", "harness-engineer", "product")
+        self.assertIn("product.yaml", str(caught.exception))
+        self.assertIn("--boundaries-from product", str(caught.exception))
+
+    def test_the_cli_exits_two_for_a_named_source_that_is_absent(self):
+        intent = self.repo()
+        code, out = run_cli(
+            ["verify", "boundaries", str(intent), "--base", self.base, "--head", "HEAD",
+             "--role", "harness-engineer", "--boundaries-from", "product"]
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("product.yaml", out)
+
+    def test_a_checkout_declaring_neither_is_refused_naming_both(self):
+        bare = self.root / "bare"
+        bare.mkdir()
+        with self.assertRaises(BoundaryError) as caught:
+            resolve_source(bare)
+        self.assertIn("product.yaml", str(caught.exception))
+        self.assertIn("config.yaml", str(caught.exception))
+
+    def test_there_is_no_cascade_from_one_file_to_the_other(self):
+        # A product repo whose `write_boundaries` block was deleted must not
+        # start being judged against installation policy — a different repo's
+        # allowlist, silently applied to this one's diff. It is refused instead,
+        # even though a config sitting beside it could have answered.
+        product = make_git_product_repo(self.root / "app", boundaries=None)
+        base = git(product, "rev-parse", "HEAD").strip()
+        write_intent_config(product, boundaries={"implementer": ["harness"]})
+        branch(product, "implementation")
+        commit_files(product, {"harness/steps.py": "# nope\n"}, "reach outside")
+        with self.assertRaises(BoundaryError) as caught:
+            check(product, base, "HEAD", "implementer")
+        self.assertIn("no write_boundaries", str(caught.exception))
+        self.assertIn("product.yaml", str(caught.exception))
+
+    def test_an_unknown_source_is_refused_rather_than_defaulted(self):
+        # Not reachable through argparse, which has `choices`. Reachable by any
+        # other caller of `check`, and defaulting one to `auto` would answer a
+        # question nobody asked.
+        with self.assertRaises(BoundaryError):
+            resolve_source(self.root, "somewhere-else")

@@ -689,9 +689,33 @@ arriving as "this PR wrote outside its trees" is the same unfindable red the
 `backpressure` split exists to prevent. Every guard's tests assert the number,
 not "non-zero".
 
+**`verify boundaries` reads two files now, and there is no cascade between
+them.** The intent repo has no `.vellum/product.yaml` and its own roles — the
+harness engineer, the librarian, the orchestrator — need the same backstop, so
+it declares a `write_boundaries` block in `.vellum/config.yaml` instead. One
+shape, one reader: `product.role_trees()` takes the already-parsed block and the
+file it came out of, `product.write_boundaries()` and the new
+`config.write_boundaries()` are both two lines over it, and every refusal names
+the path it was handed. `config` imports `product` for it, which is the same
+direction `exitduty` already imports `normalise_tree`; there is no cycle because
+`product` imports neither.
+
+`boundaries.resolve_source()` picks the file, and **the first one that exists
+wins with no fall-through**. The tempting alternative — try the product file,
+and if it has no `write_boundaries` key try the config — is the dangerous
+direction spelled out: a product repo whose block was deleted would silently
+start being judged against the *installation's* policy, a different repo's
+allowlist applied to this one's diff, and it would look configured while doing
+it. `test_there_is_no_cascade_from_one_file_to_the_other` pins it, with a config
+sitting right beside the product file that could have answered and does not.
+`--boundaries-from product|config` names the source outright, and then a missing
+file is an error rather than the other file — which is what CI passes, because a
+guard answering out of a file nobody named is the failure this whole command is
+shaped around.
+
 **An allowlist has one dangerous direction, and every judgment call leans the
-other way.** For `verify boundaries`: a role `.vellum/product.yaml` does not
-declare is refused rather than defaulted — neither default is safe, an empty
+other way.** For `verify boundaries`: a role the declaring file does not name
+is refused rather than defaulted — neither default is safe, an empty
 list faults every honest PR and an unrestricted one passes every dishonest one;
 `normalise_tree()` refuses `""`, `.`, `/` and `../..`, each of which admits
 every path in a diff under a naive prefix test; and `under()` compares path

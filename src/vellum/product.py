@@ -7,6 +7,15 @@ keys a command actually reads have accessors here, the same call
 ``vellum.config`` makes about the installation config: a schema written ahead of
 a reader is a second place for the shape to drift.
 
+A ``write_boundaries`` block is not only a product-repo thing any more: the
+intent repo declares its own, in ``.vellum/config.yaml``, because the roles that
+write *there* (the harness engineer, the librarian, the orchestrator) need the
+same backstop and that repo has no product file. The block has one shape
+wherever it is written, so it has one reader — ``role_trees`` below — and
+``vellum.config.write_boundaries`` calls it rather than spelling the rules a
+second time. Two readers of one shape is how the two come to disagree about
+what ``["../.."]`` means.
+
 ``vellum pin advance`` edits this file a line at a time and never parses it into
 a structure it then writes back, because the comments in it are the
 documentation. The guards here only *read* it, so they may parse it normally —
@@ -84,19 +93,22 @@ def normalise_tree(entry, *, path, where: str) -> str:
     return "/".join(parts)
 
 
-def write_boundaries(checkout: str | Path, role: str) -> list[str]:
-    """``write_boundaries.<role>``: the trees *role* may write, normalised.
+def role_trees(declared, role: str, *, path: str | Path) -> list[str]:
+    """One ``write_boundaries`` block, read for *role*: the trees it may write.
+
+    *declared* is whatever the file's ``write_boundaries`` key held and *path*
+    is the file it came out of, so the refusals name it — this same function
+    reads a product repo's ``.vellum/product.yaml`` and an intent repo's
+    ``.vellum/config.yaml``.
 
     Missing is an error rather than an empty list or an unrestricted one, for
     the reason ``config.divergence_cap`` gives about its own key: a default
-    would make a typo'd role name — or a product file written before this guard
+    would make a typo'd role name — or a file written before this guard
     existed — silently decide the answer, and a boundary that can turn itself
     off is not one. Which way it failed open would depend on which default was
     picked, and both are wrong: an empty list faults every honest PR, an
     unrestricted one passes every dishonest one.
     """
-    path = product_path(checkout)
-    declared = load(checkout).get("write_boundaries")
     if not isinstance(declared, dict):
         raise ProductFileError(
             f"{path}: no write_boundaries mapping. This checkout does not declare "
@@ -116,6 +128,12 @@ def write_boundaries(checkout: str | Path, role: str) -> list[str]:
         )
     where = f"write_boundaries.{role}"
     return [normalise_tree(entry, path=path, where=where) for entry in trees]
+
+
+def write_boundaries(checkout: str | Path, role: str) -> list[str]:
+    """``write_boundaries.<role>`` out of a product checkout's product file."""
+    return role_trees(load(checkout).get("write_boundaries"), role,
+                      path=product_path(checkout))
 
 
 def under(path: str, tree: str) -> bool:

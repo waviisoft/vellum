@@ -446,6 +446,51 @@ def write_product(root: Path, commit: str = "0" * 40, boundaries=UNSET) -> Path:
     return path
 
 
+#: What the intent repo's own `write_boundaries` block is expected to declare.
+#: The harness engineer owns `harness/` and nothing else — the recurring real
+#: breach these fixtures are about is a harness session editing
+#: `.vellum/memory/`, which belongs to the librarian.
+DEFAULT_INTENT_BOUNDARIES = {
+    "harness-engineer": ["harness"],
+    "librarian": [".vellum/memory"],
+}
+
+
+def make_git_intent_repo(root: Path, boundaries=UNSET, files: dict | None = None) -> Path:
+    """An intent repo with git history and a `write_boundaries` block in its config.
+
+    The intent side of `make_git_product_repo`: the guard reads a diff, so the
+    fixture has to be a real repository, and the file it reads boundaries out of
+    is `.vellum/config.yaml` rather than `.vellum/product.yaml` — the intent repo
+    has no product file, which is the whole reason the config is a source at all.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    git(root, "init", "-q", "-b", "main", ".")
+    write_intent_config(
+        root, boundaries=DEFAULT_INTENT_BOUNDARIES if boundaries is UNSET else boundaries
+    )
+    seeded = {
+        "harness/run.py": "# the harness engineer's own tree\n",
+        "spec/index.md": INDEX,
+        ".vellum/memory/areas/pipeline.md": "# Pipeline\n\nThe librarian's note.\n",
+        "ledger/notes.md": "# the orchestrator's tree\n",
+    }
+    seeded.update(files or {})
+    commit_files(root, seeded, "the installation begins")
+    return root
+
+
+def write_intent_config(root: Path, cap: int = 3, boundaries=UNSET) -> Path:
+    """Write `.vellum/config.yaml`, optionally carrying a `write_boundaries` block."""
+    (root / ".vellum").mkdir(parents=True, exist_ok=True)
+    path = root / ".vellum" / "config.yaml"
+    block = boundaries_block(
+        DEFAULT_INTENT_BOUNDARIES if boundaries is UNSET else boundaries
+    )
+    path.write_text(CONFIG.format(cap=cap) + block, encoding="utf-8")
+    return path
+
+
 def commit_files(repo: Path, files: dict, message: str) -> str:
     """Write *files* (path -> text, or None to delete) and commit. Returns the sha."""
     for relative, text in files.items():

@@ -10,6 +10,12 @@ The config lives in the *intent* repo, beside ``spec/``, because the values in
 it are installation policy rather than product code — ``divergence_cap`` is a
 statement about how far intent may run ahead of any product, so it cannot live
 in one of them.
+
+``write_boundaries`` is here for a narrower reason: it is the intent repo's own
+boundary declaration, and the intent repo has no ``.vellum/product.yaml`` to put
+it in. The block has the same shape it has in a product file and is read by the
+same function (``vellum.product.role_trees``), so a boundary entry means the
+same thing on both sides.
 """
 
 from __future__ import annotations
@@ -17,6 +23,8 @@ from __future__ import annotations
 from pathlib import Path
 
 import yaml
+
+from vellum.product import ProductFileError, role_trees
 
 
 class ConfigError(Exception):
@@ -73,3 +81,24 @@ def divergence_cap(checkout: str | Path) -> int:
             f"{path}: budgets.divergence_cap is {cap!r}; expected a non-negative integer"
         )
     return cap
+
+
+def write_boundaries(checkout: str | Path, role: str) -> list[str]:
+    """``write_boundaries.<role>`` out of an intent checkout's config.
+
+    The same block a product repo carries in ``.vellum/product.yaml``, declared
+    here because the intent repo has no product file and its own roles — the
+    harness engineer, the librarian, the orchestrator — need the same backstop
+    (``spec/behaviors/write-boundaries.md``: "CI enforces the same boundaries as
+    a backstop in colocated development contexts").
+
+    Read by ``product.role_trees``, so every refusal this makes is the refusal a
+    product file makes for the same input, and re-raised as a ``ConfigError``
+    so a caller still learns which *file* it was reading.
+    """
+    try:
+        return role_trees(
+            load(checkout).get("write_boundaries"), role, path=config_path(checkout)
+        )
+    except ProductFileError as exc:
+        raise ConfigError(str(exc)) from exc

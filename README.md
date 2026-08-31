@@ -251,14 +251,24 @@ contract above: **1 is the answer you will not like, 2 is no answer.** A
 mistyped `--role`, a renamed config or an unresolvable ref is 2, so a workflow
 blocking on 1 blocks on findings and nothing else.
 
-### `vellum verify boundaries <product-checkout> --base <ref> --head <ref>`
+### `vellum verify boundaries <checkout> --base <ref> --head <ref>`
 
-Checks the paths a branch changed against `write_boundaries.<role>` in the
-checkout's own `.vellum/product.yaml`.
+Checks the paths a branch changed against `write_boundaries.<role>` declared in
+the checkout. A product repo declares its boundaries in `.vellum/product.yaml`;
+the intent repo — which has no product file — declares its own in a
+`write_boundaries` block in `.vellum/config.yaml`, in the same shape.
+`--boundaries-from {auto,product,config}` selects the source (`auto`, the
+default, takes the product file if one exists and the config otherwise; a
+checkout that declares neither is refused, not treated as unrestricted). A named
+source whose file is absent is an error, never a silent fall-through to the
+other file.
 
 ```sh
 vellum verify boundaries . --base origin/main --head HEAD          # --role implementer
 vellum verify boundaries . --base origin/main --head HEAD --role harness-engineer
+# the intent repo, whose boundaries live in .vellum/config.yaml:
+vellum verify boundaries ../vellum-intent --role harness-engineer \
+  --boundaries-from config --base origin/main --head HEAD
 ```
 
 A role the product file does not declare is refused (2) rather than defaulted:

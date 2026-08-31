@@ -1,0 +1,302 @@
+# Harness CI — runs on every PR against the INTENT repo.
+#
+# This file lives in the product repo for review and is copied to
+# .github/workflows/harness-ci.yml in waviisoft/vellum-intent. See
+# adapters/github/README.md.
+#
+# Runners are Blacksmith (`blacksmith-2vcpu-ubuntu-2204`), matching this
+# organisation's setup — `ubuntu-latest` is never assigned a runner here. If
+# the intent repo does not have the Blacksmith app installed, change these
+# back to `ubuntu-latest` before copying this file over.
+#
+# Two checks the intent repo had no home for, because `spec-ci.yml` is filtered
+# to `spec/**`, `ledger/**` and `.vellum/config.yaml`:
+#
+#   1. the write boundary on harness PRs — and the breach it exists for is a
+#      harness session also editing `.vellum/memory/`, a diff that may touch
+#      none of spec-ci's paths and so never reaches it;
+#   2. the acceptance suite itself, which must have a step definition for every
+#      scenario the spec declares.
+#
+# Both run on EVERY pull request, with no `paths:` filter. That is deliberate
+# and it is about branch protection, not about cost: a path-filtered required
+# check never runs on the PRs it filters out, and GitHub leaves those PRs
+# waiting for a check that will never report. A job that always runs can be
+# made required; one that sometimes runs cannot.
+
+name: harness-ci
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: harness-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  # The vellum CLI lives in the product repo; the intent repo installs it from
+  # there, as spec-ci.yml and on-spec-merge.yml already do.
+  VELLUM_REF: main
+
+jobs:
+  # =====================================================================
+  # The write boundary, enforced on the repo that declares it.
+  #
+  # spec/behaviors/write-boundaries.md: "CI enforces the same boundaries as a
+  # backstop in colocated development contexts." That sentence has been
+  # enforced in product repos since the mechanical-guards wave and nowhere in
+  # this one, which is the repo where the breach actually recurs: a harness
+  # session that also tidies `.vellum/memory/`, the librarian's tree.
+  #
+  # The boundaries are DATA, in this repo's `.vellum/config.yaml` — the intent
+  # repo has no `.vellum/product.yaml` to put them in. `--boundaries-from
+  # config` names that file rather than letting the command pick: naming it
+  # makes its absence an error, where `auto` would silently read a product file
+  # if one ever appeared here, and a guard answering from a file nobody named
+  # is the shape this whole check exists to prevent.
+  #
+  # WHICH ROLE, AND WHY IT IS DERIVED FROM THE DIFF. A PR does not declare its
+  # role anywhere a workflow can read, so this job derives one mechanically:
+  # **a PR that writes `harness/` is a harness PR**, and a harness PR writes
+  # nothing else. Nothing here guesses from a branch name, a title or a label —
+  # those are decoration, and deriving enforcement from decoration is the
+  # practice `spec/decisions/2026-08-28-versions-are-commits.md` removed.
+  #
+  # The consequence, stated rather than hidden: a PR touching NO harness path
+  # is not checked against any role by this job. A librarian PR that edits
+  # `harness/` is caught (it writes harness/ and memory/, and the harness
+  # engineer may not write memory/); a librarian PR that stays out of
+  # `harness/` is not looked at. Closing that half means asking a different
+  # question — "does this diff fit inside SOME declared role's trees?" — which
+  # is CLI surface no spec change has asked for. See the PR that added this
+  # file; it is flagged for the architect rather than invented here.
+  # =====================================================================
+  boundaries:
+    name: Harness PRs stay in harness/
+    runs-on: blacksmith-2vcpu-ubuntu-2204
+    steps:
+      - name: Check out the PR
+        uses: actions/checkout@v4
+        with:
+          # The guard compares through the merge base, so it needs both sides
+          # of that comparison in the object store. It is also the shape every
+          # job in this pipeline is checked out with, and a per-job exception
+          # is how one of them ends up shallow by accident.
+          fetch-depth: 0
+          # This checkout never pushes, so the credential has no reason to
+          # outlive it in `.git/config`.
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Require the VELLUM_TOKEN secret
+        env:
+          VELLUM_TOKEN: ${{ secrets.VELLUM_TOKEN }}
+        run: |
+          if [ -z "$VELLUM_TOKEN" ]; then
+            echo "::error title=Missing secret::VELLUM_TOKEN must hold a token that can read waviisoft/vellum (private), the repo the CLI installs from"
+            exit 1
+          fi
+
+      - name: Check out the vellum CLI
+        uses: actions/checkout@v4
+        with:
+          repository: waviisoft/vellum
+          ref: ${{ env.VELLUM_REF }}
+          token: ${{ secrets.VELLUM_TOKEN }}
+          path: vellum-cli
+          # Nothing in this workflow pushes. VELLUM_TOKEN reads a private repo,
+          # and this job's workspace root is a pull request's merged tree, so
+          # the credential should not be left sitting in `.git/config`.
+          persist-credentials: false
+
+      - name: Install the vellum CLI
+        run: pip install --quiet ./vellum-cli
+
+      # Through `env`, never `${{ }}` inside the script: `${{ }}` pastes its
+      # value into the script before the shell parses the line. These two are
+      # shas rather than attacker-written prose, but the rule is the rule in
+      # every `run:` in this adapter, and an exception is how the next one
+      # carrying a title or a branch name gets written the unsafe way.
+      #
+      # The merge base is what the guard itself compares through
+      # (`gitver.changed_paths`), so this asks the same question of the same
+      # commits. Where there is no merge base it falls back to the base sha —
+      # a two-dot diff, which is a SUPERSET of the branch's own changes, so the
+      # answer can be "yes, it touches harness/" for a PR that did not: the
+      # guard then runs and reports honestly against a wider diff. Wrong loudly,
+      # never wrong quietly.
+      - name: Does this PR write harness/?
+        id: harness
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          base="$(git merge-base "$BASE" "$HEAD" || echo "$BASE")"
+          if git diff --name-only --no-renames "$base" "$HEAD" -- harness | grep -q .; then
+            echo "touched=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "touched=no" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Not a harness PR::this PR writes nothing under harness/, so the harness-engineer boundary was not checked against it"
+          fi
+
+      # Exit 1 means "this diff crosses a boundary" and nothing else; every
+      # other non-zero exit from a guard is 2 ("I could not answer"). So a red
+      # here has one meaning, and a mistyped role or a missing config arrives
+      # as a different colour of red rather than as a boundary crossing.
+      #
+      # This one BLOCKS meaningfully from the day the intent repo declares its
+      # boundaries — the `write_boundaries` block in `.vellum/config.yaml` that
+      # the paired spec change adds. Unlike the backpressure gate in spec-ci.yml
+      # it has nothing to deadlock on: the boundary is already the rule, the
+      # harness tree already holds only harness files, and against that block
+      # every harness merge on main to date passes it (measured — see the PR
+      # that added this file). Before the block exists it does not pass green on
+      # a harness PR either: with nothing to check against it exits 2 ("I could
+      # not answer"), the fail-closed colour of red — so this file must not be
+      # installed into the intent repo ahead of that block. A guard that would
+      # be red on arrival for lack of a rule earns a `continue-on-error` and a
+      # note saying when to remove it; this one's rule lands with it, so it does
+      # not have one.
+      - name: vellum verify boundaries
+        if: steps.harness.outputs.touched == 'yes'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -o pipefail
+          vellum verify boundaries . \
+            --role harness-engineer \
+            --boundaries-from config \
+            --base "$BASE" \
+            --head "$HEAD" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # =====================================================================
+  # The acceptance suite runs, and the map beside it is current.
+  #
+  # spec/features/scenarios-and-harness.md makes the scenarios in spec/ the
+  # executable definition of done. A scenario with no step definition is
+  # UNDEFINED — not a skip and not a pass — and `harness/run.py` already exits
+  # 1 for it, alongside FAIL and ERROR. So the check is the command: no flag is
+  # needed and none was added (`--strict` is the WRONG flag here — it also
+  # fails on CANNOT RUN YET, and seven of the twenty-two scenarios legitimately
+  # cannot run yet against a deployment with no forge and no certification
+  # runner, so `--strict` would be red on arrival with nothing this repo can do
+  # to clear it).
+  #
+  # This job blocks a SPEC PR, which is the point: adding a scenario the
+  # harness cannot execute is how the suite quietly stops being the definition
+  # of done. The remedy is a step definition in the same wave, or a scenario
+  # that names a capability the adapter declares missing.
+  # =====================================================================
+  suite:
+    name: Every scenario has a step definition
+    runs-on: blacksmith-2vcpu-ubuntu-2204
+    steps:
+      - name: Check out the PR
+        uses: actions/checkout@v4
+        with:
+          # `run.py` extracts the suite with `vellum suite extract`, which dates
+          # every scenario by walking this repo's spec-touching history. A
+          # shallow clone re-dates every scenario below the graft — forward,
+          # the direction that arms scenarios the product already satisfies.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Require the VELLUM_TOKEN secret
+        env:
+          VELLUM_TOKEN: ${{ secrets.VELLUM_TOKEN }}
+        run: |
+          if [ -z "$VELLUM_TOKEN" ]; then
+            echo "::error title=Missing secret::VELLUM_TOKEN must hold a token that can read waviisoft/vellum (private), the repo the CLI installs from"
+            exit 1
+          fi
+
+      - name: Check out the vellum CLI
+        uses: actions/checkout@v4
+        with:
+          repository: waviisoft/vellum
+          ref: ${{ env.VELLUM_REF }}
+          token: ${{ secrets.VELLUM_TOKEN }}
+          path: vellum-cli
+          persist-credentials: false
+
+      # The harness drives the product as a subprocess and never imports it, so
+      # what it needs is a `vellum` on PATH. `run.py` would build its own
+      # virtualenv from VELLUM_PRODUCT_REPO; installing the checkout here is the
+      # same thing done once, in the open, by the step that already exists in
+      # every other job in this adapter.
+      - name: Install the vellum CLI
+        run: pip install --quiet ./vellum-cli
+
+      # Exit 1: a scenario FAILED, ERRORED, or had an UNDEFINED step. Exit 2:
+      # the harness could not start, or the run touched the spec tree. Neither
+      # is tolerated, and neither needs a flag.
+      #
+      # The report goes to a path OUTSIDE the repository. `run.py` compares
+      # `git status --porcelain` before and after the run and exits 2 if the run
+      # changed anything, and while it happens to write `--out` after that
+      # comparison, a report written into the checkout would still leave the
+      # tree dirty for every step after this one.
+      #
+      # The status is held rather than allowed to end the step, so the map
+      # reaches the job summary on the run that FAILED — which is the run
+      # somebody needs to read it on. Exit 2 (the harness could not start)
+      # writes no report at all, hence the test before the `cat`.
+      - name: python3 harness/run.py
+        run: |
+          status=0
+          python3 harness/run.py --out "$RUNNER_TEMP/conformance.md" || status=$?
+          if [ -f "$RUNNER_TEMP/conformance.md" ]; then
+            cat "$RUNNER_TEMP/conformance.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$status"
+
+      # The committed map is documentation that goes stale silently: it is read
+      # as "what conforms today" and nothing until now re-derived it.
+      #
+      # ONE LINE IS EXCLUDED FROM THE COMPARISON, and it is not a fudge. The
+      # map's header records the commit the suite was extracted at, which is the
+      # checkout's HEAD — so the file records the sha of a commit that does not
+      # exist yet when the file is written, and the line is different on every
+      # run by construction. Comparing it would make this check impossible to
+      # pass rather than hard to pass, which is how a team learns to ignore red.
+      # Everything the map actually asserts — the scenario list, each outcome,
+      # each blocked-on capability, the totals — is compared exactly.
+      #
+      # Measured on intent `main` at 8d9e228: a fresh run differs from the
+      # committed map in that one header line and nothing else.
+      #
+      # The narrowing is a workflow-body decision because the alternative is a
+      # flag on `harness/run.py`, and `harness/` is the harness engineer's tree
+      # (this file is written by an implementer, in the product repo). If the
+      # harness grows a "report without the version header" option, this step
+      # becomes a plain `diff`.
+      #
+      # Note what else can turn this red: the map is a function of the spec tree
+      # AND of the product CLI, which is installed from `waviisoft/vellum` at
+      # `env.VELLUM_REF`. A product wave that turns a CANNOT RUN YET into a PASS
+      # makes the committed map stale without any PR here touching anything —
+      # every intent PR then reddens on this step until someone regenerates it.
+      # That is a real cost and it is the intended one: the map claiming a
+      # conformance level the product has moved past is exactly the silent
+      # staleness this check exists for, and the remedy is one command, named in
+      # the annotation below.
+      - name: The committed conformance map is current
+        run: |
+          strip() { grep -v '^- Spec version extracted at:' "$1"; }
+          if ! diff -u <(strip harness/conformance.md) <(strip "$RUNNER_TEMP/conformance.md"); then
+            echo "::error title=Stale conformance map::harness/conformance.md does not match a fresh run; regenerate it with 'python3 harness/run.py --out harness/conformance.md' and commit it"
+            exit 1
+          fi
