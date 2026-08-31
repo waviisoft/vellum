@@ -1070,6 +1070,18 @@ other clock the ledger has. Without an order, two records claiming the same
 criterion would supersede *each other*, or whichever the filename sort reached
 first, which is a coin flip on the sha.
 
+**"Reported" had to be made true: a supersede the fallback decided says so.**
+`_newer()`'s docstring always promised the approved-time fallback "is reported
+rather than silent, because it is weaker", but nothing carried the fact out — a
+supersede is a *write* (the item leaves the queue), and it was being decided on
+timestamps with no trace anywhere. `_newer()` now returns `(later,
+by_approved_time)`, the supersede's detail gains "(ordered by approved time, not
+ancestry)", and `note_time_ordered()` puts one note per version pair in the
+report. Weaker is the point: two versions approved in the same second do not
+order at all, which is the case the docstring itself flags. The strong ordering
+stays quiet, so the note means something —
+`test_a_supersede_ancestry_decided_carries_no_such_note` holds that end.
+
 **A shape the observed file cannot be read in is refused, never read as "nothing
 there".** `_mappings()` raises rather than skipping. The two are opposite
 instructions: "nothing is filed" makes a tick file every issue again, and "nobody
@@ -1078,6 +1090,37 @@ mistyped key must not arrive as a confident tick.
 `TestObservedStateIsRefusedRatherThanMisread` covers the shapes. An *empty* file
 is still supplied observed state holding nothing, which is a different fixture
 and a different answer.
+
+**`data.get(key) or []` is how that rule breaks, and it broke twice.** `or []`
+coerces a *falsy* value before any `isinstance` check runs, so `issues: 0`,
+`issues: false`, `issues: ''` and `issues: {}` all parsed as "observed, and
+nothing is filed" — the misread the rule exists to stop, and the loudest one
+there is, because it makes the tick emit `file-issue` for every planned item
+whose issue already exists. `_mappings()` never had the bug because it tests the
+raw value against `(None, [])` first; `issues:` and a question's `comments:` now
+do the same. The check to reach for is the raw value, never a truthiness test —
+only absent and the empty list are empty. Both refusals are exit 2, both are in
+`TestObservedStateIsRefusedRatherThanMisread`, and
+`test_an_absent_or_empty_issue_list_is_the_one_thing_that_is_empty` guards the
+other side so the refusal cannot grow over the shapes that really are empty.
+
+**A claim is the one action a tick writes on a fact it could not check, and it
+says so.** With `--executor` and no `--observed`, `queue()` leases and dispatches
+an item whose forge issue nothing confirms was ever filed — the issue-filed guard
+below it only fires when observed state *was* supplied. Requiring observed state
+before a claim was considered and rejected: it breaks a legitimate path. The
+`@id:fire-and-collect` lease-mutex tests assert the mutex with no forge in reach,
+which is right — the mutex is a property of repository state, and this module's
+whole design note is that its behavior is "a PASS-able property rather than a
+deployment one". Gating the claim on a forge fixture would also contradict the
+command's own contract that absent observed state means acting on repository
+state alone. So the claim is still taken and *named*: `leased_unconfirmed`
+collects the items and the report carries "A claim wants observed state ...", and
+`--executor`'s help says to pair it with `--observed`. Inferring "this item was
+leased before, so its issue must exist" was rejected too — an earlier tick could
+have taken that lease without observed state, so the inference gives false
+assurance, and it is a rule no spec sentence backs. Making the refusal real is a
+spec question, not a guess for this module.
 
 **Idempotence is asserted on the bytes.** A record is written only when the pass
 actually changed its `dump()`, so a second tick over an unchanged world writes
@@ -1124,11 +1167,23 @@ report is printed and a caller may pipe it into a step summary the way
 its own, and a line of its own is all `::add-mask` needs. Executor names,
 question text, briefings and paths all arrive from an observed file or from the
 intent repo's `ledger/`, both written by whoever can land a merge there.
-`TestTheReportIsNotAWorkflowCommandChannel` covers three of them, and the fourth
-test in that class covers the *other* direction: a briefing reaches the ledger
-through `ledger.dump`, never an f-string, so a briefing shaped like `ok\nstate:
+`TestTheReportIsNotAWorkflowCommandChannel` covers them, and one test in that
+class covers the *other* direction: a briefing reaches the ledger through
+`ledger.dump`, never an f-string, so a briefing shaped like `ok\nstate:
 superseded` does not forge a key — the failure `pin.py` had with a record's
 `name`.
+
+**Ledger *filenames* were the one gap in that "every", and they are the easiest
+to forget.** `report()` joined `written` and `unreadable` from `path.name`
+directly while every other outside string went through `_one_line()`. A filename
+is attacker-controlled in exactly the way the note above describes — anyone who
+lands a merge writes `ledger/`, git permits a newline inside a filename, and the
+`*.yaml` glob matches across one — so `evil\n::error::pwned .yaml` put
+`::error::pwned` on a line of its own. Both halves are reachable: a record is
+keyed by the `spec_version` it carries and not by what it is called, so a valid
+record under a crafted name is a real record whose name reaches `written` the
+moment the tick writes it. `to_dict()` is left alone on purpose — JSON escapes
+the newline, and the raw name is the accurate datum there.
 
 **`upsert_plan()` is a new public seam on `ledger.py`, and it exists because the
 reconciler batches writes.** `advance()` reads, merges and writes in one call,

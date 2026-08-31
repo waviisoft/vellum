@@ -308,15 +308,23 @@ class Tick:
             lines.append("Nothing to converge: desired and observed state agree.")
         lines.append("")
         if self.written:
-            lines.append(f"Ledger files written: {', '.join(self.written)}")
+            lines.append(
+                f"Ledger files written: {', '.join(_one_line(n, 80) for n in self.written)}"
+            )
             lines.append("")
         elif self.dry_run and any(a.taken for a in self.actions):
             lines.append("--dry-run: nothing was written.")
             lines.append("")
         if self.unreadable:
+            # `_one_line` for the reason every other outside string in this
+            # report gets it: a ledger filename is written by whoever can land a
+            # merge on the intent repo, git permits a newline in one, and the
+            # `*.yaml` glob matches across it — so an unnarrowed name puts a
+            # line of its own into a caller's $GITHUB_STEP_SUMMARY.
             lines.append(
                 f"{len(self.unreadable)} file(s) in the ledger could not be read as "
-                f"records and were not reconciled: {', '.join(self.unreadable)}"
+                f"records and were not reconciled: "
+                f"{', '.join(_one_line(n, 80) for n in self.unreadable)}"
             )
             lines.append("")
         for note in self.notes:
@@ -416,9 +424,21 @@ def read_observed(path: str | Path | None) -> Observed:
         raise TickError(f"{path}: observed state is not a YAML mapping")
 
     observed = Observed(supplied=True)
-    issues = data.get("issues") or []
-    if not isinstance(issues, list):
-        raise TickError(f"{path}: 'issues' is not a list of issue numbers")
+    # The raw value, never ``or []``: a falsy scalar (``0``, ``false``, ``''``,
+    # ``{}``) is a shape this cannot read, and coercing it to "no issues are
+    # filed" is the mis-decision the whole refuse-not-misread rule exists to
+    # stop — it tells the tick to file an issue for every planned item, all of
+    # which already exist. Only absent and the empty list are empty, which is
+    # exactly how ``_mappings`` reads its key.
+    issues = data.get("issues")
+    if issues in (None, []):
+        issues = []
+    elif not isinstance(issues, list):
+        raise TickError(
+            f"{path}: 'issues' is {type(issues).__name__}, expected a list of issue "
+            f"numbers. A tick reads the forge only through this file, so a shape it "
+            f"cannot read is refused rather than read as 'nothing there'."
+        )
     for entry in issues:
         number = _int_or_none(entry)
         if number is None:
@@ -645,8 +665,8 @@ def _armed(ledger: Path, sha: str) -> set[str]:
     }
 
 
-def _newer(checkout: Path, older: str, newer: str, records: dict) -> bool:
-    """Is *newer* a later spec version than *older*?
+def _newer(checkout: Path, older: str, newer: str, records: dict) -> tuple[bool, bool]:
+    """Is *newer* a later spec version than *older*, and did ancestry say so?
 
     Ancestry first: "later means descendant" is the ordering the spec relies on
     (``spec/decisions/2026-08-28-versions-are-commits.md``), and shas do not
@@ -655,14 +675,20 @@ def _newer(checkout: Path, older: str, newer: str, records: dict) -> bool:
     times are the fallback, which is the only other clock the ledger has. The
     fallback is reported rather than silent, because it is weaker: two versions
     approved in the same second do not order.
+
+    Returns ``(later, by_approved_time)``. The second half is what makes
+    "reported" true rather than merely intended: the caller decides a
+    **supersede** on this answer — a ledger write that takes an item out of the
+    queue — and a weaker clock can order two records wrongly, so a supersede
+    resting on the fallback has to leave a trace in the report.
     """
     try:
-        return is_ancestor(repo_root(checkout), older, newer)
+        return is_ancestor(repo_root(checkout), older, newer), False
     except (GitUnavailable, OSError, ValueError):
         pass
     a = parse_time(records[older][1].get("approved"))
     b = parse_time(records[newer][1].get("approved"))
-    return bool(a and b and b > a)
+    return bool(a and b and b > a), True
 
 
 def _conformed_baseline(ledger: Path, channel: str) -> tuple[str | None, str]:
@@ -717,6 +743,10 @@ class _Reconciler:
         self.parked_items: set[tuple[str, int]] = set()
         #: Records this pass changed, by sha.
         self.dirty: set[str] = set()
+        #: Version pairs a supersede was decided on without ancestry.
+        self.time_ordered: set[tuple[str, str]] = set()
+        #: Items leased with nothing confirming their forge issue is filed.
+        self.leased_unconfirmed: list[int] = []
 
     # ------------------------------------------------------------- helpers
 
@@ -725,6 +755,28 @@ class _Reconciler:
 
     def touched(self, sha: str) -> None:
         self.dirty.add(sha)
+
+    def note_time_ordered(self, older: str, newer: str) -> None:
+        """Say in the report that a supersede rests on the weaker clock.
+
+        ``_newer``'s docstring promises the ancestry fallback "is reported
+        rather than silent, because it is weaker", and a supersede is the one
+        thing it decides that writes: the item leaves the queue. Two versions
+        approved in the same second do not order at all, and a clock skewed
+        between two approvals orders them wrongly — so a reader who sees a
+        supersede needs to know which of the two answers ordered it. Once per
+        pair, because the pair is what was ordered.
+        """
+        if (older, newer) in self.time_ordered:
+            return
+        self.time_ordered.add((older, newer))
+        self.notes.append(
+            f"Ancestry could not order {older[:12]} against {newer[:12]} — a shallow "
+            f"clone, or a record for a commit this tree does not have — so their "
+            f"'approved' times did, and a supersede rests on that. It is the weaker "
+            f"ordering (two versions approved in the same second do not order); check "
+            f"the superseded item(s) above if the two were approved close together."
+        )
 
     def _claim(self, sha: str, item: dict, briefing: str | None) -> bool:
         """Claim *item* for this tick's executor, unless it is already claimed.
@@ -846,7 +898,10 @@ class _Reconciler:
             if not touches:
                 continue
             for older in open_shas:
-                if older == newer or not _newer(self.checkout, older, newer, self.records):
+                if older == newer:
+                    continue
+                later, by_time = _newer(self.checkout, older, newer, self.records)
+                if not later:
                     continue
                 _, old_record = self.records[older]
                 for item in _items(old_record):
@@ -862,8 +917,11 @@ class _Reconciler:
                     self.act(
                         "supersede", older, _int_or_none(item.get("issue")),
                         f"unstarted and overlapping {newer[:12]} on "
-                        f"{', '.join(SCENARIO_PREFIX + i for i in overlap)}",
+                        f"{', '.join(SCENARIO_PREFIX + i for i in overlap)}"
+                        + (" (ordered by approved time, not ancestry)" if by_time else ""),
                     )
+                    if by_time:
+                        self.note_time_ordered(older, newer)
 
     def directions(self) -> None:
         """New direction for an item: record it, never steer a running executor.
@@ -909,8 +967,21 @@ class _Reconciler:
             closed = bool(entry.get("closed"))
             clarify_pr = _int_or_none(entry.get("clarify_pr"))
             merged = bool(entry.get("clarify_merged"))
+            # Refused, not downgraded to "no comments". The failure direction
+            # here is the safe one — a missed draft-clarify heals next tick —
+            # but a shape the tick cannot read is refused everywhere else in
+            # this parser, and a rule with one quiet exception is not a rule a
+            # caller can rely on.
             comments = entry.get("comments")
-            comments = comments if isinstance(comments, list) else []
+            if comments in (None, []):
+                comments = []
+            elif not isinstance(comments, list):
+                raise TickError(
+                    f"observed state: question issue {issue}'s 'comments' is "
+                    f"{type(comments).__name__}, expected a list. A tick reads the "
+                    f"forge only through this file, so a shape it cannot read is "
+                    f"refused rather than read as 'nothing there'."
+                )
 
             if merged and not closed:
                 # "Merging the micro-PR closes the issue, re-arms the briefing,
@@ -1002,7 +1073,29 @@ class _Reconciler:
                         "work item exists on the forge",
                     )
                     continue
-                self._claim(sha, item, item.get("briefing"))
+                # A claim is the one action here that *writes* on an unverified
+                # fact: with no observed state nothing says this item's issue was
+                # ever filed, and the lease goes on regardless. The claim is still
+                # taken — "absent observed = repository state alone" is this
+                # command's contract, and the lease mutex is a property of
+                # repository state that must hold with no forge in reach — but it
+                # is named, so the foot-gun cannot fire quietly.
+                # Asked of the return value, not before the call: `_claim`
+                # writes no lease for an item somebody already holds, and none
+                # at all without an executor to name. Only a lease that was
+                # really taken belongs in this note.
+                leased = self._claim(sha, item, item.get("briefing"))
+                if leased and issue is not None and not self.observed.supplied:
+                    self.leased_unconfirmed.append(issue)
+        if self.leased_unconfirmed:
+            items = ", ".join(str(i) for i in self.leased_unconfirmed)
+            self.notes.append(
+                f"A claim wants observed state. Work item(s) {items} were leased and "
+                f"dispatched with no --observed, so nothing confirmed their forge "
+                f"issues exist — a lease is a write, and this is the one action a "
+                f"tick takes on a fact it could not check. Pass --observed to have an "
+                f"unfiled item held instead of claimed."
+            )
 
 
 def reconcile(

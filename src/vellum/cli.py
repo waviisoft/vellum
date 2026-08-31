@@ -309,7 +309,9 @@ def _add_tick(sub) -> None:
         "--executor",
         help="the executor a claim is taken for. Without it a ready item is "
              "reported as dispatchable and no lease is written, since a lease "
-             "names its holder",
+             "names its holder. Pair it with --observed: a claim is a write, and "
+             "without observed state nothing confirms the item's issue was ever "
+             "filed, so the tick leases it anyway and says so in the report",
     )
     t.add_argument(
         "--lease-minutes",

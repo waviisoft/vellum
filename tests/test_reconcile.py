@@ -290,6 +290,38 @@ class TestCoalescingSupersedesUnstartedOverlappingWork(TickCase):
         self.record(absent_new, items=[self.item(2, ["scenario:auth"])], approved=at(-1))
         self.assertEqual([a.item for a in self.tick().of_kind("supersede")], [1])
 
+    def test_a_supersede_the_fallback_decided_says_so_in_the_report(self):
+        """``_newer`` promises the fallback "is reported rather than silent".
+
+        It is the promise that makes the fallback acceptable at all. A
+        supersede is a *write* — the item leaves the queue — and approved times
+        are the weaker of the two clocks: two versions approved in the same
+        second do not order, and a skew between two approvals orders them
+        wrongly. That is the case the docstring itself flags, so a reader has
+        to be able to see which answer took their item.
+        """
+        absent_old = "0" * 40
+        absent_new = "1" * 40
+        self.record(absent_old, items=[self.item(1, ["scenario:auth"])], approved=at(-48))
+        self.record(absent_new, items=[self.item(2, ["scenario:auth"])], approved=at(-1))
+        tick = self.tick()
+        self.assertEqual([a.item for a in tick.of_kind("supersede")], [1])
+        self.assertTrue(
+            any("Ancestry could not order" in n for n in tick.notes),
+            f"the fallback left no note: {tick.notes}",
+        )
+        self.assertIn("Ancestry could not order", tick.report())
+        self.assertIn("ordered by approved time", tick.of_kind("supersede")[0].detail)
+
+    def test_a_supersede_ancestry_decided_carries_no_such_note(self):
+        """The note has to mean something, so the strong ordering stays quiet."""
+        self.record(self.older, items=[self.item(1, ["scenario:auth"])])
+        self.record(self.newer, items=[self.item(2, ["scenario:auth"])])
+        tick = self.tick()
+        self.assertEqual([a.item for a in tick.of_kind("supersede")], [1])
+        self.assertFalse(any("Ancestry could not order" in n for n in tick.notes))
+        self.assertNotIn("ordered by approved time", tick.of_kind("supersede")[0].detail)
+
 
 # ==========================================================  @id:fire-and-collect
 
@@ -358,6 +390,47 @@ class TestTheLeaseIsAMutex(TickCase):
         self.assertEqual([a.item for a in tick.of_kind("dispatch")], [1])
         self.assertEqual(tick.of_kind("claim"), [])
         self.assertIsNone(self.items_of(self.newer)[0]["lease"])
+
+    def test_a_claim_taken_with_no_observed_state_is_named_in_the_report(self):
+        """A claim is the one action a tick *writes* on a fact it cannot check.
+
+        With no ``--observed`` nothing says this item's issue was ever filed,
+        and the lease goes on anyway. The claim is still taken — "absent
+        observed = repository state alone" is this command's contract, and the
+        mutex above is a property of repository state that holds with no forge
+        in reach — but leasing an unfiled item is a foot-gun, so it is named
+        rather than silent.
+        """
+        self.record(self.newer, items=[self.item(1)])
+        tick = self.tick(executor="ex")
+        self.assertEqual([a.item for a in tick.of_kind("claim")], [1])
+        self.assertIn("A claim wants observed state", tick.report())
+        self.assertIn("Work item(s) 1", tick.report())
+
+    def test_a_claim_taken_with_observed_state_is_not(self):
+        self.record(self.newer, items=[self.item(1)])
+        tick = self.tick(observed=self.observed(issues=[1]), executor="ex")
+        self.assertEqual([a.item for a in tick.of_kind("claim")], [1])
+        self.assertNotIn("A claim wants observed state", tick.report())
+
+    def test_an_item_held_by_someone_else_is_not_reported_as_leased_unconfirmed(self):
+        """The caveat names leases that were really taken, not ones considered.
+
+        `_claim` writes nothing for an item somebody already holds, so counting
+        the item before the call would have the report announce a lease that
+        does not exist — the mutex working correctly, described as a foot-gun.
+        """
+        self.claimed(+1, executor="claude-cloud")
+        tick = self.tick(executor="a-second-executor")
+        self.assertEqual(tick.of_kind("claim"), [])
+        self.assertNotIn("A claim wants observed state", tick.report())
+
+    def test_a_tick_with_no_executor_writes_no_lease_and_so_needs_no_caveat(self):
+        """Nothing is claimed, so there is no unchecked write to warn about."""
+        self.record(self.newer, items=[self.item(1)])
+        tick = self.tick()
+        self.assertEqual(tick.of_kind("claim"), [])
+        self.assertNotIn("A claim wants observed state", tick.report())
 
     def test_a_reported_item_with_a_pr_is_not_dispatched_again(self):
         self.record(self.newer, state="implementing",
@@ -728,6 +801,41 @@ class TestObservedStateIsRefusedRatherThanMisread(TickCase):
         self.assertEqual(code, 2)
         self.assertIn("names no work item", err)
 
+    def test_a_falsy_scalar_where_the_issue_list_belongs_is_refused(self):
+        """The four shapes ``issues: ... or []`` swallowed before the type check.
+
+        Each one used to parse as "observed, and nothing is filed" — which is
+        not a weaker answer than the truth, it is the opposite instruction: the
+        tick emits ``file-issue`` for every planned item, telling the caller to
+        re-file issues that already exist. The sibling ``_mappings`` helper
+        reads its key off the raw value for exactly this reason, and this one
+        does now too: only absent and ``[]`` are empty.
+        """
+        for text in ("issues: 0\n", "issues: false\n", "issues: ''\n", "issues: {}\n"):
+            with self.subTest(shape=text.strip()):
+                code, out, err = run_cli(self.bad(text))
+                self.assertEqual(code, 2)
+                self.assertIn("expected a list of issue numbers", err)
+                self.assertNotIn("file-issue", out)
+
+    def test_an_absent_or_empty_issue_list_is_the_one_thing_that_is_empty(self):
+        """The refusal above must not swallow the shapes that really are empty."""
+        for text in ("", "issues:\n", "issues: []\n"):
+            with self.subTest(shape=text.strip() or "(empty file)"):
+                code, _, err = run_cli(self.bad(text))
+                self.assertEqual(code, 0, err)
+
+    def test_a_malformed_comments_shape_is_refused(self):
+        """A question's ``comments`` was the parser's one silent downgrade.
+
+        Its failure direction is the safe one — a missed ``draft-clarify``
+        heals on the next tick — but a refuse-not-misread rule with a quiet
+        exception is not a rule a caller can lean on.
+        """
+        code, _, err = run_cli(self.bad("questions: [{issue: 9, comments: 'a comment'}]\n"))
+        self.assertEqual(code, 2)
+        self.assertIn("'comments' is str, expected a list", err)
+
     def test_an_unreadable_file_is_refused(self):
         code, _, err = run_cli(
             ["tick", str(self.repo), "--observed", str(self.repo / "nope.yaml")]
@@ -786,6 +894,37 @@ class TestTheReportIsNotAWorkflowCommandChannel(TickCase):
                     items=[self.item(1, state="implementing", lease=lease)])
         report = self.tick(executor="ex").report()
         self.assertNotIn("\n::error::forged", report)
+
+    def test_an_unreadable_ledger_filename_spanning_lines_is_narrowed(self):
+        """A ledger filename is an outside string like any other.
+
+        Anyone who can land a merge on the intent repo writes ``ledger/``, git
+        permits a newline inside a filename, and the ``*.yaml`` glob matches
+        across one — so a name printed verbatim is a free line in whatever step
+        summary the caller pipes this into.
+        """
+        (self.ledger / "evil\n::error::pwned .yaml").write_text("[1, 2, 3]\n", encoding="utf-8")
+        self.record(self.newer, items=[self.item(1)])
+        report = self.tick().report()
+        self.assertNotIn("\n::error::pwned", report)
+        for line in report.splitlines():
+            self.assertNotEqual(line.strip(), "::error::pwned .yaml")
+
+    def test_a_written_ledger_filename_spanning_lines_is_narrowed(self):
+        """The same for the *written* list, which is the reachable half too.
+
+        A record is keyed by the ``spec_version`` it carries and not by what it
+        is called, so a valid record under a crafted name is a real record —
+        and the moment a tick writes it, its name reaches the report.
+        """
+        record = self.record(self.newer, items=[self.item(1, ["scenario:auth"])])
+        crafted = self.ledger / "evil\n::error::pwned .yaml"
+        crafted.write_text(record.read_text(encoding="utf-8"), encoding="utf-8")
+        record.unlink()
+        report = self.tick(executor="ex").report()
+        self.assertIn("Ledger files written:", report)
+        for line in report.splitlines():
+            self.assertNotEqual(line.strip(), "::error::pwned .yaml")
 
     def test_the_briefing_is_written_to_yaml_by_the_serialiser_not_by_hand(self):
         """A briefing is interpolated into no string on the way to the ledger.
