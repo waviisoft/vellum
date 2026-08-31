@@ -10,10 +10,15 @@ import yaml
 
 from vellum.cli import main
 from vellum.ledger import (
+    CERTIFICATION_KEYS,
     ITEM_KEYS,
+    LEASE_KEYS,
     LedgerError,
     RECORD_KEYS,
+    active_lease,
     advance,
+    certification_authorizes,
+    certify,
     dump,
     find_record,
     load,
@@ -21,6 +26,8 @@ from vellum.ledger import (
     open_record,
     parse_version,
     record_path,
+    take_lease,
+    write,
 )
 
 #: A spec version is a commit (spec/decisions/2026-08-28-versions-are-commits.md),
@@ -34,6 +41,9 @@ UNOPENED = "0123456789abcdef0123456789abcdef01234567"
 #: first seven characters — git's own abbreviation floor — so that
 #: `VERSION[:7]` names both records and neither more than the other.
 SIBLING = "9c8b70a9e3ff41c0d5b2a6748e0c1d93af5528b6"
+#: A PR head a certification run proved. Full forty, always: `certify` refuses
+#: to bind an authorization to an abbreviation.
+CERTIFIED = "2906dfb4a92e66e42cf07bd7e7e6e2e72f6dc66b"
 
 
 def run_cli(argv):
@@ -228,6 +238,142 @@ class TestWorkPlan(LedgerCase):
         path = self.plan_file("work_items:\n  - title: t\n    repo: app\n")
         with self.assertRaises(LedgerError):
             advance(self.dir, VERSION, plan=load_plan(path))
+
+
+#: A work item exactly as records were written before certification and leases
+#: existed: eight keys, no `certification`, no `lease`. Written as literal text
+#: rather than built through `new_item()`, because the whole subject is a shape
+#: this code no longer produces — a fixture that went through the constructor
+#: would gain the two new keys and quietly stop being the thing under test.
+OLD_SHAPE_RECORD = """spec_version: {sha}
+name: null
+approved: '2026-08-30T09:15:00Z'
+spec_pr: 118
+line: main
+baseline: null
+labels: []
+state: implementing
+locks: []
+work_items:
+- issue: 121
+  title: Session expiry
+  repo: app
+  satisfies:
+  - scenario:auth-idle-session-expires
+  pr: 124
+  state: merged
+  briefing: null
+  cost:
+    attempts: 2
+    tokens: 412000
+    usd: 3.1
+    executor: claude-actions
+release: null
+"""
+
+
+class TestOptionalFieldsAreBackwardCompatible(LedgerCase):
+    """A record written before this wave still parses, and still round-trips.
+
+    `certification` and `lease` are optional (`spec/features/ledger.md`). The
+    split that makes them optional is that `new_item()` writes them as null
+    while `dump()` never *inserts* them: the constructor sets defaults, the
+    serialiser only reorders what it was handed. Assert both halves, because
+    either one alone reads like an accident.
+    """
+
+    def old_record(self, sha=VERSION):
+        self.dir.mkdir(parents=True, exist_ok=True)
+        path = record_path(self.dir, sha)
+        path.write_text(OLD_SHAPE_RECORD.format(sha=sha), encoding="utf-8")
+        return path
+
+    def test_a_record_without_the_new_fields_still_parses(self):
+        item = load(self.old_record())["work_items"][0]
+        self.assertEqual(item["issue"], 121)
+        self.assertNotIn("certification", item)
+        self.assertNotIn("lease", item)
+
+    def test_re_dumping_it_is_byte_identical(self):
+        # The property the real ledger is checked against in this wave's PR,
+        # asserted here so it is checked on every run rather than by hand.
+        path = self.old_record()
+        self.assertEqual(dump(load(path)), path.read_text())
+
+    def test_an_absent_certification_reads_as_uncertified(self):
+        item = load(self.old_record())["work_items"][0]
+        authorized, reason = certification_authorizes(item, BASELINE)
+        self.assertFalse(authorized)
+        self.assertIn("no certification", reason)
+
+    def test_an_absent_lease_reads_as_unclaimed(self):
+        self.assertIsNone(active_lease(load(self.old_record())["work_items"][0]))
+
+    def test_advancing_an_old_item_does_not_materialise_the_new_fields(self):
+        # An ordinary cost update must not rewrite the shape of a record it was
+        # not asked to change: that would turn every advance into a migration
+        # and put the two keys into records nobody has certified or claimed.
+        self.old_record()
+        advance(self.dir, VERSION, issue=121, attempts=1, usd=0.25)
+        item = self.record()["work_items"][0]
+        self.assertNotIn("certification", item)
+        self.assertNotIn("lease", item)
+
+    def test_certifying_an_old_item_adds_only_certification(self):
+        self.old_record()
+        certify(self.dir, VERSION, 121, CERTIFIED, "green", at="2026-08-31T04:00:00Z")
+        item = self.record()["work_items"][0]
+        self.assertEqual(item["certification"]["sha"], CERTIFIED)
+        self.assertNotIn("lease", item)
+
+    def test_a_new_item_carries_both_fields_as_null(self):
+        open_record(self.dir, UNOPENED)
+        advance(self.dir, UNOPENED, issue=121, title="t", repo="app")
+        item = load(record_path(self.dir, UNOPENED))["work_items"][0]
+        self.assertIsNone(item["certification"])
+        self.assertIsNone(item["lease"])
+
+    def test_the_new_fields_are_emitted_last(self):
+        # Appended to ITEM_KEYS rather than slotted in beside `pr`, so an item
+        # that gains them gains lines at the end instead of moving every line
+        # below the insertion point.
+        open_record(self.dir, UNOPENED)
+        advance(self.dir, UNOPENED, issue=121, title="t", repo="app")
+        item = load(record_path(self.dir, UNOPENED))["work_items"][0]
+        self.assertEqual(list(item)[-2:], ["certification", "lease"])
+
+
+class TestNestedKeyOrder(LedgerCase):
+    def setUp(self):
+        super().setUp()
+        open_record(self.dir, VERSION)
+        advance(self.dir, VERSION, issue=121, title="t", repo="app")
+
+    def test_a_certification_is_emitted_in_the_spec_order(self):
+        certify(self.dir, VERSION, 121, CERTIFIED, "green", run="r/9")
+        item = load(record_path(self.dir, VERSION))["work_items"][0]
+        self.assertEqual(list(item["certification"]), list(CERTIFICATION_KEYS))
+
+    def test_a_lease_is_emitted_in_the_spec_order(self):
+        take_lease(self.dir, VERSION, 121, "claude-actions", "2036-01-01T00:00:00Z")
+        item = load(record_path(self.dir, VERSION))["work_items"][0]
+        self.assertEqual(list(item["lease"]), list(LEASE_KEYS))
+
+    def test_a_record_carrying_both_round_trips(self):
+        certify(self.dir, VERSION, 121, CERTIFIED, "green", run="r/9")
+        take_lease(self.dir, VERSION, 121, "claude-actions", "2036-01-01T00:00:00Z")
+        path = record_path(self.dir, VERSION)
+        self.assertEqual(path.read_text(), dump(load(path)))
+
+    def test_a_corrupt_certification_is_written_back_unchanged(self):
+        # `dump` reshapes nothing it was not handed: a field that is not a
+        # mapping reaches the reader that reports it, rather than being turned
+        # into an empty one on the way through.
+        path = record_path(self.dir, VERSION)
+        record = load(path)
+        record["work_items"][0]["certification"] = "green"
+        write(path, record)
+        self.assertEqual(load(path)["work_items"][0]["certification"], "green")
 
 
 class TestRoundTrip(LedgerCase):
