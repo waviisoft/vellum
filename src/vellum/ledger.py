@@ -12,6 +12,23 @@ match or order anything (``spec/decisions/2026-08-28-versions-are-commits.md``)
 
 Records are emitted in block style with a fixed key order, so that advancing a
 state produces a one-line diff and a read/write round-trip is byte-stable.
+
+Two of a work item's fields are about a run rather than about the work
+(``spec/features/ledger.md``), and they are read on opposite time-scales:
+
+* ``certification`` is the recorded proof, **bound to a sha**. It is the only
+  thing that authorizes an auto-merge, and it authorizes exactly one commit —
+  see ``certification_authorizes()``, and ``vellum certify`` in
+  ``src/vellum/certify.py``.
+* ``lease`` is transient claim state, not history: written at claim, cleared at
+  report, and *expired means absent* — see ``active_lease()``.
+
+Both are **optional**. ``new_item()`` writes them as ``null``, the way ``line``
+and ``locks`` are written on a record, so activating them is implementation
+rather than migration; but ``dump()`` never inserts a key an item does not
+already have. That split is the whole compatibility story: a record written
+before this wave round-trips byte-for-byte, because the constructor sets
+defaults and the serialiser only ever reorders what it was handed.
 """
 
 from __future__ import annotations
@@ -52,8 +69,37 @@ RECORD_KEYS = (
     "work_items",
     "release",
 )
-ITEM_KEYS = ("issue", "title", "repo", "satisfies", "pr", "state", "briefing", "cost")
+#: Fixed emission order for a work item. ``certification`` and ``lease`` are
+#: appended rather than slotted in beside ``pr``, so an item written before this
+#: wave keeps every byte of its existing shape and gains the two at the end.
+ITEM_KEYS = (
+    "issue",
+    "title",
+    "repo",
+    "satisfies",
+    "pr",
+    "state",
+    "briefing",
+    "cost",
+    "certification",
+    "lease",
+)
 COST_KEYS = ("attempts", "tokens", "usd", "executor")
+#: ``certification: {sha, run, at, result}`` (``spec/features/ledger.md``).
+CERTIFICATION_KEYS = ("sha", "run", "at", "result")
+#: ``lease: {executor, taken, expires}`` (``spec/features/ledger.md``).
+LEASE_KEYS = ("executor", "taken", "expires")
+
+#: The two results a certification run can record. Only ``green`` authorizes.
+CERTIFICATION_RESULTS = ("green", "red")
+GREEN = "green"
+
+#: A certification binds to one commit, so the sha it names is the whole forty
+#: and never an abbreviation. ``SHA_RE`` accepts git's 7-character floor because
+#: a *human types* a version to look a record up; nothing types a certified sha
+#: — a runner reports it — and an authorization decided on a prefix is a
+#: decision about a set of commits rather than about the one that was proved.
+FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 class LedgerError(Exception):
@@ -124,11 +170,55 @@ def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def parse_time(value) -> datetime.datetime | None:
+    """A record's ``approved``, as an aware UTC datetime, or None.
+
+    PyYAML turns an unquoted timestamp into a ``datetime`` before this is
+    reached, and ``vellum.ledger.dump`` writes a quoted string, so both arrive
+    here. A naive datetime is read as UTC: every time this file writes is UTC
+    (``ledger._now``), and guessing local would move a record across a period
+    boundary depending on where the guard ran.
+    """
+    if isinstance(value, datetime.datetime):
+        moment = value
+    elif isinstance(value, datetime.date):
+        moment = datetime.datetime(value.year, value.month, value.day)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            moment = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=datetime.timezone.utc)
+    return moment.astimezone(datetime.timezone.utc)
+
+
 def _ordered(data: dict, keys: tuple[str, ...]) -> dict:
     """Reorder *data* by *keys*, keeping any unrecognised keys at the end."""
     out = {k: data[k] for k in keys if k in data}
     out.update({k: v for k, v in data.items() if k not in out})
     return out
+
+
+def _ordered_present(item: dict, key: str, keys: tuple[str, ...]) -> None:
+    """Order ``item[key]`` in place, if it is there and is a mapping.
+
+    Deliberately not ``item.get(key) or {}``, which is how ``cost`` is handled:
+    that turns an absent or null value into an empty mapping, and for these two
+    fields absent, null and ``{}`` are three different claims — no certification
+    was ever recorded, none is recorded now, and one was recorded with nothing
+    in it. Only the first of those is a shape older records actually have, and
+    materialising a key into them is what would cost a byte-identical
+    round-trip. A non-mapping is left exactly as found, so a corrupt field
+    reaches the reader that reports it rather than being reshaped on the way.
+    """
+    if key in item and isinstance(item[key], dict):
+        item[key] = _ordered(dict(item[key]), keys)
 
 
 def new_cost() -> dict:
@@ -176,15 +266,25 @@ def new_item(
         "state": state,
         "briefing": briefing,
         "cost": new_cost(),
+        # Written as null the way a record writes `line` and `locks`: the shape
+        # is reserved, so recording the first certification or lease is an
+        # edit to a key that is already there. `dump` still never *inserts*
+        # either into an item that arrived without them.
+        "certification": None,
+        "lease": None,
     }
+
+
+def _ordered_item(item: dict) -> dict:
+    out = {**item, "cost": _ordered(dict(item.get("cost") or {}), COST_KEYS)}
+    _ordered_present(out, "certification", CERTIFICATION_KEYS)
+    _ordered_present(out, "lease", LEASE_KEYS)
+    return _ordered(out, ITEM_KEYS)
 
 
 def dump(record: dict) -> str:
     record = _ordered(dict(record), RECORD_KEYS)
-    record["work_items"] = [
-        _ordered({**item, "cost": _ordered(dict(item.get("cost") or {}), COST_KEYS)}, ITEM_KEYS)
-        for item in record.get("work_items", [])
-    ]
+    record["work_items"] = [_ordered_item(item) for item in record.get("work_items", [])]
     return yaml.safe_dump(record, sort_keys=False, default_flow_style=False, width=100)
 
 
@@ -344,3 +444,216 @@ def load_plan(path: str | Path) -> list[dict]:
     if not isinstance(items, list):
         raise LedgerError(f"{path}: expected a list of work items")
     return items
+
+
+# ------------------------------------------------- certification and leases
+
+def parse_certified_sha(value, what: str = "certified commit") -> str:
+    """The full forty characters of a commit sha, or raise.
+
+    ``parse_version`` accepts git's 7-character abbreviation because a human
+    types a version to *look a record up*, and reaching the wrong record by an
+    ambiguous prefix is caught by ``find_record`` and reported. This is the
+    other kind of sha: the one an authorization is decided on. A prefix names a
+    set of commits, so a certification stored or checked against one would
+    authorize every commit in that set — including a commit nobody proved
+    anything about. Nothing types this value; a runner reports it. So the
+    convenience is not offered here and the comparison stays exact.
+    """
+    sha = str(value).strip().lower()
+    if not FULL_SHA_RE.match(sha):
+        raise LedgerError(
+            f"{value!r} is not a full commit sha, and a {what} must be one. "
+            f"Certification binds to exactly one commit, so an abbreviation — "
+            f"which names a set of them — is refused rather than resolved."
+        )
+    return sha
+
+
+def new_certification(sha: str, result: str, run: str | None = None, at: str | None = None) -> dict:
+    """``certification: {sha, run, at, result}`` (``spec/features/ledger.md``)."""
+    if result not in CERTIFICATION_RESULTS:
+        raise LedgerError(
+            f"{result!r} is not a certification result "
+            f"({', '.join(CERTIFICATION_RESULTS)})"
+        )
+    return {
+        "sha": parse_certified_sha(sha),
+        "run": run,
+        "at": at or _now(),
+        "result": result,
+    }
+
+
+def certify(
+    ledger_dir: str | Path,
+    sha: str,
+    issue: int,
+    certified_sha: str,
+    result: str,
+    run: str | None = None,
+    at: str | None = None,
+) -> Path:
+    """Record a certification run against one work item. Returns the record path.
+
+    The new certification *replaces* whatever was there. Certification binds to
+    a sha, so a record of a run against some earlier commit is not evidence
+    about this one and keeping it alongside would only invite a reader to
+    resolve two claims. The superseded certification is not lost — the ledger's
+    history is git.
+
+    This does not check that *certified_sha* is the work item's PR head, and it
+    cannot: the item records the PR's *number*, not its head commit, so nothing
+    in the ledger knows what the head is. That comparison is the caller's, and
+    it is exactly what ``certification_authorizes`` is given a head to make.
+    """
+    path = find_record(ledger_dir, sha)
+    if path is None:
+        raise LedgerError(
+            f"{record_path(ledger_dir, sha)}: no ledger record for {sha}; open it first"
+        )
+    record = load(path)
+    item = find_item(record, issue)
+    if item is None:
+        raise LedgerError(
+            f"work item {issue} is not in {path.name}, so there is nothing to "
+            f"certify. A certification is recorded against planned work."
+        )
+    item["certification"] = new_certification(certified_sha, result, run=run, at=at)
+    write(path, record)
+    return path
+
+
+def certification_authorizes(item: dict, head: str) -> tuple[bool, str]:
+    """Whether *item*'s certification authorizes a merge at *head*.
+
+    Returns ``(authorized, reason)``; the reason is written to be printed
+    whichever way it went. Only a recorded ``green`` at exactly *head*
+    authorizes (``spec/features/ledger.md``), which makes every other shape —
+    no certification, a red one, a green one against another commit, a corrupt
+    field — the same answer with a different sentence.
+
+    Every denial is an *answer*, not a failure to answer: "no green
+    certification exists at this head" is true of a malformed certification
+    block as surely as of an absent one, and the spec says so in as many words
+    — a work item whose PR head is not the certified sha is uncertified,
+    "whatever the record says it once was".
+    """
+    head = parse_certified_sha(head, what="head commit")
+    certification = item.get("certification")
+    if certification is None:
+        return False, (
+            f"no certification is recorded for work item {item.get('issue')}. "
+            f"A merge is authorized by a recorded green certification run, never "
+            f"by checks the examined party ran on itself."
+        )
+    if not isinstance(certification, dict):
+        return False, (
+            f"work item {item.get('issue')} has a certification field that is not "
+            f"a mapping ({type(certification).__name__}); it records no run, so it "
+            f"authorizes nothing."
+        )
+    certified = str(certification.get("sha") or "").strip().lower()
+    result = str(certification.get("result") or "").strip().lower()
+    if not certified:
+        return False, (
+            f"work item {item.get('issue')} has a certification naming no sha, so "
+            f"there is no commit it is evidence about."
+        )
+    if certified != head:
+        return False, (
+            f"the certification on work item {item.get('issue')} is bound to "
+            f"{certified[:12]}, and the head is {head[:12]}. Certification binds to "
+            f"a sha: a commit pushed after the run was not covered by it."
+        )
+    if result != GREEN:
+        return False, (
+            f"the certification at {head[:12]} recorded {result or 'no result'!r}, "
+            f"not {GREEN!r}."
+        )
+    return True, f"green certification recorded at {head[:12]}."
+
+
+def new_lease(executor: str, expires: str, taken: str | None = None) -> dict:
+    """``lease: {executor, taken, expires}`` (``spec/features/ledger.md``)."""
+    if not str(executor or "").strip():
+        raise LedgerError("a lease names the executor holding it; --executor was empty")
+    if parse_time(expires) is None:
+        raise LedgerError(
+            f"{expires!r} is not a moment a lease can expire at "
+            f"(e.g. 2026-08-31T14:00:00Z). A lease with no readable expiry is "
+            f"read as no lease, so writing one would silently claim nothing."
+        )
+    return {"executor": str(executor).strip(), "taken": taken or _now(), "expires": expires}
+
+
+def active_lease(item: dict, now: datetime.datetime | None = None) -> dict | None:
+    """*item*'s lease if it is held and unexpired, else None.
+
+    "The reconciler ... treats an expired lease as no lease, returning the item
+    to the queue" (``spec/features/ledger.md``), so expiry is resolved here and
+    not left to each caller: an item is claimed exactly when this returns
+    something. "Mid-run means holding an unexpired lease" is the same sentence
+    read the other way, and ``@id:fire-and-collect`` is the scenario that turns
+    on it.
+
+    A lease whose ``expires`` cannot be read is **absent**, like an expired one.
+    Both directions lose something and they are not symmetric: reading it as
+    held strands the item forever behind a claim no clock can ever retire,
+    which is the failure the expiry exists to prevent; reading it as free costs
+    at most a second executor starting from the last pushed commit, which is
+    what a lapsed lease already means here. Expiry is exclusive — a lease is
+    held *until* it expires — so a lease expiring exactly now is not held.
+    """
+    lease = item.get("lease")
+    if not isinstance(lease, dict):
+        return None
+    expires = parse_time(lease.get("expires"))
+    if expires is None:
+        return None
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=datetime.timezone.utc)
+    return lease if expires > now else None
+
+
+def _item_for(ledger_dir: str | Path, sha: str, issue: int) -> tuple[Path, dict, dict]:
+    """``(path, record, item)`` for one work item, or raise ``LedgerError``."""
+    path = find_record(ledger_dir, sha)
+    if path is None:
+        raise LedgerError(
+            f"{record_path(ledger_dir, sha)}: no ledger record for {sha}; open it first"
+        )
+    record = load(path)
+    item = find_item(record, issue)
+    if item is None:
+        raise LedgerError(f"work item {issue} is not in {path.name}")
+    return path, record, item
+
+
+def take_lease(
+    ledger_dir: str | Path,
+    sha: str,
+    issue: int,
+    executor: str,
+    expires: str,
+    taken: str | None = None,
+) -> Path:
+    """Claim a work item for *executor* until *expires*."""
+    path, record, item = _item_for(ledger_dir, sha, issue)
+    item["lease"] = new_lease(executor, expires, taken=taken)
+    write(path, record)
+    return path
+
+
+def clear_lease(ledger_dir: str | Path, sha: str, issue: int) -> Path:
+    """Release a work item's claim — what the reconciler does at report.
+
+    Clearing writes ``null`` rather than deleting the key: the field is part of
+    the item's shape once the item has one, and a released claim and a field
+    that was never there are different things to a reader looking at a diff.
+    """
+    path, record, item = _item_for(ledger_dir, sha, issue)
+    item["lease"] = None
+    write(path, record)
+    return path

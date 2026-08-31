@@ -42,6 +42,17 @@ certification field at all"). Rather than invent one, this guard checks the
 nearest thing the schema does record — that a cut wave has reached ``verified``
 or ``shipped`` — and labels the finding as the proxy it is, in the report and in
 ``Finding.kind``. Closing that gap needs a spec slice, not a guess here.
+
+**Still a proxy, and now for a narrower reason.** A *work item* carries
+``certification: {sha, run, at, result}`` since ``spec/features/ledger.md``
+grew it, so ``vellum certify check`` can answer "is this PR head certified".
+A **wave** still carries nothing: the spec binds certification to a merge
+candidate's sha, and a cut names waves. Reading a wave as certified because
+each of its items happens to hold a green would be inventing the aggregation
+rule rather than reading one, and it would answer for items whose certified
+sha is not what actually merged. So the proxy stays until a spec slice says
+how a wave is certified. Do not "finish the job" by summing item
+certifications here.
 """
 
 from __future__ import annotations

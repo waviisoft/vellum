@@ -1,8 +1,8 @@
 # Area: the `vellum` CLI
 
-`src/vellum/`. Eleven commands — `lint`, `suite extract`,
-`ledger open|advance|verify`, the three pipeline commands `mint`,
-`backpressure`, `pin advance`, and the five mechanical guards
+`src/vellum/`. Thirteen commands — `lint`, `suite extract`,
+`ledger open|advance|verify`, `certify record|check`, the three pipeline
+commands `mint`, `backpressure`, `pin advance`, and the five mechanical guards
 `verify boundaries|deps|exit-duty`, `ledger verify` and `budget` — dispatched
 from `build_parser()` in `src/vellum/cli.py`. Every claim below names a file or
 symbol you can grep for.
@@ -18,7 +18,8 @@ symbol you can grep for.
 | `src/vellum/lint.py` | `lint_tree()`, `Finding`, the `_check_*` functions. |
 | `src/vellum/suite.py` | `extract()`, `scan_file()`, `scenarios_in()`, `BlockError`, `DroppedScenarios`, `fingerprint()`, `version_history()`, `History`, `to_dict()`. |
 | `src/vellum/gitver.py` | `spec_commits()`, `names()`, `is_shallow()`, `markdown_at()`, `show()`. All subprocess git lives here. |
-| `src/vellum/ledger.py` | `open_record()`, `advance()`, `find_record()`, `dump()`, `RECORD_KEYS`, `ITEM_KEYS`. |
+| `src/vellum/ledger.py` | `open_record()`, `advance()`, `find_record()`, `dump()`, `parse_time()`, `RECORD_KEYS`, `ITEM_KEYS`. Also the certification and lease half: `certify()`, `certification_authorizes()`, `take_lease()`, `clear_lease()`, `active_lease()`. |
+| `src/vellum/certify.py` | `check()` -> `Authorization`, `run_check()`, `run_record()`. The merge gate's evidence. |
 | `src/vellum/mint.py` | `mint()` -> `Mint`, `_commit_record()`. The `on-spec-merge` bookkeeping. |
 | `src/vellum/backpressure.py` | `measure()` -> `Window`, `run()`, `SETTLED_STATES`. The divergence gate. |
 | `src/vellum/pin.py` | `advance()` -> `Advance`, `verify_version()`, `_rewrite()`. The pin close. |
@@ -886,6 +887,108 @@ test in the file, and the one test that needs the variable absent uses
 which deletes.
 
 
+## Certification and leases
+
+`spec/features/ledger.md` gives a work item two fields that are about a *run*
+rather than about the work, and they behave nothing like each other:
+`certification: {sha, run, at, result}` and `lease: {executor, taken, expires}`.
+The schema lives in `src/vellum/ledger.py`; the command is
+`src/vellum/certify.py`.
+
+**Both fields are optional, and the split that makes them optional is worth
+stating precisely: `new_item()` writes them as null, `dump()` never *inserts*
+them.** The constructor sets defaults — the way a record writes `line` and
+`locks` — so recording the first certification edits a key that is already
+there. The serialiser only ever reorders what it was handed, so a work item
+written before this wave keeps every byte of its shape. Measured, not assumed:
+all twelve sha-keyed records on intent `main` re-dump byte-identical, and
+`TestOptionalFieldsAreBackwardCompatible` in `tests/test_ledger.py` carries an
+old-shape record as literal text and asserts the same thing on every run.
+Write that fixture as text, never through `new_item()` — a fixture built by the
+constructor gains the two keys and silently stops being the thing under test.
+
+Note what the real ledger could *not* verify: **no record in the intent repo's
+history has ever carried a work item at all** (14 ledger commits, zero items),
+so the real round-trip exercises `RECORD_KEYS` and never `ITEM_KEYS`. The
+literal fixture is the only coverage of the item half. Re-measure rather than
+re-reading this line: the check is `load()` then `dump()` over
+`ledger/*.yaml`, skipping `NOT_A_RECORD`.
+
+**Certification binds to a sha, and that is the whole of both scenarios.**
+`@id:no-self-certified-merge` says a PR whose in-session checks pass, with
+nothing recorded for its head, does not merge — so the default is deny and
+in-session results are not an input the command even accepts.
+`@id:new-commit-invalidates-cert` says a certification does not survive a new
+commit — implemented as "the head is not the certified sha", which needs no
+notion of *later* and so cannot be fooled by a force-push that rewrites what
+"subsequent" means. `certification_authorizes()` returns `(bool, reason)` and
+every non-green shape — absent, red, another sha, a corrupt field — is the same
+answer with a different sentence.
+
+**A denial is exit 1, not 2.** It is an answer, and a merge gate that cannot
+tell "this head is uncertified" from "that is not an intent checkout" reports
+the second as the first the moment a path is mistyped. A corrupt certification
+field denies rather than refusing to answer, for the same reason: "no green
+certification exists at this head" is *true* of a malformed block, and the spec
+says so in as many words — uncertified "whatever the record says it once was".
+
+**`--sha` and `--head` take the full forty; an abbreviation is refused, not
+resolved.** `SHA_RE` accepts git's 7-character floor because a human types a
+*version* to look a record up, and `find_record()` catches an ambiguous prefix
+and reports it. This is the other kind of sha: the one an authorization is
+decided on. A prefix names a set of commits, so a certification stored or
+checked against one authorizes every commit in that set — including commits
+nobody proved anything about. `FULL_SHA_RE` and `parse_certified_sha()` keep the
+comparison exact, and `TestAbbreviationsAreRefused` pins it at the CLI *and*
+below it, so it cannot be reintroduced in the library.
+
+**The ledger does not know a PR's head, so the caller supplies it.** A work
+item records the PR's *number*, not its head commit. `certify record` therefore
+cannot check that `--sha` is the head, and does not pretend to; the comparison
+the spec asks for happens in `certify check --head`, which is given the head by
+a caller that can see the forge — the same division as `backpressure --pending`
+and `budget --projected`. Do not reach for a forge API to close this.
+
+**Recording a red exits 0.** The recorder has not failed at anything; the
+denial is `check`'s to give. A red that could not be written would leave the
+ledger unable to say a run happened at all.
+
+**Certification is on the work item; a *wave* still has none.** `ledger verify`
+goes on using its record-state proxy for "a cut naming an uncertified wave" and
+its docstring now says why that is still right: the spec binds certification to
+a merge candidate's sha, cuts name waves, and summing item certifications would
+be inventing the aggregation rule rather than reading one. Do not "finish the
+job" in `chain.py`.
+
+**The lease has helpers and no command, deliberately.** Nothing in the spec
+asks a scenario of the lease that a caller could drive today —
+`@id:fire-and-collect` turns on "an executor mid-run on a claimed work item",
+and the party that claims, reports and lapses is the reconciler (Wave E). So
+`take_lease()`/`clear_lease()`/`active_lease()` land with the schema and the
+tests drive them directly. `active_lease()` is where "treats an expired lease
+as no lease" is resolved, once, rather than in each caller: an item is claimed
+exactly when it returns something, and "mid-run means holding an unexpired
+lease" is the same sentence read the other way.
+
+Two judgment calls inside it, both leaning the same way. Expiry is
+**exclusive** — a lease is held *until* it expires, so one expiring exactly now
+is not held. And a lease whose `expires` cannot be read is **absent**, like an
+expired one: reading it as held strands the item behind a claim no clock can
+retire, which is the failure the expiry exists to prevent, while reading it as
+free costs at most a second executor restarting from the last pushed commit —
+which is what a lapsed lease already means here. `new_lease()` refuses an
+unreadable expiry at write time so that direction is a mistake you are told
+about rather than a claim that silently never happened. `clear_lease()` writes
+null rather than deleting the key: a released claim and a field that was never
+there read differently in a diff.
+
+**`parse_time()` moved from `budget.py` to `ledger.py`, and `budget.py`
+re-exports it.** Lease expiry reads the ledger's own timestamps and so does the
+spend window; two definitions of how this project reads a recorded moment is
+how those two come to disagree. It sits next to the `_now()` that writes them.
+`from vellum.budget import parse_time` still works, which is what `cli.py` and
+`tests/test_budget.py` do.
+
 ## Patterns worth keeping
 
 - **Findings, not exceptions.** `lint_tree()` returns a sorted list of
@@ -907,10 +1010,18 @@ which deletes.
   may replay an approval (decision D11), so a second `open` leaves the record
   alone. Cost is additive because every agent invocation records into the same
   work-item entry.
-- **Fixed key order on write.** `RECORD_KEYS`/`ITEM_KEYS`/`COST_KEYS` and
-  `_ordered()` in `src/vellum/ledger.py` make a state change a one-line diff
-  and a read/write round-trip byte-stable
-  (`test_a_record_reread_and_redumped_is_byte_identical`).
+- **Fixed key order on write.** `RECORD_KEYS`/`ITEM_KEYS`/`COST_KEYS`,
+  `CERTIFICATION_KEYS`/`LEASE_KEYS` and `_ordered()` in `src/vellum/ledger.py`
+  make a state change a one-line diff and a read/write round-trip byte-stable
+  (`test_a_record_reread_and_redumped_is_byte_identical`). New keys are
+  **appended** to `ITEM_KEYS`, so an item that gains one gains lines at the end
+  instead of moving every line below an insertion point.
+- **An optional field is optional in the serialiser, not just in the reader.**
+  `_ordered_present()` orders a nested mapping only where the item already has
+  it, and deliberately does not copy `cost`'s `or {}` idiom — that turns absent
+  and null into `{}`, and for `certification`/`lease` absent, null and `{}` are
+  three different claims. Materialising a key into an old record is what would
+  cost the byte-identical round-trip.
 
 **`spec_version` and `spec_head` are different questions.** `spec_version` is
 the commit the suite was extracted at — a checkout's pin, a PR head — and need

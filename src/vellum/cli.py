@@ -1,12 +1,13 @@
 """``vellum`` — the v0.1 command line.
 
 Commands, one per feature spec: ``lint`` (spec-pipeline), ``suite extract``
-(scenarios-and-harness), ``ledger open|advance`` (ledger), the three pipeline
-commands the forge workflows are shims over — ``mint``, ``backpressure`` and
-``pin advance`` — and the mechanical guards: ``verify boundaries``, ``verify
-deps``, ``verify exit-duty``, ``ledger verify`` and ``budget``. Each returns a
-process exit code; failure detail goes to stderr and nothing else is printed on
-success beyond what was asked for.
+(scenarios-and-harness), ``ledger open|advance`` and ``certify record|check``
+(ledger, certification-and-releases), the three pipeline commands the forge
+workflows are shims over — ``mint``, ``backpressure`` and ``pin advance`` — and
+the mechanical guards: ``verify boundaries``, ``verify deps``, ``verify
+exit-duty``, ``ledger verify`` and ``budget``. Each returns a process exit code;
+failure detail goes to stderr and nothing else is printed on success beyond what
+was asked for.
 
 A guard is a command that reads neutral inputs — a checkout, two refs, a role —
 and answers one question about them. None of them writes anything, and none of
@@ -25,10 +26,12 @@ Exit codes, in the one place they are all visible:
 
 * ``0`` — it worked, or the command decided there was nothing to do.
 * ``1`` — the command answered, and the answer is bad news: a fence that drops
-  scenarios, a shallow clone, a divergence window at its cap.
+  scenarios, a shallow clone, a divergence window at its cap, a head no green
+  certification covers.
 * ``2`` — the command could not answer: the path is not a spec tree, the sha is
   not a sha, the pin file is not a pin file, the config has no cap, a ``--ref``
-  names no commit, ``--emit`` was handed an empty path.
+  names no commit, ``--emit`` was handed an empty path, ``certify`` was pointed
+  at a checkout with no ledger or named a work item that is not in the record.
 
 The line is between *an answer you will not like* and *no answer*, and it is
 load-bearing for ``vellum backpressure`` in particular: the moment its
@@ -58,6 +61,8 @@ from vellum.boundaries import BoundaryError
 from vellum.boundaries import run as boundaries_run
 from vellum.budget import BudgetError
 from vellum.budget import run as budget_run
+from vellum.certify import run_check as certify_check
+from vellum.certify import run_record as certify_record
 from vellum.chain import ChainError
 from vellum.chain import run as chain_run
 from vellum.config import INTENT_ENV
@@ -67,7 +72,14 @@ from vellum.deps import DEFAULT_MANIFESTS, DependencyError
 from vellum.deps import run as deps_run
 from vellum.exitduty import AREAS_TREE, DEFAULT_SOURCE_TREES, ExitDutyError
 from vellum.exitduty import run as exitduty_run
-from vellum.ledger import LedgerError, advance, load_plan, open_record, parse_version
+from vellum.ledger import (
+    CERTIFICATION_RESULTS,
+    LedgerError,
+    advance,
+    load_plan,
+    open_record,
+    parse_version,
+)
 from vellum.lint import run as lint_run
 from vellum.mint import MintError, mint as mint_run
 from vellum.pin import PinError, advance as pin_advance
@@ -153,6 +165,7 @@ def build_parser() -> argparse.ArgumentParser:
              "references could not be resolved; belongs wherever the guard blocks",
     )
 
+    _add_certify(sub)
     _add_mint(sub)
     _add_backpressure(sub)
     _add_pin(sub)
@@ -160,6 +173,82 @@ def build_parser() -> argparse.ArgumentParser:
     _add_verify(sub)
 
     return parser
+
+
+def _add_certify(sub) -> None:
+    """``certify record|check`` — the recorded proof an auto-merge is gated on.
+
+    Two subcommands rather than one command with a ``--check`` flag, for the
+    reason ``ledger`` and ``verify`` have subcommands: writing a certification
+    and asking whether one authorizes a merge take disjoint arguments, and a
+    single parser would have to accept ``--result`` beside ``--head`` and then
+    reject the combination in code. The required flags being required is worth
+    more here than in most places, because the thing being invoked wrong is a
+    merge gate.
+    """
+    certify = sub.add_parser(
+        "certify",
+        help="record a certification run, or ask whether one authorizes a merge",
+    )
+    certify_sub = certify.add_subparsers(dest="certify_command", required=True)
+
+    rec = certify_sub.add_parser(
+        "record",
+        help="record a certification run against a work item",
+        description=(
+            "Writes `certification: {sha, run, at, result}` onto the work item, "
+            "replacing any earlier one — certification binds to a sha, so a run "
+            "against an earlier commit is not evidence about this one. Recording "
+            "a red result is not a failure of this command and exits 0; what a "
+            "red does is deny the merge, which is `certify check`'s answer."
+        ),
+    )
+    _add_certify_common(rec)
+    rec.add_argument(
+        "--sha",
+        required=True,
+        help="the commit the run certified: the PR head at the time, in full",
+    )
+    rec.add_argument(
+        "--result",
+        required=True,
+        choices=list(CERTIFICATION_RESULTS),
+        help="what the run found",
+    )
+    rec.add_argument("--run", help="reference to the recorded run (a URL or id)")
+    rec.add_argument("--at", help="when the run finished, ISO 8601 (default: now, UTC)")
+
+    chk = certify_sub.add_parser(
+        "check",
+        help="does a recorded green certification authorize a merge at this head?",
+        description=(
+            "Exits 0 when a green certification is recorded at exactly --head, and "
+            "1 when it is not: no certification, a red one, or one bound to another "
+            "commit (`@id:no-self-certified-merge`, `@id:new-commit-invalidates-cert`). "
+            "Reaches no forge and runs nothing — the head is supplied by the caller "
+            "that can see the PR. It is never told whether in-session checks passed, "
+            "because the examined party's report about itself is not the evidence."
+        ),
+    )
+    _add_certify_common(chk)
+    chk.add_argument(
+        "--head",
+        required=True,
+        help="the PR's current head commit, in full; an abbreviation is refused "
+             "rather than resolved, since a prefix names a set of commits and an "
+             "authorization is about exactly one",
+    )
+
+
+def _add_certify_common(p: argparse.ArgumentParser) -> None:
+    p.add_argument("checkout", help="the intent repo checkout")
+    p.add_argument(
+        "--version",
+        required=True,
+        help="spec version: the commit sha of the record holding the work item",
+    )
+    p.add_argument("--item", type=int, required=True, help="work item issue number")
+    p.add_argument("--ledger-dir", help="ledger directory (default: <checkout>/ledger)")
 
 
 def _add_mint(sub) -> None:
@@ -386,6 +475,8 @@ def main(argv: list[str] | None = None) -> int:
             return suite_run(args.spec_dir, args.output)
         if args.command == "ledger":
             return _ledger(args)
+        if args.command == "certify":
+            return _certify(args)
         if args.command == "mint":
             return _mint(args)
         if args.command == "backpressure":
@@ -434,6 +525,27 @@ def main(argv: list[str] | None = None) -> int:
         print(f"vellum: {exc}", file=sys.stderr)
         return 2
     return 2
+
+
+def _certify(args: argparse.Namespace) -> int:
+    if args.certify_command == "check":
+        return certify_check(
+            args.checkout,
+            args.version,
+            args.item,
+            args.head,
+            ledger_dir=args.ledger_dir,
+        )
+    return certify_record(
+        args.checkout,
+        args.version,
+        args.item,
+        args.sha,
+        args.result,
+        run=args.run,
+        at=args.at,
+        ledger_dir=args.ledger_dir,
+    )
 
 
 def _mint(args: argparse.Namespace) -> int:

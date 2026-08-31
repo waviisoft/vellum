@@ -55,7 +55,12 @@ import yaml
 
 from vellum.backpressure import NOT_A_RECORD, ledger_dir_for
 from vellum.config import ConfigError, config_path, load as load_config
-from vellum.ledger import SHA_RE
+# `parse_time` reads the ledger's own timestamps, and the ledger's lease
+# expiry reads them too. It is defined once, next to the `_now()` that
+# writes them, and re-exported here: two definitions of how this project
+# reads a recorded moment is how a spend window and a lease come to
+# disagree about when something happened.
+from vellum.ledger import SHA_RE, parse_time
 
 #: The escalation label an over-cap item is parked under
 #: (``.vellum/config.yaml`` ``labels.escalation``).
@@ -246,34 +251,6 @@ def window_for(period: str, as_of: datetime.datetime) -> tuple[datetime.datetime
     raise BudgetError(
         f"{period!r} is not a period this can measure over ({', '.join(PERIODS)})"
     )
-
-
-def parse_time(value) -> datetime.datetime | None:
-    """A record's ``approved``, as an aware UTC datetime, or None.
-
-    PyYAML turns an unquoted timestamp into a ``datetime`` before this is
-    reached, and ``vellum.ledger.dump`` writes a quoted string, so both arrive
-    here. A naive datetime is read as UTC: every time this file writes is UTC
-    (``ledger._now``), and guessing local would move a record across a period
-    boundary depending on where the guard ran.
-    """
-    if isinstance(value, datetime.datetime):
-        moment = value
-    elif isinstance(value, datetime.date):
-        moment = datetime.datetime(value.year, value.month, value.day)
-    elif isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return None
-        try:
-            moment = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
-        except ValueError:
-            return None
-    else:
-        return None
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=datetime.timezone.utc)
-    return moment.astimezone(datetime.timezone.utc)
 
 
 # ------------------------------------------------------------------- caps
