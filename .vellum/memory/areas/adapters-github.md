@@ -72,16 +72,23 @@ sat unfolded while a wave's worth of review happened here against files that
 were not what ran. If you must change the installed copy first to unbreak CI,
 fold it back in the same wave.
 
-**Measured again at the start of this wave, and they were still not identical.**
-waviisoft/vellum#5 folded the change back and dropped the note *upstream*, and
-recorded "the two sides are byte-identical" — but nobody removed the note from
-the installed copies, so both still carry a seven-line `INSTALLED COPY` header
-asking for a fold-back that has already happened. Only comments differ; the
-steps are the same. Two lessons, and the second is the one that costs: a
-fold-back is not done until the installed side is also edited, and **"they are
-identical now" is a claim with a short shelf life — run the `diff`, do not
-read the note.** The header is doubly stale as of this wave, since it explains
-itself by the private `spec` submodule, which no longer exists.
+**The `INSTALLED COPY` headers are gone, and this note about them was itself
+stale.** The history: waviisoft/vellum#5 folded the installed edits back and
+dropped the note *upstream*, recording "the two sides are byte-identical" while
+the installed copies still carried a seven-line `INSTALLED COPY` header. This
+paragraph then said so — and `waviisoft/vellum-intent#21` ("workflows: sync the
+installed copies with upstream adapters") fixed it, after which the paragraph
+went on asserting a drift that no longer existed.
+
+Measured at the start of *this* wave: `.github/workflows/spec-ci.yml` and
+`on-spec-merge.yml` in the intent repo were **byte-identical** to
+`adapters/github/` at vellum `main`, and neither carries the header.
+
+So the lesson survives its own example twice over: a fold-back is not done
+until the installed side is edited, and **"they are identical now" — or "they
+differ" — is a claim with a short shelf life. Run the `diff`, do not read the
+note.** This wave rewrites both upstream files; the architect syncs the
+installed copies at landing, and the `diff` is how you will know it happened.
 
 **The CLI is checked out, not `pip install`ed from its git URL, and that shape
 is load-bearing.** `waviisoft/vellum` is private, so the intent repo's own job

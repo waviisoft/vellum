@@ -200,6 +200,22 @@ class TestTheRewrite(PinCase):
         )
         self.assertEqual(line, f"  commit: {self.sha}")
 
+    def test_a_trailing_comment_on_the_pin_line_survives(self):
+        # The comments in this file are the documentation. Replacing a value
+        # while silently dropping the comment beside it is the loss the
+        # line-level edit exists to avoid, so it is asserted rather than
+        # assumed.
+        self.pin_file.write_text(
+            "pin:\n  commit: " + "c" * 40 + "  # the pin of record\n"
+            "  name: null  # decoration\n",
+            encoding="utf-8",
+        )
+        advance(self.product, self.sha, self.intent)
+        text = self.pin_file.read_text(encoding="utf-8")
+
+        self.assertIn(f"commit: {self.sha}  # the pin of record", text)
+        self.assertIn("name: null  # decoration", text)
+
     def test_advancing_to_the_pin_already_set_rewrites_nothing(self):
         advance(self.product, self.sha, self.intent)
         before = self.pin_file.read_text(encoding="utf-8")

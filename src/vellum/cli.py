@@ -223,11 +223,11 @@ def main(argv: list[str] | None = None) -> int:
     except LedgerError as exc:
         print(f"vellum: {exc}", file=sys.stderr)
         return 2
-    # A shallow clone, a ledger with no records, a window past its cap: the
-    # repository is the problem, not the command line, so these take lint's
-    # code rather than 2. `backpressure_run` returns 1 itself — being past the
-    # cap is an answer, not an error — and only reaches here when the window
-    # could not be measured at all.
+    # A shallow clone, an unreadable spec history, a checkout with no ledger:
+    # the repository is the problem, not the command line, so these take lint's
+    # code rather than 2. A window *past its cap* never arrives here —
+    # `backpressure_run` returns 1 for that itself, because being past the cap
+    # is an answer the command computed, not a failure to compute one.
     except MintError as exc:
         print(f"vellum: {exc}", file=sys.stderr)
         return 1

@@ -116,6 +116,10 @@ when only the ledger half was measured, rather than implying the whole window.
   that PR merges.
 - `vellum backpressure` against intent `main`: 11 of 3, BLOCKED, exit 1. This
   is the finding behind the `continue-on-error` hold.
+- The **installed workflow copies were byte-identical** to `adapters/github/`
+  at vellum `main`, and neither carries the `INSTALLED COPY` header that
+  `adapters-github.md` warned was still there — `waviisoft/vellum-intent#21`
+  removed them. That note about a stale note had itself gone stale.
 - The **ledger migration this file's sibling asked for is already done**
   (`waviisoft/vellum-intent#22`): eleven records, every filename a sha, no
   `spec_version: spec-v*` anywhere. Both `adapters/github/README.md` and

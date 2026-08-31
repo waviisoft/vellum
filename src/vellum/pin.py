@@ -82,8 +82,15 @@ PRODUCT_RELPATH = Path(".vellum") / "product.yaml"
 #: A top-level `pin:` key: column zero, no leading space.
 _PIN_BLOCK_RE = re.compile(r"^pin:\s*$")
 #: `  commit: <value>` / `  name: <value>` nested one level under it. The
-#: indent is captured so the rewritten line keeps the file's own.
-_FIELD_RE = re.compile(r"^(?P<indent>\s+)(?P<key>commit|name):(?P<rest>\s.*|\s*)$")
+#: indent is captured so the rewritten line keeps the file's own, and any
+#: trailing `# comment` is captured so the rewrite keeps that too — this file's
+#: comments are the documentation, and dropping one while replacing a value
+#: beside it is exactly the loss the line-level edit exists to avoid.
+_FIELD_RE = re.compile(
+    r"^(?P<indent>\s+)(?P<key>commit|name):"
+    r"(?P<value>[^#]*?)"
+    r"(?P<comment>\s+#.*)?$"
+)
 #: Any other key at column zero ends the pin block.
 _TOP_LEVEL_RE = re.compile(r"^[A-Za-z_][\w-]*:")
 
@@ -224,7 +231,7 @@ def _rewrite(text: str, commit: str, name: str | None) -> str:
             raise PinError(f"`pin.{key}` appears twice; refusing to guess which is the pin")
         seen[key] = i
         value = commit if key == "commit" else (name or "null")
-        lines[i] = f"{field.group('indent')}{key}: {value}"
+        lines[i] = f"{field.group('indent')}{key}: {value}{field.group('comment') or ''}"
 
     if "commit" not in seen:
         raise PinError("no `pin.commit` under the `pin:` block; this is not a pin file")
