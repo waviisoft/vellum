@@ -33,6 +33,16 @@ dependency_policy:
   lockfile_required: true
 """
 
+#: A `[dependency-groups]` array mixing a requirement string with a PEP 735
+#: `{include-group = "..."}` entry. Valid TOML that `tomllib` parses happily,
+#: which is the whole point: the reader that had the real parser was the one
+#: that dropped the array — the unlisted host in it included — and exited 0,
+#: while the 3.10 fallback refused the same file. Both readers refuse it now.
+MIXED_DEPENDENCY_GROUP = """[dependency-groups]
+test = ["evil @ https://evil.invalid/x.tar.gz", {include-group = "base"}]
+base = ["listed"]
+"""
+
 
 class DepsCase(unittest.TestCase):
     def setUp(self):
@@ -282,6 +292,22 @@ class TestTheTomlFallbackAgreesWithTheRealParser(DepsCase):
             _scan_toml_arrays(text, "pyproject.toml"), _from_parsed(tomllib.loads(text))
         )
 
+    def agree_refuses(self, text):
+        """Both readers refuse *text*, rather than one of them answering.
+
+        The other half of agreement, and the half that was missing: two readers
+        that return the same dict on every input either can read still disagree
+        if one of them *drops* what it cannot classify and the other raises.
+        ``agree`` above cannot see that, because the input it feeds is input
+        both readers accept.
+        """
+        import tomllib
+
+        with self.assertRaises(DependencyError):
+            _scan_toml_arrays(text, "pyproject.toml")
+        with self.assertRaises(DependencyError):
+            _from_parsed(tomllib.loads(text), "pyproject.toml")
+
     def test_on_this_repos_own_pyproject(self):
         self.agree(Path(__file__).resolve().parents[1].joinpath("pyproject.toml").read_text())
 
@@ -305,6 +331,90 @@ class TestTheTomlFallbackAgreesWithTheRealParser(DepsCase):
 
     def test_a_dependencies_key_outside_a_dependency_table_is_ignored_by_both(self):
         self.agree('[tool.other]\ndependencies = ["not-a-dependency"]\n')
+
+    def test_a_mixed_dependency_group_is_refused_by_both(self):
+        # The input that showed the two readers disagreeing in the dangerous
+        # direction. `{include-group = "..."}` is valid PEP 735 and tomllib
+        # parses this file without complaint, so the real parser handed back an
+        # array that `_from_parsed` then dropped *whole* — the string
+        # requirement beside it included — while the fallback raised.
+        self.agree_refuses(MIXED_DEPENDENCY_GROUP)
+
+    def test_a_non_string_in_an_every_key_table_is_refused_by_both(self):
+        # `project.optional-dependencies` is the other table where every key is
+        # a dependency list, so every key is held to the same rule.
+        self.agree_refuses('[project.optional-dependencies]\ndev = ["pytest", 7]\n')
+
+    def test_a_non_string_in_a_named_key_table_is_refused_by_both(self):
+        self.agree_refuses('[build-system]\nrequires = ["setuptools", false]\n')
+
+    def test_a_non_array_value_is_ignored_by_both_rather_than_refused(self):
+        # The rule is about an array's *contents*. A cared-about table may hold
+        # ordinary scalar keys — `[project]` always holds `name` and `version` —
+        # and the fallback simply does not match those lines, so neither reader
+        # may treat one as a dependency declaration it failed to read.
+        self.agree('[project]\nname = "app"\nversion = "0.1.0"\n')
+
+    def test_the_refusal_names_the_requirements_it_will_not_report_alone(self):
+        # Keeping the string elements is what makes the refusal actionable:
+        # they are the requirements a silent drop would have hidden, so the
+        # operator has to see them — here, the unlisted host itself.
+        import tomllib
+
+        with self.assertRaises(DependencyError) as caught:
+            _from_parsed(tomllib.loads(MIXED_DEPENDENCY_GROUP), "pyproject.toml")
+        self.assertIn("evil.invalid", str(caught.exception))
+        self.assertIn("include-group", str(caught.exception))
+
+
+class TestAMixedDependencyGroupEndToEnd(DepsCase):
+    """The whole command, on the tree that made the default interpreter fail open.
+
+    Deliberately not skipped below 3.11. Both readers refuse this file now, so
+    the assertion is the same on every interpreter — and a regression that put
+    the drop back on the 3.11 path would show up on the interpreter that
+    actually runs this guard, rather than only in the fallback-agreement class
+    that 3.10 skips.
+    """
+
+    def test_it_is_refused_rather_than_answered(self):
+        self.manifest("pyproject.toml", MIXED_DEPENDENCY_GROUP)
+        code, _ = run_cli(
+            ["verify", "deps", str(self.product), "--intent", str(self.intent)]
+        )
+        # 2, not 1: the guard could not read the manifest, which is "no answer".
+        # Not 0, which is what it used to give while never seeing evil.invalid.
+        self.assertEqual(code, 2)
+
+    def test_the_refusal_names_the_unlisted_host_it_would_have_dropped(self):
+        self.manifest("pyproject.toml", MIXED_DEPENDENCY_GROUP)
+        _, out = run_cli(
+            ["verify", "deps", str(self.product), "--intent", str(self.intent)]
+        )
+        self.assertIn("evil.invalid", out)
+
+    def test_check_raises_rather_than_reporting_a_shorter_answer(self):
+        self.manifest("pyproject.toml", MIXED_DEPENDENCY_GROUP)
+        with self.assertRaises(DependencyError):
+            self.check()
+
+    def test_the_same_file_with_the_group_spelled_as_strings_is_read_whole(self):
+        # The requirement is not "refuse dependency-groups"; it is "never
+        # report fewer than the file declares". Written as strings throughout,
+        # both entries are found and the unlisted host is the finding it
+        # always should have been.
+        self.manifest(
+            "pyproject.toml",
+            '[dependency-groups]\n'
+            'test = ["evil @ https://evil.invalid/x.tar.gz"]\n'
+            'base = ["listed"]\n',
+        )
+        result = self.check()
+        self.assertEqual(
+            {r.text for r in result.requirements},
+            {"evil @ https://evil.invalid/x.tar.gz", "listed"},
+        )
+        self.assertEqual([r.registry for r in result.offending], ["evil.invalid"])
 
 
 class TestTheTomlFallbackRefusesRatherThanUnderReporting(unittest.TestCase):

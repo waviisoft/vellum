@@ -41,6 +41,15 @@ reads the arrays it understands and **raises** the moment it meets anything
 inside the tables it cares about that it does not, so the failure is "no answer"
 (exit 2) rather than a shorter answer that reads like a pass. On 3.11 and up the
 real parser is used and the fallback is exercised against it in the tests.
+
+The two readers are held to the *same* strictness, not merely to the same
+answer on input both can read. Having the real parser meant ``_from_parsed``
+could have quietly dropped what it could not classify — and did, until a mixed
+``[dependency-groups]`` array showed the default interpreter passing a file the
+3.10 fallback refused. Wherever the fallback raises on the contents of an array
+in a table this cares about, ``_from_parsed`` raises too; a disagreement between
+them is only ever allowed to run in the direction of *more* refusals, never
+fewer requirements.
 """
 
 from __future__ import annotations
@@ -409,10 +418,21 @@ def _scan_toml_arrays(text: str, source: str) -> dict[str, list[str]]:
                 break
             item = _STRING_RE.match(rest)
             if item is None:
+                # The values read so far are named for the reason `_from_parsed`
+                # names its own: they are the requirements sitting in the array
+                # this will not read past, so they are exactly what a reader
+                # that skipped instead of raising would have hidden.
+                kept = ", ".join(repr(v) for v in values) or "(none)"
                 raise DependencyError(
                     f"{source}: [{table}] {key} contains {rest.split(',')[0]!r}, "
-                    f"which this reader cannot read as a string. Run this guard on "
-                    f"Python 3.11 or later, where the real TOML parser is used."
+                    f"which this reader cannot read as a string. It will not report "
+                    f"the {len(values)} requirement(s) it read before it ({kept}) as "
+                    f"though they were the whole array. If that element is TOML "
+                    f"string syntax this reader does not cover, run the guard on "
+                    f"Python 3.11 or later, where the real TOML parser is used; an "
+                    f"element that is genuinely not a string is refused there too, "
+                    f"because either reader would otherwise find fewer dependencies "
+                    f"than the file declares."
                 )
             raw_value = item.group("value")
             # A literal ('single-quoted') TOML string processes no escapes at
@@ -440,7 +460,7 @@ def read_pyproject(root: Path, path: Path) -> list[Requirement]:
             data = tomllib.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
             raise DependencyError(f"{source}: not valid TOML: {exc}") from exc
-        arrays = _from_parsed(data)
+        arrays = _from_parsed(data, source)
     else:  # pragma: no cover - 3.10 only
         arrays = _scan_toml_arrays(raw.decode("utf-8", "replace"), source)
     found: list[Requirement] = []
@@ -455,8 +475,23 @@ def read_pyproject(root: Path, path: Path) -> list[Requirement]:
     return found
 
 
-def _from_parsed(data: dict) -> dict[str, list[str]]:
-    """The same arrays ``_scan_toml_arrays`` finds, out of a parsed document."""
+def _from_parsed(data: dict, source: str = "pyproject.toml") -> dict[str, list[str]]:
+    """The same arrays ``_scan_toml_arrays`` finds, out of a parsed document.
+
+    Strict in the same place, and for the same reason. A parser that reads the
+    whole document is no help if this then *drops* what it cannot classify: an
+    array mixing a requirement string with a PEP 735 ``{include-group = "..."}``
+    entry is valid TOML, so ``tomllib`` hands it over intact, and admitting the
+    array only when every element is a string discarded the requirements in it
+    along with the table entry — the guard's one forbidden outcome, arrived at
+    on the *default* interpreter while the 3.10 fallback correctly refused the
+    same file.
+
+    So a non-string inside a table this cares about raises here too, and the
+    string elements are kept to be named in the refusal: the operator needs to
+    see which requirements were sitting in the array this will not read past,
+    since those are exactly the ones a silent drop would have hidden.
+    """
     out: dict[str, list[str]] = {}
     for table, wanted in _DEP_TABLES.items():
         node = data
@@ -469,8 +504,25 @@ def _from_parsed(data: dict) -> dict[str, list[str]]:
         for key, value in node.items():
             if wanted is not None and key not in wanted:
                 continue
-            if isinstance(value, list) and all(isinstance(v, str) for v in value):
-                out[f"{table}.{key}"] = list(value)
+            # A key whose value is not an array at all is left alone, which is
+            # what the fallback does with it: `_ARRAY_RE` simply does not match
+            # the line. Only an array's *contents* are held to the string rule.
+            if not isinstance(value, list):
+                continue
+            strings = [v for v in value if isinstance(v, str)]
+            if len(strings) != len(value):
+                other = next(v for v in value if not isinstance(v, str))
+                kept = ", ".join(repr(s) for s in strings) or "(none)"
+                raise DependencyError(
+                    f"{source}: [{table}] {key} contains {other!r}, which is not "
+                    f"a requirement string. This guard will not read past it and "
+                    f"report the {len(strings)} string requirement(s) beside it "
+                    f"({kept}) as though they were the whole array — that would "
+                    f"find fewer dependencies than the file declares, which is "
+                    f"the one answer this guard must never give. Declare every "
+                    f"requirement in this table as a string."
+                )
+            out[f"{table}.{key}"] = strings
     return out
 
 

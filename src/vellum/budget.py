@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import math
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -414,13 +415,29 @@ def _number(value) -> float:
     conservative direction here only because the item is still *listed*: the
     report shows it, so a cost that reads $0.00 next to 40 attempts is visible
     rather than absorbed.
+
+    ``.nan`` and ``.inf`` are unreadable in exactly that sense, and they reach
+    here as floats rather than as text, so the check above passes them through
+    untouched unless this says otherwise. NaN is the dangerous one: it poisons
+    the window's sum, and ``committed >= cap`` is *false* for NaN, so a single
+    ``cost.usd: .nan`` in a ledger record — which the threat model treats as
+    attacker-influenceable — turned the period cap off entirely while the
+    report still read OK. Both go to 0.0 rather than only NaN: a cost of
+    infinity is not a measurement either, ``int(float('nan'))`` raises where
+    ``attempts`` and ``tokens`` are read, and ``json.dumps`` spells both as
+    tokens (``NaN``, ``Infinity``) that are not valid JSON for the caller
+    reading ``--json``. Real spend is unaffected and still parks the queue; a
+    poisoned field lists at $0.00, which is what the paragraph above promises
+    for every other unreadable value.
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         try:
-            return float(str(value))
+            number = float(str(value))
         except (TypeError, ValueError):
             return 0.0
-    return float(value)
+    else:
+        number = float(value)
+    return number if math.isfinite(number) else 0.0
 
 
 def run(

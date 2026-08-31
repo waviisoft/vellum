@@ -35,14 +35,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from vellum.gitver import GitUnavailable, changed_paths, resolve
-from vellum.product import under
+from vellum.product import ProductFileError, normalise_tree, under
 
 #: Where a product repo's area notes live (``spec/features/memory-and-briefings.md``).
 AREAS_TREE = ".vellum/memory/areas"
 
 #: The tree exit duty is owed for, when the caller names none. ``src`` is what
 #: the scenario names and what ``product.trees`` lists in every product repo the
-#: installation has; ``--src`` exists for a repo laid out differently.
+#: installation has; ``--src`` exists for a repo laid out differently. Entries
+#: are normalised by ``product.normalise_tree`` before anything is compared
+#: against them, so a non-default layout cannot turn the guard off by naming a
+#: tree that matches nothing.
 DEFAULT_SOURCE_TREES = ("src",)
 
 
@@ -121,7 +124,20 @@ def check(
 ) -> ExitDuty:
     """Whether a branch that changed source also changed an area note."""
     path = Path(checkout)
-    trees = list(source_trees or DEFAULT_SOURCE_TREES)
+    # Normalised the way a write boundary is, and by the same function. These
+    # are an allowlist read the other way round — a path is source when it lies
+    # under one of them — so a malformed entry turns the guard *off* instead of
+    # widening it, which is quieter and therefore worse: `--src .` and
+    # `--src src/` both leave `under(p, tree)` false for every path in the diff,
+    # so exit duty is never owed and the run exits 0 looking configured.
+    # `normalise_tree` refuses the ones that name no tree and trims the rest.
+    try:
+        trees = [
+            normalise_tree(entry, path=path, where="--src")
+            for entry in (source_trees or DEFAULT_SOURCE_TREES)
+        ]
+    except ProductFileError as exc:
+        raise ExitDutyError(str(exc)) from exc
     if not path.is_dir():
         raise ExitDutyError(f"{path}: not a directory; is this a product checkout?")
     try:

@@ -705,9 +705,23 @@ pass incorrect ones. The mechanical half is enforced mechanically and the
 editorial half stays where `spec/features/memory-and-briefings.md` puts it: the
 verifier reviewing the memory diff. The report says which of the two it
 checked, so a green run is not misread. A path inside `AREAS_TREE` is never
-also counted as source, so an installation whose source tree is `.` — or one
-that lists `.vellum/memory` in `product.trees`, as this repo does — cannot make
-the memory diff satisfy itself.
+also counted as source, so an installation that lists `.vellum/memory` in
+`product.trees`, as this repo does, cannot make the memory diff satisfy itself.
+
+**`--src` goes through `normalise_tree()`, the same function a write boundary
+uses.** A source tree is an allowlist read the other way round — a path is
+source when it lies *under* one — so a malformed entry turns the guard **off**
+rather than widening it, and that is the quieter failure and therefore the
+worse one. `--src .` and `--src src/` both left `under(p, tree)` false for
+every path in the diff, so exit duty was never owed and the run exited 0 while
+looking configured; the default `--src` was fine, which is exactly why nothing
+noticed. Normalising trims `src/` and `./src/` to `src` and refuses `""`, `.`,
+`/` and `../..` as `ExitDutyError` (exit 2) — the same four `normalise_tree()`
+already refused for `verify boundaries`, for the same reason, now stated once
+in one function. `TestSourceTreesAreNormalised` covers them.
+`test_a_note_is_memory_first_and_never_also_source` used to pass `--src .` and
+so asserted nothing at all; it names `.vellum/memory` now, a tree that really
+does contain the note's path, so the memory-first rule is what does the work.
 
 **`ledger verify` scopes two checks to the record and three to the cut, because
 the spec's sentence does.** "The ledger guard fails a *release* whose chain does
@@ -774,6 +788,26 @@ stderr**, so `| jq` still parses a parked run — the property `suite extract -o
 already had, asserted directly by
 `test_a_parked_run_writes_nothing_but_json_to_stdout`.
 
+**A non-finite cost is unreadable, and `_number()` reads it as $0.00 like any
+other.** NaN was the exploitable one: it poisons the window's sum, and
+`committed >= cap` is *false* for NaN, so a single `cost.usd: .nan` in a ledger
+record — which the threat model treats as attacker-influenceable — turned the
+period cap off entirely while the report still read OK. $130 of real in-window
+spend against a $100 cap exited **0**. `inf` was never exploitable (it summed to
+inf and parked, which is fail-closed) but it was not a measurement either, and
+letting it through put a value no caller can use into the total, the report and
+`--json` — `json.dumps` spells the two `NaN` and `Infinity`, neither of which is
+JSON, so the stdout/stderr split above was being undone by the payload itself.
+`int(float('nan'))` also *raises*, where `attempts` and `tokens` are read, so an
+unreadable count there took the whole measurement down instead of listing the
+item. Both go to 0.0. Zero stays the conservative reading only because the item
+is still **listed** — the poisoned item appears in the report at $0.00 beside
+its attempts — and real spend is untouched and still parks the queue. Note the
+deliberate change of behavior: an `inf` record no longer parks on its own.
+`--projected` is a caller's number rather than repository data and is *not*
+coerced here; `--projected nan` is still an unguarded way to say "no cap", and
+is an invocation-surface question rather than this one.
+
 **`--projected` and `--pending` are the same idea twice.** Where a guard needs a
 number only a forge or a not-yet-built runner can supply, the caller passes it
 and the report says plainly when it was not supplied. `budget` cannot project a
@@ -788,10 +822,30 @@ about, a key whose value it cannot read *exactly* raises `DependencyError`
 (exit 2, "no answer") rather than being skipped into a shorter answer that reads
 like a pass. `TestTheTomlFallbackAgreesWithTheRealParser` asserts it against
 `tomllib` on 3.11+, including on this repo's own `pyproject.toml`. **Measured,
-not assumed:** the whole suite was run under a real `python3.10` — 458 tests,
+not assumed:** the whole suite was run under a real `python3.10` — 486 tests,
 green, with `TestReadingPyproject` executing through the fallback and only the
-five agreement tests skipping — and both readers return byte-identical
+twelve agreement tests skipping — and both readers return byte-identical
 requirement lists for this repo's `pyproject.toml` and `requirements.txt`.
+
+**The two TOML readers are held to the same *strictness*, not just to the same
+answer.** Having the real parser is what made `_from_parsed()` the *weaker* of
+the two: it admitted an array only when every element was a string and dropped
+it whole otherwise, so a `[dependency-groups]` list mixing a requirement with a
+valid PEP 735 `{include-group = "..."}` entry — TOML `tomllib` parses without
+complaint — took the string requirements down with it. `vellum verify deps`
+exited **0** on a tree declaring `evil @ https://evil.invalid/x.tar.gz`, on the
+*default* interpreter, while 3.10 refused the same file. Two readers that
+return equal dicts on every input both accept can still disagree like that, and
+`agree()` could not see it because the input it feeds is input both accept —
+`agree_refuses()` is the missing half. Both readers now raise on a non-string
+inside a table they care about, and both name the string requirements they read
+beside it, because those are exactly what a silent drop would have hidden. A
+cared-about table may still hold ordinary scalar keys (`[project]` always has
+`name` and `version`): the rule is about an array's *contents*, and a non-array
+value is ignored by both, which is what the fallback's `_ARRAY_RE` does anyway.
+`TestAMixedDependencyGroupEndToEnd` asserts the whole command on **every**
+interpreter rather than skipping below 3.11 — a regression that put the drop
+back would otherwise only show up in the class 3.10 skips.
 
 **Registry hosts are compared exactly, after parsing.** `host_of()` goes through
 `urlsplit().hostname` rather than a regex, so it strips userinfo and port:

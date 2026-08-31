@@ -84,11 +84,13 @@ class TestWhenNoDutyIsOwed(ExitDutyCase):
 
 class TestWhichTreesCount(ExitDutyCase):
     def test_a_note_is_memory_first_and_never_also_source(self):
-        # An installation whose source tree is `.` — or one that lists
-        # `.vellum/memory` in product.trees, as this very repo does — must not
-        # be able to let the memory diff satisfy itself.
+        # An installation that lists `.vellum/memory` in product.trees, as this
+        # very repo does, must not be able to let the memory diff satisfy
+        # itself. The source tree here genuinely contains the note's path, so
+        # the memory-first rule is what does the work — this was written as
+        # `--src .`, which matched nothing at all and so asserted nothing.
         self.implementation({".vellum/memory/areas/app.md": "# App\n\nrewritten\n"})
-        result = check(self.product, self.base, "HEAD", source_trees=["."])
+        result = check(self.product, self.base, "HEAD", source_trees=[".vellum/memory"])
         self.assertEqual(result.source_changed, [])
         self.assertEqual(result.memory_changed, [".vellum/memory/areas/app.md"])
         self.assertFalse(result.owed)
@@ -106,6 +108,67 @@ class TestWhichTreesCount(ExitDutyCase):
         )
         self.assertEqual(code, 1)
         self.assertIn("lib/thing.py", out)
+
+
+class TestSourceTreesAreNormalised(ExitDutyCase):
+    """``--src`` entries go through the same normaliser a write boundary does.
+
+    A source tree is an allowlist read the other way round — a path is source
+    when it lies *under* one — so a malformed entry turns the guard off rather
+    than widening it. That is the quieter failure and therefore the worse one:
+    the run exits 0, reports "no source changed", and looks configured.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.implementation({"src/billing/invoices.py": "def issue():\n    return None\n"})
+
+    def duty(self, *src):
+        argv = ["verify", "exit-duty", str(self.product), "--base", self.base,
+                "--head", "HEAD"]
+        for entry in src:
+            argv += ["--src", entry]
+        return run_cli(argv)
+
+    def test_a_trailing_slash_still_names_the_tree(self):
+        # `under(p, "src/")` is false for every path, so this exited 0 on a
+        # diff the same command exits 1 on when the slash is left off.
+        self.assertEqual(self.duty("src/")[0], 1)
+        self.assertEqual(check(self.product, self.base, "HEAD",
+                               source_trees=["src/"]).source_trees, ["src"])
+
+    def test_a_dot_is_refused_rather_than_matching_nothing(self):
+        # `.` reads as "the whole repo" and matches no path under a prefix
+        # test, which is the guard silently switched off. There is no safe
+        # default for "which tree did you mean", so it is refused: exit 2, the
+        # code every one of these guards uses for "no answer".
+        code, out = self.duty(".")
+        self.assertEqual(code, 2)
+        self.assertIn("admit every path", out)
+
+    def test_an_absolute_entry_is_refused(self):
+        self.assertEqual(self.duty("/src")[0], 2)
+
+    def test_an_entry_escaping_the_repository_is_refused(self):
+        self.assertEqual(self.duty("../..")[0], 2)
+
+    def test_an_empty_entry_is_refused(self):
+        self.assertEqual(self.duty("")[0], 2)
+
+    def test_a_refused_entry_raises_the_guards_own_error(self):
+        with self.assertRaises(ExitDutyError):
+            check(self.product, self.base, "HEAD", source_trees=["."])
+
+    def test_the_default_survives_normalisation(self):
+        self.assertEqual(
+            check(self.product, self.base, "HEAD").source_trees, ["src"]
+        )
+
+    def test_a_redundant_dot_segment_is_trimmed_rather_than_refused(self):
+        # `./src` names a tree perfectly well; only an entry naming *no* tree
+        # is refused. Normalising rather than rejecting keeps an honest caller
+        # working.
+        self.assertEqual(self.duty("./src/")[0], 1)
 
 
 class TestWhatItDoesNotClaim(ExitDutyCase):

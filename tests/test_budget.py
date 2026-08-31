@@ -324,6 +324,75 @@ class TestWhatIsCounted(BudgetCase):
         self.assertEqual(spend.spent, 0.0)
         self.assertEqual(len(spend.windowed), 1)
 
+    def poison(self, usd, text):
+        """Rewrite the second work item's recorded cost to *text*."""
+        self.spend(usd, issue=1)
+        self.spend(1.0, issue=2)
+        path = self.ledger / f"{SHAS[0]}.yaml"
+        path.write_text(
+            path.read_text().replace("usd: 1.0", f"usd: {text}"), encoding="utf-8"
+        )
+
+    def test_a_nan_cost_does_not_disable_the_period_cap(self):
+        # The exploitable one. NaN poisons the window's sum, and `committed >=
+        # cap` is *false* for NaN, so one `.nan` in a record the threat model
+        # treats as attacker-influenceable turned the cap off entirely: $130 of
+        # real spend against a $100 cap reported OK and exited 0.
+        self.poison(130.0, ".nan")
+        spend = measure(self.repo)
+        self.assertEqual(spend.spent, 130.0)
+        self.assertTrue(spend.queue_parked)
+        self.assertTrue(spend.parked)
+
+    def test_the_cli_parks_on_real_spend_beside_a_nan_record(self):
+        self.poison(130.0, ".nan")
+        code, out = run_cli(["budget", str(self.repo)])
+        self.assertEqual(code, 1)
+        self.assertIn("PARKED [queue]", out)
+        self.assertIn(PARK_MARKER, out)
+
+    def test_the_poisoned_item_is_listed_at_zero_rather_than_absorbed(self):
+        # Zero is only the conservative reading because the item still appears
+        # in the report — a cost that reads $0.00 next to its attempts is
+        # visible, which is what `_number` promises for every unreadable field.
+        self.poison(130.0, ".nan")
+        spend = measure(self.repo)
+        self.assertEqual(len(spend.windowed), 2)
+        self.assertEqual(sorted(i.usd for i in spend.windowed), [0.0, 130.0])
+
+    def test_an_inf_cost_is_read_the_same_way(self):
+        # `inf` was not exploitable — it summed to inf and parked — but it was
+        # not a measurement either, and leaving it through made the total, the
+        # report and `--json` all carry a value no caller can use. It lists at
+        # $0.00 like any other unreadable cost; the real spend beside it is
+        # what parks the queue.
+        self.poison(130.0, ".inf")
+        spend = measure(self.repo)
+        self.assertEqual(spend.spent, 130.0)
+        self.assertTrue(spend.queue_parked)
+
+    def test_a_non_finite_cost_leaves_json_parseable(self):
+        # `json.dumps` spells these `NaN` and `Infinity`, which are not JSON,
+        # so `vellum budget --json | jq` broke on exactly the records this
+        # guard exists to notice.
+        self.poison(130.0, ".nan")
+        code, out, _ = run_cli_streams(["budget", str(self.repo), "--json"])
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(out)["spent_usd"], 130.0)
+
+    def test_a_nan_attempts_count_does_not_take_the_run_down(self):
+        # `attempts` and `tokens` go through `int(_number(...))`, and
+        # `int(float('nan'))` raises — so an unreadable count there took the
+        # whole measurement down rather than listing the item.
+        self.spend(10.0, issue=1)
+        path = self.ledger / f"{SHAS[0]}.yaml"
+        path.write_text(
+            path.read_text().replace("attempts: 1", "attempts: .nan"), encoding="utf-8"
+        )
+        spend = measure(self.repo)
+        self.assertEqual(spend.spent, 10.0)
+        self.assertEqual(spend.windowed[0].attempts, 0)
+
     def test_releases_yaml_is_not_a_record(self):
         (self.ledger / "releases.yaml").write_text("cuts: []\n", encoding="utf-8")
         self.spend(10.0)

@@ -361,8 +361,10 @@ def _add_verify(sub) -> None:
         action="append",
         default=[],
         dest="source_trees",
-        help="source tree exit duty is owed for; repeatable "
-             f"(default: {', '.join(DEFAULT_SOURCE_TREES)})",
+        help="source tree exit duty is owed for, as a repo-relative path; "
+             "repeatable. An entry naming no tree ('.', '/', '') is refused "
+             "rather than read as 'everywhere', which would match nothing and "
+             f"turn the guard off (default: {', '.join(DEFAULT_SOURCE_TREES)})",
     )
 
 
