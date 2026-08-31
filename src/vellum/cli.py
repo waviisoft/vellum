@@ -1,9 +1,29 @@
 """``vellum`` — the v0.1 command line.
 
-Three commands, one per feature spec: ``lint`` (spec-pipeline), ``suite
-extract`` (scenarios-and-harness), ``ledger open|advance`` (ledger). Each
-returns a process exit code; failure detail goes to stderr and nothing else
-is printed on success beyond what was asked for.
+Commands, one per feature spec: ``lint`` (spec-pipeline), ``suite extract``
+(scenarios-and-harness), ``ledger open|advance`` (ledger), and the three
+pipeline commands the forge workflows are shims over — ``mint``,
+``backpressure`` and ``pin advance``. Each returns a process exit code; failure
+detail goes to stderr and nothing else is printed on success beyond what was
+asked for.
+
+Pipeline logic lives here rather than in a workflow body
+(``spec/features/spec-pipeline.md``): a forge job that holds logic can only be
+tested by running that forge, and the same logic in a command can be driven in
+a sandbox — which is what makes the pipeline's behavior a PASS-able property
+rather than a deployment one (``spec/features/scenarios-and-harness.md``).
+
+Exit codes, in the one place they are all visible:
+
+* ``0`` — it worked, or the command decided there was nothing to do.
+* ``1`` — the *tree, repo or window* is the problem: a fence that drops
+  scenarios, a shallow clone, a divergence window past its cap. Something a
+  caller should act on.
+* ``2`` — the *invocation* is the problem: the path is not a spec tree, the
+  sha is not a sha, the pin file is not a pin file.
+
+The split is load-bearing for a caller that has to tell a bad spec from a bad
+command line, so tests assert the number rather than "non-zero".
 """
 
 from __future__ import annotations
@@ -12,8 +32,13 @@ import argparse
 import sys
 
 from vellum import __version__
+from vellum.backpressure import BackpressureError
+from vellum.backpressure import run as backpressure_run
+from vellum.config import INTENT_ENV, ConfigError
 from vellum.ledger import LedgerError, advance, load_plan, open_record, parse_version
 from vellum.lint import run as lint_run
+from vellum.mint import MintError, mint as mint_run
+from vellum.pin import PinError, advance as pin_advance
 from vellum.specfile import SpecTreeError
 from vellum.suite import run as suite_run
 
@@ -75,7 +100,92 @@ def build_parser() -> argparse.ArgumentParser:
     adv.add_argument("--usd", type=float, default=0.0, help="usd to add to cost")
     adv.add_argument("--executor", help="executor that performed the work")
 
+    _add_mint(sub)
+    _add_backpressure(sub)
+    _add_pin(sub)
+
     return parser
+
+
+def _add_mint(sub) -> None:
+    m = sub.add_parser(
+        "mint",
+        help="open the ledger record for the spec version at a commit",
+        description=(
+            "The bookkeeping a spec merge leaves behind. Exits 0 and writes nothing "
+            "when the commit is not a spec version (a racing merge, a hand-run on a "
+            "ledger commit) or when a record already exists (a replay); read "
+            "`minted` from --emit to tell those apart. Refuses a shallow clone, "
+            "which makes all three of its answers wrong. Never tags and never "
+            "pushes: the decorative tag is annotated with an attacker-supplied "
+            "commit message and stays with the caller."
+        ),
+    )
+    m.add_argument("checkout", help="the intent repo checkout, or its spec tree")
+    m.add_argument("--ref", default="HEAD", help="the commit to mint (default: HEAD)")
+    m.add_argument("--ledger-dir", help="ledger directory (default: <repo>/ledger)")
+    m.add_argument("--spec-pr", type=int, help="the spec PR that was merged")
+    m.add_argument("--label", action="append", default=[], dest="labels")
+    m.add_argument(
+        "--commit",
+        action="store_true",
+        help="stage and commit the record under a fixed message; never pushes",
+    )
+    m.add_argument(
+        "--emit",
+        help="write `key=value` lines here (sha, minted, reason, name, baseline, "
+             "record, committed) — the shape a runner reads step outputs in",
+    )
+
+
+def _add_backpressure(sub) -> None:
+    b = sub.add_parser(
+        "backpressure",
+        help="count unshipped spec versions against the divergence cap",
+        description=(
+            "Exits 1 at or past the cap — landing one more version would put the "
+            "window past it — and 0 below, reporting the window either way. Counts "
+            "ledger records that are neither shipped nor superseded; approved-but-"
+            "unlanded spec PRs are forge state, so pass --pending to include them."
+        ),
+    )
+    b.add_argument("checkout", help="the intent repo checkout")
+    b.add_argument("--ledger-dir", help="ledger directory (default: <checkout>/ledger)")
+    b.add_argument(
+        "--cap",
+        type=int,
+        help="override budgets.divergence_cap from .vellum/config.yaml",
+    )
+    b.add_argument(
+        "--pending",
+        type=int,
+        default=0,
+        help="approved spec PRs not yet landed, counted alongside the ledger's",
+    )
+
+
+def _add_pin(sub) -> None:
+    pin = sub.add_parser("pin", help="the product repo's pin of record")
+    pin_sub = pin.add_subparsers(dest="pin_command", required=True)
+    adv = pin_sub.add_parser(
+        "advance",
+        help="move .vellum/product.yaml's pin.commit to a spec version",
+        description=(
+            "Checks the sha is a real spec version — a ledger record exists for it, "
+            "or it is a spec-touching commit in the intent checkout's first-parent "
+            "ancestry — then replaces pin.commit in place, leaving every comment and "
+            "every other field of the file exactly as it was. pin.name follows the "
+            "commit, since decoration that names a different version is worse than "
+            "none."
+        ),
+    )
+    adv.add_argument("product_checkout", help="the product repo checkout")
+    adv.add_argument("--to", required=True, help="the spec version to pin: a commit sha")
+    adv.add_argument(
+        "--intent",
+        help="an intent repo checkout to validate against "
+             f"(default: ${INTENT_ENV})",
+    )
 
 
 def _add_common_ledger_args(p: argparse.ArgumentParser) -> None:
@@ -96,13 +206,91 @@ def main(argv: list[str] | None = None) -> int:
             return suite_run(args.spec_dir, args.output)
         if args.command == "ledger":
             return _ledger(args)
+        if args.command == "mint":
+            return _mint(args)
+        if args.command == "backpressure":
+            return backpressure_run(
+                args.checkout,
+                ledger_dir=args.ledger_dir,
+                cap=args.cap,
+                pending=args.pending,
+            )
+        if args.command == "pin":
+            return _pin(args)
     except SpecTreeError as exc:
         print(f"vellum: {exc}", file=sys.stderr)
         return 2
     except LedgerError as exc:
         print(f"vellum: {exc}", file=sys.stderr)
         return 2
+    # A shallow clone, a ledger with no records, a window past its cap: the
+    # repository is the problem, not the command line, so these take lint's
+    # code rather than 2. `backpressure_run` returns 1 itself — being past the
+    # cap is an answer, not an error — and only reaches here when the window
+    # could not be measured at all.
+    except MintError as exc:
+        print(f"vellum: {exc}", file=sys.stderr)
+        return 1
+    except BackpressureError as exc:
+        print(f"vellum: {exc}", file=sys.stderr)
+        return 1
+    except ConfigError as exc:
+        print(f"vellum: {exc}", file=sys.stderr)
+        return 1
+    except PinError as exc:
+        print(f"vellum: {exc}", file=sys.stderr)
+        return 1
     return 2
+
+
+def _mint(args: argparse.Namespace) -> int:
+    result = mint_run(
+        args.checkout,
+        ref=args.ref,
+        ledger_dir=args.ledger_dir,
+        spec_pr=args.spec_pr,
+        labels=args.labels,
+        commit=args.commit,
+    )
+    print(result.report())
+    if args.emit:
+        _emit(args.emit, result.emit())
+    return 0
+
+
+def _emit(path: str, pairs: dict[str, str]) -> None:
+    """Append ``key=value`` lines to *path*, one per pair.
+
+    Appended rather than written, because the file a caller passes is usually a
+    runner's accumulating step-output file and truncating it would drop what
+    earlier steps wrote.
+
+    A value carrying a newline would forge a second key in that file, so it is
+    refused rather than escaped. Nothing this command computes can contain one
+    today — shas, ``spec-vN``, ``yes``/``no``, a path — which is exactly why
+    the check is cheap to keep and worth keeping before something that can is
+    added to the set.
+    """
+    bad = sorted(k for k, v in pairs.items() if "\n" in v or "\r" in v)
+    if bad:
+        raise MintError(f"refusing to emit {bad}: a value spanning lines would forge a key")
+    with open(path, "a", encoding="utf-8") as fh:
+        for key, value in pairs.items():
+            fh.write(f"{key}={value}\n")
+
+
+def _pin(args: argparse.Namespace) -> int:
+    import os
+
+    intent = args.intent or os.environ.get(INTENT_ENV)
+    if not intent:
+        # An invocation problem, not a repository one: nothing was pointed at.
+        raise SpecTreeError(
+            f"no intent checkout: pass --intent, or set {INTENT_ENV}. A pin names a "
+            f"spec version, and only the intent repo can say whether {args.to} is one."
+        )
+    print(pin_advance(args.product_checkout, args.to, intent).report())
+    return 0
 
 
 def _ledger(args: argparse.Namespace) -> int:

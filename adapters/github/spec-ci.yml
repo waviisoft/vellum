@@ -108,6 +108,14 @@ jobs:
       # The summary is written to $GITHUB_STEP_SUMMARY by hand rather than by
       # redirecting stdout, so that stdout stays free for the `::error`
       # annotation the failure needs.
+      #
+      # STILL A LOGIC BODY, DELIBERATELY — one of two left in this adapter (the
+      # other is issue filing in on-spec-merge.yml). It is not one of the three
+      # commands spec/features/spec-pipeline.md names as absorbing the workflow
+      # bodies, and the shape it would take — a reporting flag on `vellum suite
+      # extract` — is CLI surface no spec change has asked for. It reads
+      # `suite.json`, which the command already emits; it invents nothing and
+      # decides nothing the CLI has not already decided.
       - name: Summarise the suite
         run: |
           python - <<'PY'
@@ -204,18 +212,77 @@ jobs:
           echo "STUB: would post affected areas, predicted repos, size and risk"
 
   # =====================================================================
-  # ===================  STUB — NOT IMPLEMENTED (v0.2)  =================
-  # Backpressure: spec/features/spec-pipeline.md blocks approval past the
-  # configured cap of unshipped spec versions (divergence_cap in
-  # .vellum/config.yaml). Needs ledger/releases.yaml pointers, which the
-  # librarian maintains from v0.3.
-  # =====================================================================
+  # Backpressure — spec/features/spec-pipeline.md: "past the configured cap of
+  # unshipped spec versions, further spec merges are blocked until
+  # implementation catches up." This was a stub that echoed and exited 0; it is
+  # `vellum backpressure` now, which counts ledger records that are neither
+  # shipped nor superseded and exits non-zero at or past `budgets.divergence_cap`
+  # in .vellum/config.yaml. Scenario: `@id:backpressure-blocks-merge`.
+  #
+  # ------------------------------------------------------------------
+  # REPORTING, NOT YET BLOCKING — and this is one line to change.
+  #
+  # `continue-on-error: true` below is not caution about the command. It is a
+  # fact about the ledger it reads: nothing has ever set a record to `shipped`,
+  # because releases do not exist yet (`ledger/releases.yaml` carries
+  # `spec_conformed: null` and no cuts, and the release machinery is a later
+  # wave). So every record in the intent repo counts as unshipped — measured,
+  # not guessed: 11 records against a cap of 3 at the time this was written.
+  #
+  # Arming the gate before there is any way to relieve it would block every
+  # spec merge in the repository, including the one that lands the release
+  # machinery. That is not backpressure, it is a deadlock, and a red check
+  # nobody can clear is how a team learns to ignore red.
+  #
+  # So the check runs for real, reports for real, and does not block. **Delete
+  # the `continue-on-error` line to arm it** — once release pointers are
+  # maintained and shipped versions actually leave the window. Nothing else
+  # needs to change.
+  # ------------------------------------------------------------------
   backpressure:
-    name: Backpressure check (STUB)
+    name: Backpressure check (reporting only)
     runs-on: blacksmith-2vcpu-ubuntu-2204
     steps:
-      - name: Divergence cap (STUB — always passes)
+      - uses: actions/checkout@v4
+        with:
+          # The window is counted from `ledger/`, which a shallow clone has in
+          # full — but `fetch-depth: 0` stays, because it is the shape every
+          # job in this pipeline is checked out with and a per-job exception is
+          # how one of them ends up shallow by accident.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Require the VELLUM_TOKEN secret
+        env:
+          VELLUM_TOKEN: ${{ secrets.VELLUM_TOKEN }}
         run: |
-          echo "::warning title=Stub::backpressure check is not implemented (v0.2)"
-          echo "STUB: would compare spec_head to spec_conformed against divergence_cap"
-          echo "STUB: both are commits now, so 'above/below' is an ancestry test, not arithmetic"
+          if [ -z "$VELLUM_TOKEN" ]; then
+            echo "::error title=Missing secret::VELLUM_TOKEN must hold a token that can read waviisoft/vellum (private), the repo the CLI installs from"
+            exit 1
+          fi
+
+      - name: Check out the vellum CLI
+        uses: actions/checkout@v4
+        with:
+          repository: waviisoft/vellum
+          ref: ${{ env.VELLUM_REF }}
+          token: ${{ secrets.VELLUM_TOKEN }}
+          path: vellum-cli
+
+      - name: Install the vellum CLI
+        run: pip install --quiet ./vellum-cli
+
+      # Remove `continue-on-error` to make this block a merge. See above.
+      #
+      # `set -o pipefail` is load-bearing and not style: without it the step's
+      # status is `tee`'s, which is always 0, so deleting the
+      # `continue-on-error` line above would arm a gate that can never close.
+      # A guard that silently does nothing is worse than no guard.
+      - name: Divergence cap
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          vellum backpressure . | tee -a "$GITHUB_STEP_SUMMARY"

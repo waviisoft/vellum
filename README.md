@@ -156,6 +156,72 @@ workflow needs: the record either exists for this commit or it does not. Cost fl
 invocation records into the same work-item entry. Records default to `./ledger`;
 use `--ledger-dir` to point elsewhere.
 
+### `vellum mint <intent-checkout>`
+
+The bookkeeping a spec merge leaves behind: opens the ledger record for the
+version at a commit, in state `approved`, with the previous spec version as its
+baseline and a derived decorative name. This is what
+`adapters/github/on-spec-merge.yml` used to run as four shell steps
+(`spec/features/spec-pipeline.md`: pipeline logic lives in the CLI, workflow
+bodies are shims over it).
+
+```sh
+vellum mint .                                # report what it would record
+vellum mint . --ref "$GITHUB_SHA" --emit "$GITHUB_OUTPUT"
+vellum mint . --commit                       # also stage and commit; never pushes
+```
+
+**It exits 0 on both of its no-ops** — a commit whose diff does not touch the
+spec tree (a racing merge, a hand-run on a ledger commit), and a replay where a
+record already exists — because both are benign and the workflow step it
+replaced left the job green for both. **Read `minted` from `--emit`, not the
+exit code**, to decide whether to run the steps that are *not* idempotent:
+tagging, filing issues, pushing.
+
+`--emit <path>` appends `key=value` lines — `sha`, `minted`, `reason`, `name`,
+`baseline`, `record`, `committed` — which is the shape a runner reads step
+outputs in and plain enough for any other runner to read.
+
+A **shallow clone is refused** (exit 1): the first-parent walk is what decides
+whether the commit is a version, what it descends from and what to call it, and
+all three are wrong below the graft. It never tags and never pushes — the tag is
+annotated with the head commit message, which is attacker-supplied, so it stays
+in the workflow where it is passed through `env`.
+
+### `vellum backpressure <intent-checkout>`
+
+The divergence gate. Counts ledger records that are neither `shipped` nor
+`superseded` and compares them to `budgets.divergence_cap` in
+`.vellum/config.yaml`, reporting the window either way.
+
+```sh
+vellum backpressure .              # exit 1 at or past the cap, 0 below
+vellum backpressure . --cap 5      # ask a what-if without editing policy
+vellum backpressure . --pending 2  # plus approved spec PRs that have not landed
+```
+
+It blocks **at** the cap, not past it: the question is "may another version
+land". `--pending` exists because an open spec PR is forge state, not
+repository state — a caller that can see the forge supplies that count, and the
+report says plainly when only the ledger half was measured.
+
+### `vellum pin advance <product-checkout> --to <sha>`
+
+Moves this repo's pin of record. Checks first that the sha is a real spec
+version — a ledger record exists for it, or it is a spec-touching commit in the
+intent checkout's first-parent ancestry — then replaces `pin.commit` in
+`.vellum/product.yaml` in place, leaving every comment and every other field
+exactly as they were. `pin.name` follows the commit, since decoration naming a
+different version is worse than none.
+
+```sh
+vellum pin advance . --to 0e9f3f57fd94fa0cbbda6602da9a79c609e1c231 \
+    --intent ../vellum-intent          # or set VELLUM_INTENT_REPO
+```
+
+An intent checkout is required and there is no `--force`: a pin naming a
+non-version is the failure this command exists to prevent.
+
 ## Layout
 
 | Path | What |

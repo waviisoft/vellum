@@ -14,7 +14,7 @@ notes live in `.vellum/memory/areas/`; wave worklogs in `.vellum/memory/waves/`.
 
 ## Areas
 
-- [`.vellum/memory/areas/cli.md`](areas/cli.md) — `vellum lint`, `vellum suite extract`, `vellum ledger`.
+- [`.vellum/memory/areas/cli.md`](areas/cli.md) — `vellum lint`, `vellum suite extract`, `vellum ledger`, and the pipeline commands `vellum mint`, `vellum backpressure`, `vellum pin advance`.
 - [`.vellum/memory/areas/adapters-github.md`](areas/adapters-github.md) — the two GitHub Actions workflows.
 
 ## Waves
@@ -24,6 +24,7 @@ notes live in `.vellum/memory/areas/`; wave worklogs in `.vellum/memory/waves/`.
 - [`.vellum/memory/waves/spec-v3.md`](waves/spec-v3.md) — scenarios are self-contained; Backgrounds banned.
 - [`.vellum/memory/waves/spec-v6.md`](waves/spec-v6.md) — one Feature per fence; runnable scenarios; the PO/PA/CA hierarchy.
 - [`.vellum/memory/waves/versions-are-commits.md`](waves/versions-are-commits.md) — versions became commits, the pin became a file, minting shrank, `Rule:` banned.
+- [`.vellum/memory/waves/cli-absorbs-workflows.md`](waves/cli-absorbs-workflows.md) — the workflow bodies became `vellum mint`, `vellum backpressure`, `vellum pin advance`.
 
 Worklogs up to `spec-v6.md` are named for the version they landed at. This one
 is named for what it did, because a version's name is decoration now
