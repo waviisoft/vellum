@@ -166,7 +166,12 @@ def find_record(ledger_dir: str | Path, sha: str) -> Path | None:
     return matches[0][0] if matches else None
 
 
-def _now() -> str:
+def now() -> str:
+    """The moment this project writes into a record: ISO 8601, UTC, to the second.
+
+    Public because ``release.py`` stamps a cut with it. One definition of how a
+    moment is written is the same discipline that moved ``parse_time`` here from
+    ``budget.py`` — the reader and the writer must not come to disagree."""
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -176,7 +181,7 @@ def parse_time(value) -> datetime.datetime | None:
     PyYAML turns an unquoted timestamp into a ``datetime`` before this is
     reached, and ``vellum.ledger.dump`` writes a quoted string, so both arrive
     here. A naive datetime is read as UTC: every time this file writes is UTC
-    (``ledger._now``), and guessing local would move a record across a period
+    (``ledger.now``), and guessing local would move a record across a period
     boundary depending on where the guard ran.
     """
     if isinstance(value, datetime.datetime):
@@ -237,7 +242,7 @@ def new_record(
     return {
         "spec_version": sha,
         "name": name,
-        "approved": approved or _now(),
+        "approved": approved or now(),
         "spec_pr": spec_pr,
         "line": line,
         "baseline": baseline,
@@ -495,7 +500,7 @@ def new_certification(sha: str, result: str, run: str | None = None, at: str | N
     return {
         "sha": parse_certified_sha(sha),
         "run": run,
-        "at": at or _now(),
+        "at": at or now(),
         "result": result,
     }
 
@@ -599,7 +604,7 @@ def new_lease(executor: str, expires: str, taken: str | None = None) -> dict:
             f"(e.g. 2026-08-31T14:00:00Z). A lease with no readable expiry is "
             f"read as no lease, so writing one would silently claim nothing."
         )
-    return {"executor": str(executor).strip(), "taken": taken or _now(), "expires": expires}
+    return {"executor": str(executor).strip(), "taken": taken or now(), "expires": expires}
 
 
 def active_lease(item: dict, now: datetime.datetime | None = None) -> dict | None:

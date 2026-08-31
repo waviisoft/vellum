@@ -240,24 +240,48 @@ jobs:
   #
   # `continue-on-error: true` below is not caution about the command. It is a
   # fact about the ledger it reads: nothing has ever set a record to `shipped`,
-  # because releases do not exist yet (`ledger/releases.yaml` carries
-  # `spec_conformed: null` and no cuts, and the release machinery is a later
-  # wave). So every record in the intent repo counts as unshipped — measured,
-  # not guessed: 11 records against a cap of 3 at the time this was written.
+  # so every record in the intent repo counts as unshipped. Arming the gate
+  # before there is any way to relieve it would block every spec merge in the
+  # repository, including the one that lands the relief. That is not
+  # backpressure, it is a deadlock, and a red check nobody can clear is how a
+  # team learns to ignore red.
   #
-  # Arming the gate before there is any way to relieve it would block every
-  # spec merge in the repository, including the one that lands the release
-  # machinery. That is not backpressure, it is a deadlock, and a red check
-  # nobody can clear is how a team learns to ignore red.
+  # Wave F (waviisoft/vellum#14) built the relief and did NOT arm the gate,
+  # because the gate is still deadlocked. Re-measured on `main`, not carried
+  # over from the note above:
   #
-  # So the check runs for real, reports for real, and does not block. **Delete
-  # the `continue-on-error` line to arm it** — once release pointers are
-  # maintained and shipped versions actually leave the window. Nothing else
-  # needs to change.
+  #   * 14 records, every one of them `approved`, against a cap of 3.
+  #     `vellum backpressure . --strict` exits 1 with "Divergence window: 14 of 3".
+  #   * `ledger/releases.yaml` still has `cuts: []` and
+  #     `channels.production.spec_conformed: null`. A cut relieves the window —
+  #     `vellum release cut --suite-result green` writes `state: shipped` onto
+  #     every wave it names — but no cut has been recorded here, and this wave
+  #     lands in the *product* repo, which holds no intent-repo credentials and
+  #     so cannot record one.
+  #   * A green cut over the ledger as it stands is REFUSED anyway, and that is
+  #     the sharper half: `release cut` will not promote a wave whose record has
+  #     not reached `verified` or `shipped`, because promotion writes `shipped`
+  #     — one of `chain.CERTIFIABLE_STATES` — and a cut that shipped an
+  #     `approved` wave would satisfy `vellum ledger verify`'s own
+  #     `uncertified-wave` check by having been made. All 14 records are
+  #     `approved`, so the refusal fires on all 14.
   #
-  # Arming is TRACKED, not merely intended: `waviisoft/vellum-intent#41`
-  # schedules it into Wave F, behind the release machinery that has to exist
-  # first. This comment is not the only record of the hold.
+  # So relief needs two things that are the orchestrator's and not this repo's:
+  # the records advancing to `verified`, and a cut recorded on the intent repo.
+  # Both were verified to work, on a scratch clone of this repo's own main: with
+  # the 14 records advanced to `verified`, one `vellum release cut --channel
+  # production --suite-result green` naming all 14 takes the window from
+  # "14 of 3, BLOCKED" to "0 of 3, OK" and moves `spec_conformed` to a60b3195.
+  #
+  # So the check goes on running for real, reporting for real, and not blocking.
+  # **Delete the `continue-on-error` line to arm it** — once a real cut has been
+  # recorded and `vellum backpressure . --strict` exits 0 against this repo's
+  # `main`. Run it first; do not arm on the strength of this comment. Nothing
+  # else needs to change.
+  #
+  # Arming is TRACKED, not merely intended: `waviisoft/vellum-intent#41` stays
+  # OPEN, now behind a recorded cut rather than behind the machinery to record
+  # one. This comment is not the only record of the hold.
   # ------------------------------------------------------------------
   backpressure:
     name: Backpressure check (reporting only)

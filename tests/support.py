@@ -326,6 +326,14 @@ write_boundaries:
 """
 
 
+#: The product map a real intent repo carries. `core` matches waviisoft/vellum's
+#: own `product.name`, so a fixture cut pins the product this repo *is*.
+WORKSPACE = """intent: waviisoft/vellum-intent
+products:
+  core: {repo: waviisoft/vellum, trees: [src, .vellum/memory]}
+"""
+
+
 def make_intent_repo(root: Path, cap: int = 3) -> Path:
     """A sandbox intent repo: git, a ``spec/`` tree, a config, a ledger.
 
@@ -337,6 +345,11 @@ def make_intent_repo(root: Path, cap: int = 3) -> Path:
     make_spec_repo(root)
     (root / ".vellum").mkdir(parents=True, exist_ok=True)
     (root / ".vellum" / "config.yaml").write_text(CONFIG.format(cap=cap), encoding="utf-8")
+    # The products a release cut may pin. Real intent repos carry this
+    # (spec/features/repo-topology.md maps the products here), and
+    # `vellum release cut` reads it as an allowlist rather than trusting the
+    # product name it was handed, so a sandbox without one is not one.
+    (root / ".vellum" / "workspace.yaml").write_text(WORKSPACE, encoding="utf-8")
     (root / "ledger").mkdir(exist_ok=True)
     return root
 
@@ -527,12 +540,25 @@ def write_suite(ledger: Path, sha: str, scenarios) -> Path:
     return path
 
 
-def write_releases(ledger: Path, cuts=(), spec_head: str | None = None) -> Path:
+def write_releases(
+    ledger: Path,
+    cuts=(),
+    spec_head: str | None = None,
+    spec_conformed: str | None = None,
+    channels: dict | None = None,
+) -> Path:
     """A ``ledger/releases.yaml`` whose ``cuts`` name *cuts*.
 
     Each entry may be a sha (written as ``{wave: <sha>}``, the shape the intent
     repo's harness builds) or a mapping written through as-is, for the tests
     whose subject is a malformed cut.
+
+    *spec_conformed* sets the production channel's pointer — the input the
+    armed/enforced partition reads. *channels* replaces the whole mapping, for
+    the tests whose subject is a channel that is not declared. The real file has
+    ``spec_conformed: null``, which is why None is the default: a fixture that
+    quietly conformed to something would make every partition test agree with a
+    world the installation is not in.
     """
     import yaml
 
@@ -543,7 +569,11 @@ def write_releases(ledger: Path, cuts=(), spec_head: str | None = None) -> Path:
         yaml.safe_dump(
             {
                 "spec_head": spec_head,
-                "channels": {"production": {"spec_conformed": None}},
+                "channels": (
+                    channels
+                    if channels is not None
+                    else {"production": {"spec_conformed": spec_conformed}}
+                ),
                 "cuts": entries,
                 "stamps": {},
             },

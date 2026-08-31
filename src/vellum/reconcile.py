@@ -118,6 +118,7 @@ from vellum.ledger import (
     parse_time,
     upsert_plan,
 )
+from vellum.text import one_line
 
 #: Record states a version has left the reconciler's attention in. The same two
 #: ``vellum.backpressure`` counts as settled, for the same reason: one shipped,
@@ -192,14 +193,8 @@ class TickError(Exception):
 #: carrying a newline starts a line of its own and a line of its own is all
 #: ``::add-mask`` needs. Every string this module prints that came from outside
 #: it (an executor name, a question, a briefing, a path in an observed-state
-#: file) goes through ``_one_line`` first.
-_WHITESPACE_RUN = re.compile(r"\s+")
-
-
-def _one_line(value, limit: int = 120) -> str:
-    """*value* as one short line: whitespace collapsed, then truncated."""
-    text = _WHITESPACE_RUN.sub(" ", str(value if value is not None else "")).strip()
-    return text if len(text) <= limit else text[: limit - 1] + "…"
+#: file) goes through ``one_line`` first, which lives in ``vellum.text`` because
+#: ``release.py`` needs the same rule and two spellings of it would drift.
 
 
 # ------------------------------------------------------------------ actions
@@ -309,14 +304,14 @@ class Tick:
         lines.append("")
         if self.written:
             lines.append(
-                f"Ledger files written: {', '.join(_one_line(n, 80) for n in self.written)}"
+                f"Ledger files written: {', '.join(one_line(n, 80) for n in self.written)}"
             )
             lines.append("")
         elif self.dry_run and any(a.taken for a in self.actions):
             lines.append("--dry-run: nothing was written.")
             lines.append("")
         if self.unreadable:
-            # `_one_line` for the reason every other outside string in this
+            # `one_line` for the reason every other outside string in this
             # report gets it: a ledger filename is written by whoever can land a
             # merge on the intent repo, git permits a newline in one, and the
             # `*.yaml` glob matches across it — so an unnarrowed name puts a
@@ -324,7 +319,7 @@ class Tick:
             lines.append(
                 f"{len(self.unreadable)} file(s) in the ledger could not be read as "
                 f"records and were not reconciled: "
-                f"{', '.join(_one_line(n, 80) for n in self.unreadable)}"
+                f"{', '.join(one_line(n, 80) for n in self.unreadable)}"
             )
             lines.append("")
         for note in self.notes:
@@ -699,7 +694,7 @@ def _conformed_baseline(ledger: Path, channel: str) -> tuple[str | None, str]:
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError) as exc:
-        return None, f"{path.name} could not be read: {_one_line(exc)}"
+        return None, f"{path.name} could not be read: {one_line(exc)}"
     channels = (data or {}).get("channels") if isinstance(data, dict) else None
     entry = channels.get(channel) if isinstance(channels, dict) else None
     value = entry.get("spec_conformed") if isinstance(entry, dict) else None
@@ -751,7 +746,7 @@ class _Reconciler:
     # ------------------------------------------------------------- helpers
 
     def act(self, kind: str, version: str, item: int | None, detail: str) -> None:
-        self.actions.append(Action(kind, version, item, _one_line(detail)))
+        self.actions.append(Action(kind, version, item, one_line(detail)))
 
     def touched(self, sha: str) -> None:
         self.dirty.add(sha)
@@ -793,8 +788,8 @@ class _Reconciler:
         if held is not None:
             self.act(
                 "hold", sha, item.get("issue"),
-                f"claimed by {_one_line(held.get('executor'), 40)} until "
-                f"{_one_line(held.get('expires'), 40)}; not re-dispatched",
+                f"claimed by {one_line(held.get('executor'), 40)} until "
+                f"{one_line(held.get('expires'), 40)}; not re-dispatched",
             )
             return False
         if self.executor is None:
@@ -819,7 +814,7 @@ class _Reconciler:
         self.act(
             "dispatch", sha, item.get("issue"),
             "spawn a fresh run"
-            + (f" with the briefing: {_one_line(briefing, 60)}" if briefing else ""),
+            + (f" with the briefing: {one_line(briefing, 60)}" if briefing else ""),
         )
         return True
 
@@ -871,8 +866,8 @@ class _Reconciler:
                 continue
             self.act(
                 "file-issue", sha, issue,
-                f"{_one_line(item.get('title') or 'untitled', 60)} "
-                f"({_one_line(item.get('repo') or 'no repo', 30)})"
+                f"{one_line(item.get('title') or 'untitled', 60)} "
+                f"({one_line(item.get('repo') or 'no repo', 30)})"
                 + ("" if self.observed.supplied else " — no observed issues were supplied"),
             )
 
@@ -944,13 +939,13 @@ class _Reconciler:
                     self.touched(sha)
                     self.act(
                         "record-direction", sha, issue,
-                        f"briefing updated: {_one_line(briefing, 60)}",
+                        f"briefing updated: {one_line(briefing, 60)}",
                     )
                 held = active_lease(item, now=self.now)
                 if held is not None:
                     self.act(
                         "hold", sha, issue,
-                        f"a run holds this item until {_one_line(held.get('expires'), 40)}; "
+                        f"a run holds this item until {one_line(held.get('expires'), 40)}; "
                         f"there is no mid-run channel, so the lease is left to lapse and "
                         f"a fresh run will carry the new briefing",
                     )
@@ -1036,14 +1031,14 @@ class _Reconciler:
             if answer is not None:
                 self.act(
                     "answer-question", version, item,
-                    f"answered from the corpus: {_one_line(answer.reference, 80)} "
+                    f"answered from the corpus: {one_line(answer.reference, 80)} "
                     f"(carries {len(answer.matched)}/{len(answer.terms)} of the "
                     f"question's terms) — reply with the reference and open no issue",
                 )
                 continue
             self.act(
                 "open-question", version, item,
-                f"the corpus does not answer {_one_line(question, 60)!r}; open a "
+                f"the corpus does not answer {one_line(question, 60)!r}; open a "
                 f"question issue mentioning the owner and park the item",
             )
             if item is not None:
@@ -1188,7 +1183,7 @@ def reconcile(
     engine.notes.extend(notes)
     if executor is not None:
         engine.notes.append(
-            f"Claims are taken for {_one_line(executor, 40)} and last "
+            f"Claims are taken for {one_line(executor, 40)} and last "
             f"{lease_minutes} minute(s). No spec sentence or config key gives a lease "
             f"duration, so that number is this command's, not the installation's."
         )

@@ -106,13 +106,36 @@ as permission to "simplify" this back into a one-line pip install.
 
 **Backpressure is real now and deliberately not blocking.** `vellum
 backpressure` counts records that are neither `shipped` nor `superseded`, and
-nothing has ever set a record to `shipped` because releases do not exist yet
-(`ledger/releases.yaml`: `spec_conformed: null`, no cuts). So every record
-counts as unshipped — measured, 11 against a cap of 3. Arming the gate in that
-state blocks every spec merge in the repository, including the one that would
-land the release machinery: a deadlock, not backpressure. The step carries
-`continue-on-error: true` and reports into the job summary; **delete that one
-line to arm it** once shipped versions actually leave the window.
+nothing has ever set a record to `shipped`. So every record counts as
+unshipped. Arming the gate in that state blocks every spec merge in the
+repository, including the one that would land the relief: a deadlock, not
+backpressure. The step carries `continue-on-error: true` and reports into the
+job summary; **delete that one line to arm it**.
+
+**Wave F built the relief and did not arm the gate, and the reason moved
+rather than went away.** `vellum release cut` exists now and a promoted cut
+*does* take versions out of the window — verified on a scratch clone of intent
+`main`: with the records advanced to `verified`, one cut naming all 14 takes
+`vellum backpressure . --strict` from "14 of 3, BLOCKED" to "0 of 3, OK". What
+is missing is not machinery any more, it is a **recorded cut**, and two things
+stand between:
+
+- `ledger/releases.yaml` on intent `main` still reads `cuts: []` and
+  `channels.production.spec_conformed: null`. A cut has to be *recorded there*,
+  and a wave landing in this product repo cannot record one — an implementer
+  holds no intent-repo credentials (`spec/features/repo-topology.md`).
+- Every one of the 14 records is `approved`, and `release cut` refuses to
+  promote a wave that has not reached `verified` or `shipped`. That refusal is
+  not fussiness: promotion writes `shipped`, which is one of
+  `chain.CERTIFIABLE_STATES`, so a cut shipping an `approved` wave would satisfy
+  `vellum ledger verify`'s own `uncertified-wave` check by having been made.
+
+So `waviisoft/vellum-intent#41` stays OPEN, re-scoped from "wait for the release
+machinery" to "wait for a recorded cut". The arming condition is a command, not
+a judgement: arm when `vellum backpressure . --strict` exits 0 against intent
+`main`. **Run it; do not read this note.** The measurement above was 11 records
+when it was first written and is 14 now, which is the whole argument for
+re-running rather than re-reading.
 
 `set -o pipefail` in that step is load-bearing, not style. Without it the step
 takes `tee`'s status, which is always 0, so deleting `continue-on-error` would
