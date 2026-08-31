@@ -2,12 +2,12 @@
 
 Commands, one per feature spec: ``lint`` (spec-pipeline), ``suite extract``
 (scenarios-and-harness), ``ledger open|advance`` and ``certify record|check``
-(ledger, certification-and-releases), the three pipeline commands the forge
-workflows are shims over — ``mint``, ``backpressure`` and ``pin advance`` — and
-the mechanical guards: ``verify boundaries``, ``verify deps``, ``verify
-exit-duty``, ``ledger verify`` and ``budget``. Each returns a process exit code;
-failure detail goes to stderr and nothing else is printed on success beyond what
-was asked for.
+(ledger, certification-and-releases), ``tick`` (orchestration,
+question-protocol), the three pipeline commands the forge workflows are shims
+over — ``mint``, ``backpressure`` and ``pin advance`` — and the mechanical
+guards: ``verify boundaries``, ``verify deps``, ``verify exit-duty``, ``ledger
+verify`` and ``budget``. Each returns a process exit code; failure detail goes to
+stderr and nothing else is printed on success beyond what was asked for.
 
 A guard is a command that reads neutral inputs — a checkout, two refs, a role —
 and answers one question about them. None of them writes anything, and none of
@@ -15,6 +15,12 @@ them reaches a forge: where a guard needs a number only a forge or a
 not-yet-built runner can supply, the caller passes it (``backpressure
 --pending``, ``budget --projected``) and the report says plainly when it was not
 supplied.
+
+``tick`` is the one command here that *writes* and is not a pipeline shim, and it
+keeps the same division rather than escaping it: desired state is the checkout it
+is pointed at, observed state is ``--observed``, and every forge action it
+reaches is emitted for the caller instead of performed. Ledger writes are its
+own, because the ledger is repository state.
 
 Pipeline logic lives here rather than in a workflow body
 (``spec/features/spec-pipeline.md``): a forge job that holds logic can only be
@@ -27,11 +33,12 @@ Exit codes, in the one place they are all visible:
 * ``0`` — it worked, or the command decided there was nothing to do.
 * ``1`` — the command answered, and the answer is bad news: a fence that drops
   scenarios, a shallow clone, a divergence window at its cap, a head no green
-  certification covers.
+  certification covers, a wave parked past the question timebox.
 * ``2`` — the command could not answer: the path is not a spec tree, the sha is
   not a sha, the pin file is not a pin file, the config has no cap, a ``--ref``
   names no commit, ``--emit`` was handed an empty path, ``certify`` was pointed
-  at a checkout with no ledger or named a work item that is not in the record.
+  at a checkout with no ledger or named a work item that is not in the record,
+  ``tick`` was handed observed state in a shape it could not read.
 
 The line is between *an answer you will not like* and *no answer*, and it is
 load-bearing for ``vellum backpressure`` in particular: the moment its
@@ -83,6 +90,8 @@ from vellum.ledger import (
 from vellum.lint import run as lint_run
 from vellum.mint import MintError, mint as mint_run
 from vellum.pin import PinError, advance as pin_advance
+from vellum.reconcile import DEFAULT_CORPUS_MATCH, DEFAULT_LEASE_MINUTES, TickError
+from vellum.reconcile import run as tick_run
 from vellum.specfile import SpecTreeError
 from vellum.suite import run as suite_run
 
@@ -166,6 +175,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     _add_certify(sub)
+    _add_tick(sub)
     _add_mint(sub)
     _add_backpressure(sub)
     _add_pin(sub)
@@ -249,6 +259,97 @@ def _add_certify_common(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument("--item", type=int, required=True, help="work item issue number")
     p.add_argument("--ledger-dir", help="ledger directory (default: <checkout>/ledger)")
+
+
+def _add_tick(sub) -> None:
+    """``tick`` — one pass of the stateless reconciler.
+
+    The only *writing* command here that is not a pipeline shim, and the split
+    that keeps it honest is the one every guard already uses: desired state is
+    the checkout it is pointed at, and observed state — the forge half — is
+    supplied by the caller through ``--observed``, the way ``backpressure
+    --pending`` and ``certify check --head`` are. A tick reaches no forge, so
+    every forge action it reaches is *emitted* for the caller and every ledger
+    write is performed.
+    """
+    t = sub.add_parser(
+        "tick",
+        help="run one reconciler pass over an intent checkout",
+        description=(
+            "Reads desired state (ledger records, the spec tree, releases.yaml) "
+            "and observed state (--observed, supplied by a caller that can see the "
+            "forge), computes the convergent next actions idempotently, and takes "
+            "the ledger half of them: commits a work plan, marks coalesced items "
+            "superseded, claims an item under a lease, records new direction as a "
+            "briefing. Forge actions — file an issue, open or close a question, "
+            "draft a spec:clarify PR, spawn a run — are reported for the caller and "
+            "never performed. Exits 1 when a wave is parked past the question "
+            "timebox, and 0 otherwise; running it twice over an unchanged world "
+            "writes nothing the second time."
+        ),
+    )
+    t.add_argument("checkout", help="the intent repo checkout")
+    t.add_argument("--ledger-dir", help="ledger directory (default: <checkout>/ledger)")
+    t.add_argument(
+        "--observed",
+        help="YAML file of observed forge state: issues, questions, raised, "
+             "directions. Absent means nothing was seen, which the report "
+             "distinguishes from nothing being there",
+    )
+    t.add_argument(
+        "--plan",
+        help="workplan.yaml to commit into the record named by --version, the way "
+             "`ledger advance --plan` does",
+    )
+    t.add_argument(
+        "--version",
+        help="reconcile only the record this sha names (required with --plan)",
+    )
+    t.add_argument(
+        "--executor",
+        help="the executor a claim is taken for. Without it a ready item is "
+             "reported as dispatchable and no lease is written, since a lease "
+             "names its holder",
+    )
+    t.add_argument(
+        "--lease-minutes",
+        type=int,
+        default=DEFAULT_LEASE_MINUTES,
+        help=f"how long a claim lasts (default: {DEFAULT_LEASE_MINUTES}). No spec "
+             f"sentence and no config key gives a lease duration, so this number is "
+             f"the command's own and the report says so",
+    )
+    t.add_argument(
+        "--timebox-hours",
+        type=float,
+        help="override questions.timebox_hours from .vellum/config.yaml",
+    )
+    t.add_argument(
+        "--corpus-match",
+        type=float,
+        default=DEFAULT_CORPUS_MATCH,
+        help=f"fraction of a question's significant terms a corpus document must "
+             f"carry before the question is answered mechanically rather than "
+             f"escalated (default: {DEFAULT_CORPUS_MATCH}, i.e. all of them). The "
+             f"spec states the duty and not the rule, so this is a knob and the "
+             f"default is the strictest setting",
+    )
+    t.add_argument(
+        "--channel",
+        default="production",
+        help="release channel whose spec_conformed is the baseline to plan against",
+    )
+    t.add_argument(
+        "--now",
+        help="reconcile as of this ISO 8601 moment (default: now, UTC). Lease "
+             "expiry and the question timebox are both read against it",
+    )
+    t.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="compute the actions and write nothing",
+    )
+    t.add_argument("--json", action="store_true", help="emit the tick as JSON")
 
 
 def _add_mint(sub) -> None:
@@ -477,6 +578,8 @@ def main(argv: list[str] | None = None) -> int:
             return _ledger(args)
         if args.command == "certify":
             return _certify(args)
+        if args.command == "tick":
+            return _tick(args)
         if args.command == "mint":
             return _mint(args)
         if args.command == "backpressure":
@@ -521,10 +624,47 @@ def main(argv: list[str] | None = None) -> int:
     # broken chain link and a parked queue are all 1, and 1 is what a workflow
     # blocks a merge on; a mistyped `--role` reaching a caller as "this PR wrote
     # outside its trees" would be a red nobody can find the cause of.
-    except (BoundaryError, ChainError, BudgetError, DependencyError, ExitDutyError) as exc:
+    except (BoundaryError, ChainError, BudgetError, DependencyError, ExitDutyError,
+            TickError) as exc:
         print(f"vellum: {exc}", file=sys.stderr)
         return 2
     return 2
+
+
+def _tick(args: argparse.Namespace) -> int:
+    now = None
+    if args.now:
+        now = parse_time(args.now)
+        if now is None:
+            # The same refusal `budget --as-of` makes, for the same reason: the
+            # caller asked to reconcile at a moment and named none this can find.
+            # Reconciling at "now" instead would resolve every lease and every
+            # timebox against a clock nobody asked about.
+            raise TickError(
+                f"--now {args.now!r} is not an ISO 8601 moment "
+                f"(e.g. 2026-08-31T00:00:00Z)"
+            )
+    if args.plan is not None and not args.version:
+        raise TickError(
+            "--plan needs --version: a work plan is produced for one approved "
+            "version, and committing it into every open record would file the same "
+            "work several times."
+        )
+    return tick_run(
+        args.checkout,
+        ledger_dir=args.ledger_dir,
+        observed=args.observed,
+        plan=load_plan(args.plan) if args.plan else None,
+        version=args.version,
+        executor=args.executor,
+        lease_minutes=args.lease_minutes,
+        timebox_hours=args.timebox_hours,
+        channel=args.channel,
+        corpus_match=args.corpus_match,
+        now=now,
+        dry_run=args.dry_run,
+        as_json=args.json,
+    )
 
 
 def _certify(args: argparse.Namespace) -> int:
