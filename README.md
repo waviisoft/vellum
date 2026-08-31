@@ -100,14 +100,23 @@ the checkout does not contain cannot affect it, however new. Decorative names
 are reported alongside every sha (`version_name`, `spec_version_name`) and read
 for nothing.
 
-**A tree `vellum lint` rejects does not extract.** A `gherkin` fence that fails
-to parse exits 1 and writes nothing, naming each failing block on stderr —
-`<file>:<line>: gherkin block at line <n> does not parse: …`, the same blocks
-lint reports as `GH001`. There is no partial-extraction flag: the scenarios in
-a broken block are exactly the ones a consumer of `suite.json` cannot see are
-missing, so a smaller suite is never emitted in place of an error. Dating is
-the one place a broken block is still skipped, because it reads commits that
-are already in the past and nobody can go back and fix them.
+**A tree that would yield a short suite does not extract.** Two constructs cost
+the suite scenarios, and either one exits 1 and writes nothing, naming each
+block on stderr: a `gherkin` fence that fails to parse (`<file>:<line>: gherkin
+block at line <n> does not parse: …`, which lint reports as `GH001`), and a
+`Rule:`, whose nested scenarios are not admitted (`… nests <n> scenario(s)
+under a banned Rule (…)`, lint's `GH010`). There is no partial-extraction flag:
+those scenarios are exactly the ones a consumer of `suite.json` cannot see are
+missing, so a smaller suite is never emitted in place of an error. Every word
+of a refusal goes to stderr, so `extract … -o - | jq` sees an empty stream, and
+an existing output file is left exactly as it was.
+
+**It is not a second `lint`.** The refusal is scoped to that harm and no wider:
+a tree lint rejects for an unresolved link, a missing `@id:`, or a fence
+declaring no scenarios still extracts, because the suite it yields describes
+every scenario the tree holds. Dating is the one place a dropping block is
+still skipped, because it reads commits that are already in the past and nobody
+can go back and fix them.
 
 ```sh
 vellum suite extract "$VELLUM_INTENT_REPO" --output suite.json   # - writes to stdout

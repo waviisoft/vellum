@@ -13,7 +13,7 @@ names a file or symbol you can grep for.
 | `src/vellum/gherkin_blocks.py` | `_documents()`, `split_documents()`, `parse_block()` -> `Block`, `_attach_id()`, `scenario_ref()`. |
 | `src/vellum/links.py` | `find_references()`, `resolve()`, `heading_anchor()`, `heading_anchors()`. |
 | `src/vellum/lint.py` | `lint_tree()`, `Finding`, the `_check_*` functions. |
-| `src/vellum/suite.py` | `extract()`, `scan_file()`, `scenarios_in()`, `UnparseableBlocks`, `fingerprint()`, `version_history()`, `History`, `to_dict()`. |
+| `src/vellum/suite.py` | `extract()`, `scan_file()`, `scenarios_in()`, `BlockError`, `DroppedScenarios`, `fingerprint()`, `version_history()`, `History`, `to_dict()`. |
 | `src/vellum/gitver.py` | `spec_commits()`, `names()`, `is_shallow()`, `markdown_at()`, `show()`. All subprocess git lives here. |
 | `src/vellum/ledger.py` | `open_record()`, `advance()`, `find_record()`, `dump()`, `RECORD_KEYS`, `ITEM_KEYS`. |
 
@@ -174,8 +174,8 @@ since no fixture can carry a Background any more.
 
 **Extraction refuses the tree it was handed; the walk behind it does not.**
 `extract()` scans every spec file through `scan_file()` and raises
-`UnparseableBlocks` before it touches git, so a refusal costs no history walk
-and one run names every failing fence rather than one per invocation. But
+`DroppedScenarios` before it touches git, so a refusal costs no history walk
+and one run names every offending fence rather than one per invocation. But
 `version_history()` dates scenarios by re-parsing *old* trees — `_scenarios_at()`
 runs `scenarios_in()`, the tolerant half of `scan_file()`, over every
 spec-touching commit in the checkout's ancestry — and those go on skipping. The
@@ -188,6 +188,13 @@ one they can repair, so that is the one that fails.
 broken block and then a good one and extracting; delete it and a later tidy-up
 that "makes `scenarios_in` consistent" will look harmless.
 
+`scan_file()` takes the parsed `SpecFile`, not its text. Extraction hands it the
+one `iter_spec_files()` already built, which is the same object `lint_tree()`
+walks — so the fences the two commands judge are the same set by construction
+rather than because two `parse_spec_text()` calls happened to agree. Only
+`scenarios_in()` still parses text, because *its* caller has text: the history
+walk reads blobs out of git, not files off disk.
+
 **Measured before it was changed, not assumed:** every gherkin fence at every
 spec commit on waviisoft/vellum-intent main parses today — 16 spec commits, 542
 markdown file-revisions, 196 fences, zero `GherkinParseError`. So no historical
@@ -197,6 +204,28 @@ after this change. The tolerance is kept for what it protects against, not for
 anything it is carrying now. Re-measure it rather than re-reading this line: the
 script is a walk of `spec_commits()` calling `parse_block()` on each fence, which
 is `_scenarios_at()` with the failures counted instead of dropped.
+
+**The refusal is keyed on the drop, not on `GherkinParseError` and not on lint.**
+Two constructs cost the suite scenarios and both refuse: a fence that does not
+parse (`GH001`) and a `Rule:` with children (`GH010`), whose nested scenarios
+`parse_block()` deliberately does not admit — that block parses perfectly and
+still hands back fewer scenarios than a stock runner executes, which is the same
+silent absence reached the other way. Keying on the exception alone left that
+half open: `bad-rules` extracted exit 0 with three scenarios missing while lint
+rejected the same tree with `GH010`, the exact defect waviisoft/vellum#7 closed
+for the parse half.
+
+The scope is the harm and nothing wider, and the boundary is load-bearing in
+both directions. A `Rule:` holding **no** scenarios does not refuse: it fails
+lint on its own account and costs the suite nothing, so `rule.scenarios` is
+tested before a `BlockError` is made. Nor do findings that drop nothing — an
+unresolved link, a missing `@id:`, `GH002` on a fence declaring no scenarios.
+Widening this to "a tree lint rejects does not extract" would make `extract` a
+second `lint` and stop the harness on trees whose suite is complete;
+`TestFindingsThatDropNothingStillExtract` and
+`test_a_rule_holding_nothing_does_not_refuse` in `tests/test_suite.py` are what
+hold the line. `BlockError.code` carries `GH001`/`GH010` so the refusal points
+at the finding rather than restating it.
 
 **Silent absence was the failure class, so there is no partial-extraction flag.**
 waviisoft/vellum#7: `lint` exited 1 with `GH001` while `extract` exited 0 on the
@@ -216,11 +245,23 @@ empty suite is at least conspicuous.
 **Exit 1, not 2.** `run()` in `src/vellum/suite.py` uses lint's code for "the
 tree is the problem"; 2 stays what `SpecTreeError` and `LedgerError` mean, "the
 path you gave me is not a spec tree". A caller telling a bad spec from a bad
-invocation can still do it. The message names the file, the failing block's
-opening fence line, and the parser's own fault line — `<file>:<line>: gherkin
-block at line <n> does not parse: …` — because "which block" and "where in it"
-are different questions and the second one alone does not tell you which fence
-to go and look at.
+invocation can still do it, so the tests assert `1` rather than "non-zero" — a
+drift to 2 would tell a caller the wrong thing about its own invocation and
+still pass a non-zero assertion. The message names the file, the offending
+block's opening fence line, and the fault line inside it — `<file>:<line>:
+gherkin block at line <n> …` — because "which block" and "where in it" are
+different questions and the second one alone does not tell you which fence to
+go and look at.
+
+**Every word of a refusal goes to stderr, and an existing output file is not
+touched.** `-o -` puts the suite on stdout, so a diagnostic printed there would
+be parsed as part of the JSON by `extract … -o - | jq`; and `on-spec-merge.yml`
+extracts over `ledger/suite-<sha>.json` on a main that may already carry one, so
+truncating it on a refusal would take the tree from "no answer" to "a wrong
+answer already committed". Both are properties nothing forced — `run()` returns
+before it opens the file at all — so both are asserted directly:
+`test_a_refusal_writes_nothing_to_stdout` and
+`test_an_existing_output_file_is_left_exactly_as_it_was`.
 
 **Never hard-code any fact about the pinned tree in a test** — not the pin, not
 the scenario count, not the file count. Use `pinned_commit()`,
@@ -263,6 +304,8 @@ dropped its pre-existing scenario along with the smuggled one, and the finding
 counted two. This is why `GH010`'s message names how many scenarios the Rule
 holds — that count is the defect (waviisoft/vellum-intent#16), not the keyword
 — and why `tests/fixtures/bad-rules/features/absorbs-what-follows.md` exists.
+`scan_file()` reads the same `Rule.scenarios` count to decide whether extraction
+refuses, so the finding and the refusal cannot disagree about how many.
 Detection reads `child["rule"]` from the parsed node, as `GH008` and `GH009` do,
 so a `Rule:` in a docstring or a step's text is left alone; the negative
 control for that is `features/mentions-a-rule.md`.
@@ -336,13 +379,15 @@ the unrunnability.
 - **Findings, not exceptions.** `lint_tree()` returns a sorted list of
   `Finding`; only `main()` decides the exit code. That keeps lint usable as a
   library (`--json`) and makes the tests assert on codes rather than on text.
-- **Lint and extraction agree about a broken block: both refuse it.**
-  `extract()` in `src/vellum/suite.py` raises `UnparseableBlocks` naming every
-  failing fence, and `run()` turns that into exit 1 with nothing written. That
+- **Lint and extraction agree about a block that drops scenarios: both refuse it.**
+  `extract()` in `src/vellum/suite.py` raises `DroppedScenarios` naming every
+  such fence, and `run()` turns that into exit 1 with nothing written. That
   reversed the older rule — extraction used to skip a broken block so it could
   "still describe the rest of the tree" — for the reason under Landmines above.
-  `TestUnparseableBlocksAreRefused` in `tests/test_suite.py` pins it, and
-  asserts the lint/extract disagreement itself rather than only the new code.
+  `TestUnparseableBlocksAreRefused` and `TestRuleNestedScenariosAreRefused` in
+  `tests/test_suite.py` pin the two kinds, and each asserts the lint/extract
+  disagreement itself rather than only the new code. They agree about *these*
+  blocks, not about every finding: see the scope note under Landmines.
 - **Untagged means "the version this would mint".** A working-tree scenario no
   tag carries gets `latest + 1` and `pending: true` (`extract()`), which is
   exactly what spec CI needs when it runs on a PR before the tag exists.
