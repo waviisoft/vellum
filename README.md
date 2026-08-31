@@ -243,6 +243,116 @@ vellum pin advance . --to 0e9f3f57fd94fa0cbbda6602da9a79c609e1c231 \
 An intent checkout is required and there is no `--force`: a pin naming a
 non-version is the failure this command exists to prevent.
 
+## The mechanical guards
+
+Five read-only checks, each answering one question about neutral inputs. None
+writes anything, none reaches a forge, and all five follow the exit-code
+contract above: **1 is the answer you will not like, 2 is no answer.** A
+mistyped `--role`, a renamed config or an unresolvable ref is 2, so a workflow
+blocking on 1 blocks on findings and nothing else.
+
+### `vellum verify boundaries <product-checkout> --base <ref> --head <ref>`
+
+Checks the paths a branch changed against `write_boundaries.<role>` in the
+checkout's own `.vellum/product.yaml`.
+
+```sh
+vellum verify boundaries . --base origin/main --head HEAD          # --role implementer
+vellum verify boundaries . --base origin/main --head HEAD --role harness-engineer
+```
+
+A role the product file does not declare is refused (2) rather than defaulted:
+an empty list would fault every honest PR and an unrestricted one would pass
+every dishonest one. Boundary entries that would admit every path — `""`, `.`,
+`/`, `../..` — are refused for the same reason. The comparison goes through the
+merge base, so a commit somebody else landed on `main` is not charged to the
+branch; where no merge base exists the wider direct diff is read and the report
+says so. Renames are not detected, so a file moved *out* of a protected tree
+still counts as a write to it.
+
+### `vellum verify deps <product-checkout>`
+
+Checks every declared dependency against `dependency_policy.registries` in the
+installation's `.vellum/config.yaml`, which lives in the intent repo — so this
+needs `--intent` or `VELLUM_INTENT_REPO`, exactly as `pin advance` does.
+
+```sh
+vellum verify deps . --intent ../vellum-intent
+vellum verify deps . --manifest requirements.txt      # instead of the default globs
+```
+
+Reads `pyproject.toml` (`project.dependencies`, `project.optional-dependencies`,
+`dependency-groups`, `build-system.requires`) and `requirements*.txt`, following
+`-r` includes that stay inside the checkout. A plain requirement resolves to
+whatever index is in force — `pypi.org`, unless `--index-url` changed it; a
+direct or VCS reference resolves to its host; a local path resolves to no
+registry and is not a finding. Hosts are compared exactly after parsing, so
+neither `pypi.org.evil.invalid` nor `https://pypi.org@evil.invalid/simple` is
+`pypi.org`.
+
+### `vellum verify exit-duty <product-checkout> --base <ref> --head <ref>`
+
+Fails when a diff changes source and nothing under `.vellum/memory/areas/`.
+
+```sh
+vellum verify exit-duty . --base origin/main --head HEAD
+vellum verify exit-duty . --base origin/main --head HEAD --src lib --src src
+```
+
+It checks that *some* note changed, not that it is the right one. An area is an
+editorial grouping and its name is not derivable from a source path — this
+repo's own `src/vellum/` is documented by `areas/cli.md` — so a guess would
+fault correct PRs and pass incorrect ones. Which note a change belongs in stays
+the verifier's reading of the memory diff.
+
+### `vellum ledger verify <intent-checkout>`
+
+Resolves every link in the chain, exiting 1 naming the first broken one.
+
+```sh
+vellum ledger verify .
+vellum ledger verify . --strict    # refuse when any record's ids went unchecked
+```
+
+Checked on **every record**: a work item with no PR, and a `satisfies:` entry
+naming a scenario the suite at that version does not have. Checked only on
+waves a **cut** names: that the wave resolves to a record, that it has reached
+`verified`, and that every criterion it arms is claimed by some work item — an
+open wave legitimately has criteria nothing claims yet, which is what an
+unplanned wave is.
+
+The suite at a version is `ledger/suite-<sha>.json`. When one is absent the id
+checks are reported **unchecked**, not passed; `--strict` refuses instead.
+
+**The certification check is a proxy, and the report says so.** The record
+schema has no certification field at all, so "a cut naming an uncertified wave"
+is read as "a cut wave that has not reached `verified` or `shipped`". Closing
+that gap needs a spec slice.
+
+### `vellum budget <intent-checkout>`
+
+Sums recorded work-item spend against the caps in `.vellum/config.yaml`.
+
+```sh
+vellum budget .                     # per-item and period caps, both reported
+vellum budget . --projected 12.50   # would the next item's certification exceed it?
+vellum budget . --json              # the park state, for a caller that acts on it
+```
+
+Two caps, two parks: `budgets.per_item_usd` against each item's own accumulated
+cost (a lifetime cap, not windowed), and `budgets.period_usd` against everything
+spent inside the current `budgets.period`. Exceeding the first parks the item as
+`needs-human`; hitting the second parks the queue. Nothing is written — the
+marker and the spend report are for the caller that can file an issue, the same
+division `mint` keeps by computing a tag and never applying one.
+
+A cost entry carries no timestamp, so spend is attributed to the period
+containing its record's `approved` time, the only clock the ledger has. A record
+whose `approved` cannot be read is counted **inside** the window, and named in
+the report. Certification does not exist yet, so `--projected` takes the next
+item's cost from a caller that knows — the same shape as `backpressure
+--pending`.
+
 ## Layout
 
 | Path | What |

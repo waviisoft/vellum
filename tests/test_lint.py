@@ -5,7 +5,6 @@ from pathlib import Path
 
 from support import (
     FIXTURES,
-    REPO_ROOT,
     intent_checkout,
     intent_spec_tree,
     pinned_scenario_count,

@@ -75,10 +75,14 @@ from vellum.gitver import (
     spec_commits,
 )
 from vellum.ledger import LedgerError, find_record, parse_version
+from vellum.product import product_path
 from vellum.specfile import SpecTreeError, resolve_spec_root
 
-#: The pin of record, relative to a product checkout.
-PRODUCT_RELPATH = Path(".vellum") / "product.yaml"
+# Where the pin file lives — `PRODUCT_RELPATH`, `product_path` — is defined in
+# `vellum.product`, not here. The guards read the same file for
+# `write_boundaries` and `product.trees`, and two spellings of where it lives is
+# how a rename comes to move only half of the readers. This module remains the
+# only thing that *writes* it.
 
 #: A top-level `pin:` key: column zero, no leading space.
 _PIN_BLOCK_RE = re.compile(r"^pin:\s*$")
@@ -135,10 +139,6 @@ class Advance:
         if not self.changed:
             lines.append("  (already at this pin; the file was not rewritten)")
         return "\n".join(lines)
-
-
-def product_path(checkout: str | Path) -> Path:
-    return Path(checkout) / PRODUCT_RELPATH
 
 
 def _intent_repo(intent: str | Path) -> tuple[Path, str]:

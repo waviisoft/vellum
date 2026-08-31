@@ -369,3 +369,186 @@ def write_record(ledger: Path, sha: str, state: str = "approved", name: str | No
     path = record_path(ledger, sha)
     path.write_text(dump(record), encoding="utf-8")
     return path
+
+
+#: A product file carrying the three things the guards read: the pin, the trees
+#: the repo owns, and the trees each role may write. Written as a template
+#: rather than dumped from a dict because `.vellum/product.yaml` is a
+#: comment-bearing file in every real repo and a fixture that round-trips
+#: through `safe_dump` stops resembling one.
+GUARDED_PRODUCT = """# A product repo's backref, pin of record and boundaries.
+intent:
+  repo: waviisoft/vellum-intent
+
+pin:
+  commit: {commit}
+  name: null
+
+product:
+  name: core
+  trees: [src, .vellum/memory]
+
+{boundaries}"""
+
+#: What `waviisoft/vellum` itself declares, minus the trees a fixture has no
+#: use for. Tests that are about a *particular* boundary pass their own.
+DEFAULT_BOUNDARIES = {"implementer": ["src", "tests", ".vellum/memory"]}
+
+#: "the caller said nothing", which is not the same argument as `None`. `None`
+#: means "write no write_boundaries key at all" — a product file from before the
+#: guard existed — and a fixture has to be able to ask for that.
+UNSET = object()
+
+
+def boundaries_block(boundaries: dict | None) -> str:
+    """`write_boundaries:` as YAML text, or nothing at all when None.
+
+    None writes no key, which is a different fixture from an empty mapping: one
+    is a product file from before the guard existed, the other declares that no
+    role may write anything. Both are refusals and the tests assert they are
+    reached by different messages.
+    """
+    if boundaries is None:
+        return ""
+    lines = ["write_boundaries:"]
+    for role, trees in boundaries.items():
+        rendered = ", ".join(str(t) for t in trees)
+        lines.append(f"  {role}: [{rendered}]")
+    return "\n".join(lines) + "\n"
+
+
+def write_product(root: Path, commit: str = "0" * 40, boundaries=UNSET) -> Path:
+    """Write `.vellum/product.yaml` into *root*."""
+    (root / ".vellum").mkdir(parents=True, exist_ok=True)
+    path = root / ".vellum" / "product.yaml"
+    path.write_text(
+        GUARDED_PRODUCT.format(
+            commit=commit,
+            boundaries=boundaries_block(
+                DEFAULT_BOUNDARIES if boundaries is UNSET else boundaries
+            ),
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def commit_files(repo: Path, files: dict, message: str) -> str:
+    """Write *files* (path -> text, or None to delete) and commit. Returns the sha."""
+    for relative, text in files.items():
+        path = repo / relative
+        if text is None:
+            if path.exists():
+                path.unlink()
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", message, "--allow-empty")
+    return git(repo, "rev-parse", "HEAD").strip()
+
+
+def make_git_product_repo(root: Path, boundaries=UNSET, files: dict | None = None) -> Path:
+    """A product repo with git history: a product file, a src tree, an area note.
+
+    The guards over a product checkout all read a *diff*, so unlike
+    `make_product_repo` — which needs no history, because `pin advance` reads
+    one file — these fixtures have to be real repositories.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    git(root, "init", "-q", "-b", "main", ".")
+    write_product(root, boundaries=boundaries)
+    seeded = {
+        "src/app.py": "def main():\n    return 0\n",
+        ".vellum/memory/areas/app.md": "# App\n\nThe note that exists before the change.\n",
+        "harness/steps.py": "# the harness the implementer may not write\n",
+        "README.md": "# product\n",
+    }
+    seeded.update(files or {})
+    commit_files(root, seeded, "the product begins")
+    return root
+
+
+def branch(repo: Path, name: str) -> None:
+    git(repo, "checkout", "-q", "-b", name)
+
+
+def write_suite(ledger: Path, sha: str, scenarios) -> Path:
+    """A ``ledger/suite-<sha>.json`` holding *scenarios*.
+
+    *scenarios* is an iterable of ``id`` or ``(id, version)``; a bare id is
+    dated to *sha*, which makes it a criterion that version armed. Written in
+    the shape ``vellum suite extract`` emits (schema 2) rather than a minimal
+    one, so a reader that starts consulting a second field does not find a
+    fixture that never had it.
+    """
+    import json
+
+    entries = []
+    for scenario in scenarios:
+        ident, version = scenario if isinstance(scenario, tuple) else (scenario, sha)
+        entries.append(
+            {
+                "id": ident,
+                "ref": f"scenario:{ident}",
+                "file": f"features/{ident}.md",
+                "line": 1,
+                "version": version,
+                "version_name": None,
+                "pending": False,
+                "feature": "Sandbox",
+                "name": ident,
+                "keyword": "Scenario",
+                "tags": [f"@id:{ident}"],
+                "background_steps": [],
+                "steps": [{"keyword": "Given", "text": "a sandbox"}],
+                "examples": [],
+            }
+        )
+    ledger.mkdir(parents=True, exist_ok=True)
+    path = ledger / f"suite-{sha}.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema": 2,
+                "generator": "vellum tests",
+                "spec_version": sha,
+                "spec_version_name": None,
+                "spec_head": sha,
+                "spec_head_name": None,
+                "shallow": False,
+                "scenario_count": len(entries),
+                "scenarios": entries,
+            },
+            indent=1,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def write_releases(ledger: Path, cuts=(), spec_head: str | None = None) -> Path:
+    """A ``ledger/releases.yaml`` whose ``cuts`` name *cuts*.
+
+    Each entry may be a sha (written as ``{wave: <sha>}``, the shape the intent
+    repo's harness builds) or a mapping written through as-is, for the tests
+    whose subject is a malformed cut.
+    """
+    import yaml
+
+    entries = [c if isinstance(c, dict) else {"wave": c} for c in cuts]
+    ledger.mkdir(parents=True, exist_ok=True)
+    path = ledger / "releases.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "spec_head": spec_head,
+                "channels": {"production": {"spec_conformed": None}},
+                "cuts": entries,
+                "stamps": {},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    return path
