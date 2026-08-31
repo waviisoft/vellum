@@ -209,6 +209,22 @@ class TestCuts(ChainCase):
         self.assertEqual(self.kinds(chain), ["unknown-wave"])
         self.assertIn("spec-v1", str(chain.findings[0]))
 
+    def test_a_cut_pinning_several_waves_names_all_of_them(self):
+        # `spec/features/ledger.md` says a cut records "pinned waves" — plural.
+        # Reading only a scalar `wave:` would skip the rest, and skipping a cut
+        # wave is a guard failing open, so both spellings are read.
+        self.wave(SHAS[0], state="verified", scenarios=[])
+        self.wave(SHAS[1], state="implementing", scenarios=[])
+        write_releases(self.ledger, cuts=[{"wave": [SHAS[0], SHAS[1]]}])
+        chain = verify(self.repo)
+        self.assertEqual(chain.cuts, [SHAS[0], SHAS[1]])
+        self.assertEqual(self.kinds(chain), ["uncertified-wave"])
+
+    def test_a_cut_using_the_plural_key_is_read_too(self):
+        self.wave(SHAS[0], state="implementing", scenarios=[])
+        write_releases(self.ledger, cuts=[{"waves": [SHAS[0]]}])
+        self.assertEqual(self.kinds(verify(self.repo)), ["uncertified-wave"])
+
     def test_no_releases_file_is_no_cuts_rather_than_an_error(self):
         self.wave(SHAS[0])
         self.assertEqual(verify(self.repo).cuts, [])

@@ -130,6 +130,15 @@ class TestHowARegistryIsDecided(DepsCase):
             {r.registry for r in self.check().requirements}, {"internal.example.invalid"}
         )
 
+    def test_a_value_containing_its_own_equals_sign_is_not_cut_in_half(self):
+        self.manifest(
+            "requirements.txt",
+            "--index-url https://internal.example.invalid/simple?token=abc\nrequests\n",
+        )
+        self.assertEqual(
+            {r.registry for r in self.check().requirements}, {"internal.example.invalid"}
+        )
+
     def test_an_index_url_written_with_an_equals_sign_is_read(self):
         self.manifest(
             "requirements.txt", "--index-url=https://internal.example.invalid/simple\nrequests\n"
@@ -278,6 +287,15 @@ class TestTheTomlFallbackAgreesWithTheRealParser(DepsCase):
 
     def test_on_a_fixture_using_every_table(self):
         self.agree(TestReadingPyproject.PYPROJECT)
+
+    def test_on_a_literal_string_which_processes_no_escapes(self):
+        self.agree("[project]\ndependencies = ['a\\\\b']\n")
+
+    def test_on_a_non_ascii_value(self):
+        # `unicode_escape` round-trips non-ASCII through latin-1, so a value
+        # decoded unconditionally comes back mangled. Only a basic string
+        # carrying a backslash is decoded at all.
+        self.agree('[project]\ndependencies = ["pakket-\u00e9\u00e9n>=1"]\n')
 
     def test_on_a_single_line_array(self):
         self.agree('[project]\ndependencies = ["a", "b"]\n')

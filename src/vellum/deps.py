@@ -246,6 +246,21 @@ def _classify(
     return Requirement(source, stripped, index, why)
 
 
+def _split_option(line: str) -> tuple[str, str]:
+    """A pip option line as ``(option, value)``.
+
+    Both spellings pip accepts: ``--index-url URL`` and ``--index-url=URL``. The
+    ``=`` form is only taken when the ``=`` precedes any space, so a value that
+    contains one of its own — ``--index-url https://host/simple?token=x`` — is
+    not cut in half at the wrong character.
+    """
+    head, sep, tail = line.partition("=")
+    if sep and " " not in head:
+        return head.strip(), tail.strip()
+    option, _, value = line.partition(" ")
+    return option.strip(), value.strip()
+
+
 def _contained(root: Path, target: Path, *, source: str) -> Path:
     """*target*, refused unless it lies inside *root*.
 
@@ -297,11 +312,7 @@ def read_requirements_txt(
         if not line:
             continue
         if line.startswith("-"):
-            option, _, value = line.partition(" ")
-            option, value = option.strip(), value.strip().strip("=").strip()
-            if "=" in option and not value:
-                option, _, value = line.partition("=")
-                option, value = option.strip(), value.strip()
+            option, value = _split_option(line)
             if option in ("-r", "--requirement"):
                 nested = _contained(root, Path(value), source=source)
                 found += read_requirements_txt(root, nested, seen)
@@ -403,7 +414,14 @@ def _scan_toml_arrays(text: str, source: str) -> dict[str, list[str]]:
                     f"which this reader cannot read as a string. Run this guard on "
                     f"Python 3.11 or later, where the real TOML parser is used."
                 )
-            values.append(item.group("value").encode().decode("unicode_escape"))
+            raw_value = item.group("value")
+            # A literal ('single-quoted') TOML string processes no escapes at
+            # all, and `unicode_escape` round-trips non-ASCII through latin-1 —
+            # so it is applied only to a basic string that actually carries a
+            # backslash, rather than to every value on the way past.
+            if item.group("q") == '"' and "\\" in raw_value:
+                raw_value = raw_value.encode("utf-8").decode("unicode_escape")
+            values.append(raw_value)
             rest = rest[item.end():]
         out[f"{table}.{key}"] = values
         i += 1
