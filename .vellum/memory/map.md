@@ -9,13 +9,14 @@ notes live in `.vellum/memory/areas/`; wave worklogs in `.vellum/memory/waves/`.
 |---|---|
 | `src/vellum/` | The CLI. One module per concern; see `.vellum/memory/areas/cli.md`. |
 | `tests/` | `unittest` suite plus fixture spec trees under `tests/fixtures/`. |
-| `adapters/github/` | Workflows written **for the intent repo**, ready to copy over. See `.vellum/memory/areas/adapters-github.md`. |
+| `.github/workflows/` | `ci.yml` tests this repo; `spec-ci.yml`, `on-spec-merge.yml` and `harness-ci.yml` are **reusable** (`workflow_call`) workflows an installation's intent repo calls, and never run here. See `.vellum/memory/areas/adapters-github.md`. |
+| `adapters/github/` | The **caller stubs** an intent repo carries, rendered by `vellum init` from `vellum.install.SHIPPED`. See `.vellum/memory/areas/adapters-github.md`. |
 | `.vellum/product.yaml` | Backref to the intent repo, and the pin of record — `pin.commit`. Nothing mounts the intent repo here; CI fetches it, and tests read `VELLUM_INTENT_REPO`. |
 
 ## Areas
 
-- [`.vellum/memory/areas/cli.md`](areas/cli.md) — `vellum lint`, `vellum suite extract`, `vellum ledger`, and the pipeline commands `vellum mint`, `vellum backpressure`, `vellum pin advance`.
-- [`.vellum/memory/areas/adapters-github.md`](areas/adapters-github.md) — the two GitHub Actions workflows.
+- [`.vellum/memory/areas/cli.md`](areas/cli.md) — `vellum lint`, `vellum suite extract`, `vellum ledger`, the pipeline commands `vellum mint`, `vellum backpressure`, `vellum pin advance`, the mechanical guards, and the installer commands `vellum init` / `vellum doctor`.
+- [`.vellum/memory/areas/adapters-github.md`](areas/adapters-github.md) — the reusable GitHub Actions workflows and the caller stubs that invoke them.
 
 ## Waves
 
@@ -25,6 +26,7 @@ notes live in `.vellum/memory/areas/`; wave worklogs in `.vellum/memory/waves/`.
 - [`.vellum/memory/waves/spec-v6.md`](waves/spec-v6.md) — one Feature per fence; runnable scenarios; the PO/PA/CA hierarchy.
 - [`.vellum/memory/waves/versions-are-commits.md`](waves/versions-are-commits.md) — versions became commits, the pin became a file, minting shrank, `Rule:` banned.
 - [`.vellum/memory/waves/cli-absorbs-workflows.md`](waves/cli-absorbs-workflows.md) — the workflow bodies became `vellum mint`, `vellum backpressure`, `vellum pin advance`.
+- [`.vellum/memory/waves/adapters-install-thin.md`](waves/adapters-install-thin.md) — the adapters became reusable workflows plus caller stubs; `vellum init` and `vellum doctor`.
 
 Worklogs up to `spec-v6.md` are named for the version they landed at. This one
 is named for what it did, because a version's name is decoration now

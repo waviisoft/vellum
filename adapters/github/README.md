@@ -1,245 +1,249 @@
-# GitHub adapter
+# GitHub adapter — the caller stubs
 
-Three workflows **for the intent repo** (`waviisoft/vellum-intent`), kept here
-so they are reviewed alongside the CLI they call. They are not run by this repo.
+Three **caller stubs** for the intent repo (`waviisoft/vellum-intent`). Each is
+a dozen lines that name a reusable workflow in this repo at a pinned ref and
+pass the one secret it needs. The logic lives in
+[`.github/workflows/`](../../.github/workflows/) of this repo, as
+`workflow_call` workflows, and is reviewed there alongside the CLI it calls.
 
-Install them by copying:
+| Stub | Reusable workflow | Trigger | Does |
+|---|---|---|---|
+| `spec-ci.yml` | [`../../.github/workflows/spec-ci.yml`](../../.github/workflows/spec-ci.yml) | `pull_request` touching `spec/**`, `ledger/**`, `.vellum/config.yaml` or the stub itself | `vellum lint` + `vellum suite extract`, uploads `suite.json`, summarises the scenarios the PR introduces or changes, and runs `vellum backpressure` (reporting, not blocking). The three agent reviews are stubs. |
+| `on-spec-merge.yml` | [`../../.github/workflows/on-spec-merge.yml`](../../.github/workflows/on-spec-merge.yml) | `push` to `main` touching `spec/**` | `vellum mint` opens the ledger record for the merge commit; the workflow tags the decorative name, extracts the suite, files work-item issues from `workplan.yaml`, commits and pushes. The planner is a stub. |
+| `harness-ci.yml` | [`../../.github/workflows/harness-ci.yml`](../../.github/workflows/harness-ci.yml) | `pull_request`, **every** one | `vellum verify boundaries` against the harness engineer's trees on any PR that writes `harness/`, and `python3 harness/run.py` — which fails on an UNDEFINED scenario — plus a check that the committed `harness/conformance.md` matches a fresh run. |
+
+## Installing
 
 ```sh
-cp adapters/github/spec-ci.yml       ../vellum-intent/.github/workflows/
-cp adapters/github/on-spec-merge.yml ../vellum-intent/.github/workflows/
-cp adapters/github/harness-ci.yml    ../vellum-intent/.github/workflows/
+cd ../vellum-intent
+vellum init .                    # pins this CLI's own version
+vellum init . --ref main         # or pin something else
+vellum init . --branch trunk     # if the default branch is not `main`
+vellum doctor .                  # what is installed is what ships
 ```
 
-Keep the two sides byte-identical. These files are the upstream copy and the
-intent repo's `.github/workflows/` holds what actually runs, so a plain `diff`
-between them is the whole drift check — if it reports anything, one side has
-been edited in place and the other has not.
+`vellum init` reads `.vellum/workspace.yaml` — the intent slug, the products,
+and the forge — and writes one stub per shipped workflow into
+`.github/workflows/`. It is idempotent: run again over an installed checkout it
+writes nothing and says so. A stub that exists and *differs* is reported and
+left alone; `--force` restamps it, which is also how a ref is bumped.
 
-| File | Trigger | Does |
-|---|---|---|
-| `spec-ci.yml` | `pull_request` touching `spec/**`, `ledger/**`, `.vellum/config.yaml` or the workflow itself | `vellum lint` + `vellum suite extract`, uploads `suite.json`, summarises the scenarios the PR introduces or changes, and runs `vellum backpressure` (reporting, not blocking — see below). The three agent reviews are stubs. |
-| `on-spec-merge.yml` | `push` to `main` touching `spec/**` | `vellum mint` opens the ledger record for the merge commit; the workflow tags the decorative name, extracts the suite, files work-item issues from `workplan.yaml`, commits and pushes. The planner is a stub. |
-| `harness-ci.yml` | `pull_request`, **every** one | `vellum verify boundaries` against the harness engineer's trees on any PR that writes `harness/`, and `python3 harness/run.py` — which fails on an UNDEFINED scenario — plus a check that the committed `harness/conformance.md` matches a fresh run. |
+**`--branch` is the branch `on-spec-merge` watches**, and it is the one piece of
+a trigger that belongs to the installation rather than to this product. It
+defaults to `main`. Hard-coding it made an installation on `trunk` one that
+could never be doctor-green — the check reporting the repository's own correct
+configuration as drift — so the branch list is stamped from `--branch` and
+`doctor` exempts it from the `on:` comparison. Only it: `push` must still be
+there, its `paths:` are still compared, and a trigger added beside it is still
+drift.
 
-## harness-ci.yml: the pipeline guards its own boundaries
+Copying by hand works too — the three files here are exactly what `init`
+writes, and `tests/test_install.py` asserts that byte for byte. **But the
+committed files pin `v0.1.0`, and `waviisoft/vellum` has cut no `v*` tag yet**,
+so a hand-copied stub resolves to nothing until one exists. Edit the two ref
+lines to `main`, or run `vellum init . --ref main`.
 
-`spec/behaviors/write-boundaries.md` says "CI enforces the same boundaries as a
-backstop in colocated development contexts". Until this file that sentence was
-enforced in *product* repos only, and the intent repo is where the breach
-recurs: a harness session that also tidies `.vellum/memory/`, which is the
-librarian's tree.
+## Upgrading is bumping a ref
 
-**It needs a `write_boundaries` block in `.vellum/config.yaml`.** The intent
-repo has no `.vellum/product.yaml`, so its boundaries live in the installation
-config, in exactly the shape a product file uses:
-
-```yaml
-write_boundaries:
-  harness-engineer: [harness]
-  librarian: [.vellum/memory]
+```sh
+vellum init . --ref v0.2.0 --force
 ```
 
-A top-level mapping of role name to a list of repo-relative path prefixes. An
-entry may name a directory or a single file; `""`, `.`, `/`, an absolute path
-and anything containing `..` are all refused, because each admits every path in
-a diff. **The data is the architect's to author** — this repo ships the command
-that reads it and no boundary data for a repo it does not own. Until the block
-exists, the `boundaries` job exits 2 ("I could not answer") on any PR that
-writes `harness/`, which is the correct colour of red: a guard with nothing to
-check against has not passed.
+Two lines change per stub: the `@<ref>` on `uses:`, and the `vellum-ref:` input
+that the workflow checks the CLI out at. **The input is quoted** — `vellum-ref:
+"v0.2.0"` — because a bare `1.10`, `010`, `null`, `true` or `on` is not a string
+to a YAML reader, and a stub carrying an unquoted one fails its own doctor with
+`ref-mismatch` or `no-cli-ref`. The `@<ref>` half was never affected: it is part
+of a longer scalar. They are stamped equal and
+`vellum doctor` reports when they have come apart. The `@<ref>` alone does not
+pin the CLI: the checkout of `waviisoft/vellum` inside the workflow body needs a
+ref it can be handed, and an installation's CLI version has to be readable in
+the repository that runs it.
 
-The job passes `--boundaries-from config` rather than letting the command
-choose. Naming the source makes its absence an error, where the default would
-silently read a product file if one ever appeared in that repo.
+## Why stubs, and what a stub may not become
 
-**The role is derived from the diff, not from a label or a branch name.** A PR
-that writes `harness/` is a harness PR and must write nothing else. A PR that
-writes no harness path is not checked against any role by this job — closing
-that half means asking "does this diff fit inside *some* declared role's
-trees?", which is CLI surface no spec change has asked for.
+`spec/features/installation.md`: "A stub holds no logic, so it has nothing to
+drift; upgrading an installation is bumping the ref in each stub, reviewable
+like any change."
 
-**`harness/conformance.md` is not a harness edit.** The map is a generated
-report of the spec tree against the installed CLI, and the suite job fails a PR
-whose committed map does not match a fresh run — so a spec PR adding a scenario
-(with its steps already on `main`) must regenerate the map in the same PR to be
-green. The role classifier ignores that one file, otherwise the same PR would be
-read as a harness PR and failed for also writing `spec/`, and no scenario-adding
-spec change could ever land. Writing a step definition is harness engineering;
-refreshing the report is not.
+The full-copy shape this replaces produced two measured incidents with a single
+repo pair, both recorded in
+[`.vellum/memory/areas/adapters-github.md`](../../.vellum/memory/areas/adapters-github.md):
+a fold-back that sat unfolded through a wave of review against files that were
+not what ran, and a set of `INSTALLED COPY` headers that outlived their own
+fold-back note. A second pair would have doubled the surface
+(waviisoft/vellum-intent#23).
 
-**Both jobs run on every PR, with no `paths:` filter.** That is about branch
-protection rather than cost: a path-filtered required check never reports on
-the PRs it filters out, and GitHub leaves those waiting forever. Both of these
-can safely be made required.
+So `vellum doctor` treats **a `run:` body or a second job in a stub as a
+finding, named by file**. If an installation needs something the shipped
+workflow does not do, that is a change to the shipped workflow, not a local
+edit: a local edit is precisely the thing that used to drift.
 
-**The conformance-map check excludes one line, deliberately.** The map's header
-records the commit the suite was extracted at, which is the checkout's HEAD — so
-the committed file names a sha that did not exist when it was written, and that
-line differs on every run by construction. Comparing it would make the check
-impossible rather than hard. Everything the map asserts — the scenario list,
-each outcome, each blocked-on capability, the totals — is compared exactly. If
-`harness/run.py` ever grows an option to omit the header, this step becomes a
-plain `diff`.
+**The delegating job carries `uses:`, `with:` and `secrets:` and nothing else.**
+An allowlist, because the ways to add logic beside a delegation are open-ended
+and several of them *report success while doing it*:
 
-## The bodies are shims
+| Added key | What it does that nothing else would catch |
+|---|---|
+| `if:` | A **skipped** job reports **success** to branch protection. `if: false` on `harness-ci` is a green write-boundary gate that ran nothing. |
+| `strategy:` | Runs the reusable workflow N times. On `on-spec-merge` that is N minters racing the same ledger push inside one run. |
+| `needs:` | The job never starts when its dependency does not. |
+| `permissions:` | Job-level, below the shipped grant: refused at the point of use, and the top-level block still compares equal. |
+| `timeout-minutes`, `continue-on-error` | A required check that reports the wrong answer, or none. |
+| `env:`, `container:` | Reach the callee's environment. |
 
-`spec/features/spec-pipeline.md`: "Pipeline logic lives in the product CLI, and
-forge workflow bodies are single-command shims over it — minting is `vellum
-mint`, the divergence gate is `vellum backpressure`, the pin close is `vellum
-pin advance`." What used to be four shell steps in `on-spec-merge.yml` — the
-version guard, the baseline walk, the name derivation, the ledger write — is
-one `vellum mint` call, and the `backpressure` stub is one `vellum backpressure`
-call.
+**And the job's *id* is the shipped one.** A job calling a reusable workflow
+reports its checks as `<job id> / <called job name>`, so renaming
+`spec-ci:` to anything else leaves branch protection requiring names that no
+longer report — see "Installing changes your required check names" below, which
+is the same failure arrived at from the other direction.
 
-The point is testability, not brevity. Logic in a workflow body can only be
-exercised by running this forge; the same logic in a command is driven in a
-sandbox, which is what makes the pipeline's behavior a PASS-able property
-rather than a deployment one (`spec/features/scenarios-and-harness.md`). Every
-guard that moved is covered in `tests/test_mint.py` and
-`tests/test_backpressure.py`, named for what it protects.
+**A stray workflow beside the stubs is a finding too.** Any *other* file under
+`.github/workflows/` that delegates to `waviisoft/vellum`'s workflows, or runs
+`vellum` in a `run:` body of its own, is reported as `stray-workflow`. That is
+where a retired full copy hides: rename one aside as `spec-ci-legacy.yml` and it
+goes on running on every PR, holding logic nothing keeps equal to what ships,
+invisible to a check that only opens the three files it stamped. An intent
+repo's own unrelated CI is not reported.
 
-**Read `steps.mint.outputs.minted`, never the exit code.** `vellum mint` exits
-0 on both of its no-ops — a commit that does not touch `spec/`, and a replay —
-exactly as the guard step it replaced did, because a racing merge and a re-run
-of an idempotent job are both benign. `minted=no` is what tells the workflow to
-skip the steps that are *not* idempotent.
+**What a stub does carry, and why none of it can drift into a wrong answer:**
 
-**Four `run:` bodies still hold logic, deliberately.** Issue filing and the
-push-range detector in `on-spec-merge.yml`, "Summarise the suite" in
-`spec-ci.yml`, and the two derivations in `harness-ci.yml` (is this a harness
-PR; is the committed map current) are none of them among the three commands the
-spec names, and absorbing any would mean CLI surface nothing has asked for — a
-forge issue API, a push-range minter, a reporting flag on `suite extract`, a
-report option on `harness/run.py`, which is a tree this repo may not write.
-Each carries an in-file note saying so.
+- **Triggers.** They are statements about the caller's repository, and a
+  reusable workflow has no trigger but `workflow_call`. A wrong trigger does
+  not run; it does not answer wrongly.
+- **`permissions`.** A called workflow's token can only be *narrowed* by the
+  callee, never widened, so the grant has to be made where the run starts. A
+  permission that is too small is refused at the point of use.
+- **`concurrency`.** A group serialises the runs of one repository. Two
+  installations sharing a group would serialise unrelated repositories against
+  each other, so the group belongs to the caller.
+- **`secrets:` by name — never `secrets: inherit`.** `spec/features/installation.md`:
+  "a stub passes each secret by name and never inherits the caller's whole
+  secret set, so a reusable workflow holds exactly the credential its job names
+  and nothing else in the installation." `inherit` is a doctor finding, not a
+  style note. **By name means the value too**: `VELLUM_TOKEN: ${{
+  secrets.ORG_ADMIN_PAT }}` satisfies any check made by key alone while handing
+  the reusable workflow a different — very possibly wider — credential under the
+  name it audits. Doctor reads the referenced secret back out of the expression
+  and compares it to the key, so spacing an operator changed is not a finding
+  and a remap is (`secret-remapped`).
 
-## on-spec-merge robustness (waviisoft/vellum-intent#24)
+## Installing changes your required check names
 
-Three of the four findings that issue records are closed here; the fourth
-(`docs/design.md` still describing integer version minting) is intent-repo
-documentation and not this repo's to fix.
+A job that calls a reusable workflow reports its checks as
+`<calling job>/<called job name>`. So `Lint and extract the suite` becomes
+`spec-ci / Lint and extract the suite`, and `Harness PRs stay in harness/`
+becomes `harness-ci / Harness PRs stay in harness/`.
 
-- **The ledger push retries behind a rebase** (item 1). `concurrency` serialises
-  runs against each other but not against anything else pushing to `main`, and a
-  rejected push used to strand the record with no replay path — the guard accepts
-  only the branch tip, so nothing would re-record it. The rebase moves this run's
-  one ledger commit onto whatever landed; a conflict aborts and reddens rather
-  than losing it, and two concurrent runs write different filenames (a record is
-  keyed by its version's sha) so they do not conflict at all.
-- **A spec-touching commit below the push tip is now named, not skipped**
-  (item 2). Only the tip is minted, so a multi-commit direct push to `main` could
-  leave a version on `main` with no ledger record, in a green run. The last step
-  scans `before..after` and fails the run naming each one. It is a **detector,
-  not a recorder**: minting a range means a job shaped differently from this one,
-  and whether the answer is that job or branch protection against direct pushes
-  is the architect's call.
-- **The `work-item` label is created before an issue asks for it, and no work-item
-  title reaches a search query** (item 3). `gh issue create --label` fails
-  outright when the label does not exist, and it does not exist in the intent
-  repo. The duplicate-issue lookup used to paste the title into GitHub's search
-  grammar, where a title carrying a double quote makes an unbalanced phrase — a
-  malformed query matches nothing, so the existing issue is not found and the run
-  files a duplicate. It lists the `work-item` label instead and compares titles
-  exactly in jq, which is where the comparison already was.
+**Rename every required status check in the intent repo's branch protection when
+you install these**, or the rules go on requiring checks that no longer report
+and every PR waits forever. The calling job in each stub is named for the
+workflow, so the prefix is `spec-ci/`, `on-spec-merge/` or `harness-ci/` and
+nothing else. `vellum doctor` cannot see branch protection and does not warn
+about this.
+
+## Prerequisites
+
+- **`waviisoft/vellum` must allow its workflows to be reused within the
+  organization.** It is a private repo, so this is an Actions setting on *it*:
+  Settings > Actions > General > Access > "Accessible from repositories in the
+  organization". Without it the caller's run fails at `uses:` with a resolution
+  error. **Neither checkout can see this setting**, so `vellum doctor` says it
+  cannot check it rather than passing over it.
+- **The intent repo needs a `VELLUM_TOKEN` secret** holding a token that can
+  read `waviisoft/vellum`. This repo is private, so the intent repo's own job
+  token cannot read it. Every shipped workflow asserts the secret in its first
+  step and fails with a named error when it is empty, rather than failing later
+  and less legibly inside pip. **A checkout cannot see whether a secret is
+  set**, so doctor says that too.
+- **The pinned ref has to exist in `waviisoft/vellum`.** `vellum init` defaults
+  to `v<this CLI's version>` and *cannot confirm from an intent checkout that
+  the tag exists*, so it says so rather than guessing a ref that does.
+  **This repo has cut no `v*` tag yet**: until it does, install with
+  `vellum init . --ref main`, or the stubs resolve to nothing. Pass
+  `--releases-from <a vellum checkout>` to have either command read the `v*`
+  tags and report currency.
+- **The pins are MUTABLE tags, and that is the trust model.** `uses:
+  waviisoft/vellum/...@v0.1.0` names a tag, not a sha, and so does every
+  `actions/checkout@v4` inside the reusable workflows. Whoever can move a tag in
+  `waviisoft/vellum` changes what runs in every installation that pins it —
+  including `on-spec-merge`, which runs with `contents: write` and
+  `issues: write` on the intent repo. That was true of the copied workflows too;
+  what centralising changes is the blast radius, from one hand-copied file to
+  every installation at once. Tag protection on `waviisoft/vellum`, or pinning a
+  sha (`vellum init . --ref <sha>`, which both commands accept), are the two
+  ways to narrow it. Nothing here enforces either.
+- **Runners are Blacksmith** (`blacksmith-2vcpu-ubuntu-2204`). This
+  organisation never assigns a runner to `ubuntu-latest`: the job is accepted
+  and then fails in seconds with `runner_id: 0`, no logs and no steps, which
+  reads like an infrastructure blip and is not one. The labels are in the
+  *shipped* workflows now, which is a real limit of hosting the bodies
+  centrally: an installation outside this organisation cannot change them from
+  its stub. Making the label an input is the fix when a second organisation
+  needs it; nothing has asked yet.
+- **`on-spec-merge` needs `contents: write` and `issues: write`** — granted in
+  its stub — and branch protection on `main` that lets the workflow token push,
+  or the ledger commit step fails.
+- **Both spec-side workflows check out with `fetch-depth: 0`.** The version
+  sequence *is* main's history, and `vellum suite extract` dates scenarios by
+  walking it. A shallow clone silently re-dates every scenario below its graft
+  **forward**, onto the truncation point — right count, nothing pending,
+  nothing raised, and wrong in the direction that arms scenarios the product
+  already satisfies. `suite.json` carries `shallow: true` when it happens;
+  treat that as the last line, not the guard.
+- **`harness-ci` must not be installed ahead of a `write_boundaries` block in
+  the intent repo's `.vellum/config.yaml`.** With nothing to check against, its
+  boundary job exits 2 ("I could not answer") on any PR that writes `harness/`
+  — which is the correct colour of red, and not a state to install into
+  deliberately. The block is a top-level mapping of role to repo-relative path
+  prefixes:
+
+  ```yaml
+  write_boundaries:
+    harness-engineer: [harness]
+    librarian: [.vellum/memory]
+  ```
+
+  **The data is the architect's to author** — this repo ships the command that
+  reads it and no boundary data for a repo it does not own.
 
 ## What is real and what is not
 
-Every stub is marked in-file with a `STUB — NOT IMPLEMENTED (v0.2)` banner, a
-`::warning` annotation at runtime, and a comment naming the role contract that
-will replace it. **The stubbed checks pass vacuously** — a green `spec-ci` in
-v0.1 means the spec lints and every scenario parses, and nothing more. It is
-not evidence that a spec change was reviewed for coherence, coverage or impact.
+Every stub is marked in-file with a `STUB — NOT IMPLEMENTED (v0.2)` banner in
+the *shipped* workflow, a `::warning` annotation at runtime, and a comment
+naming the role contract that will replace it. **The stubbed checks pass
+vacuously** — a green `spec-ci` in v0.1 means the spec lints and every scenario
+parses, and nothing more. It is not evidence that a spec change was reviewed
+for coherence, coverage or impact.
 
-Real in v0.1:
-
-- lint and suite extraction, and their non-zero exit codes blocking a merge
-- opening and updating the ledger record, keyed by the merge commit's sha —
-  which is also the entire replay guard, since the record either exists for
-  this commit or it does not
-- naming the version, as decoration: a `spec-vN` tag derived from the count of
-  spec versions in the commit's ancestry. Nothing reads it, so the step is
-  `continue-on-error` and a run whose tag push fails has still recorded the
-  version
-- filing work-item issues from a `workplan.yaml` (reusing an existing issue of
-  the same title rather than duplicating it)
-- counting the divergence window (`vellum backpressure`) — real, and
-  **reporting only** until releases exist; see below
+Real in v0.1: lint and suite extraction; opening and updating the ledger record;
+naming the version as decoration; filing work-item issues from a `workplan.yaml`;
+and counting the divergence window (`vellum backpressure`) — real, and
+**reporting only** until releases exist.
 
 Stubbed for v0.2: coherence review, coverage review, impact report, and the
-planner that writes `workplan.yaml`. Until the planner lands, a hand-written
-`workplan.yaml` at the intent repo root exercises the issue-filing path end to
-end.
+planner that writes `workplan.yaml`.
 
 ### Backpressure runs for real and does not block yet
 
 `vellum backpressure` counts ledger records that are neither `shipped` nor
-`superseded` and exits non-zero at or past `budgets.divergence_cap`. Nothing
-has ever set a record to `shipped`, because releases do not exist yet
-(`ledger/releases.yaml` carries `spec_conformed: null` and no cuts), so every
-record in the intent repo counts as unshipped — 11 against a cap of 3 when this
-was measured.
-
-Arming the gate in that state would block every spec merge in the repository,
-including the one that lands the release machinery: a deadlock, not
+`superseded` and exits non-zero at or past `budgets.divergence_cap`. Nothing has
+ever set a record to `shipped`, so every record in the intent repo counts as
+unshipped. Arming the gate in that state would block every spec merge in the
+repository, including the one that lands the relief: a deadlock, not
 backpressure. So the step runs, reports into the job summary, and carries
-`continue-on-error: true`. **Delete that one line to arm it**, once shipped
-versions actually leave the window. The `set -o pipefail` beside it is
-load-bearing — without it the step's status is `tee`'s, and arming the gate
-would produce a check that can never close.
+`continue-on-error: true` in the shipped workflow. **Delete that one line to arm
+it**, once `vellum backpressure . --strict` exits 0 against intent `main` — run
+it, do not read this note. `waviisoft/vellum-intent#41` tracks the hold.
 
-It runs with `--strict`, which refuses to measure at all when a ledger file
-cannot be read rather than reporting it and counting a narrower window. On a
-gate that is the right direction. And `1` from this command means *blocked* and
-nothing else — every other non-zero exit is `2` — so an armed gate's red always
-has one meaning.
+The `set -o pipefail` beside it is load-bearing: without it the step's status is
+`tee`'s, and arming the gate would produce a check that can never close.
 
-The job's `pull_request` trigger includes `.vellum/config.yaml` and `ledger/**`
-alongside `spec/**`, because a PR that raises `divergence_cap` or adds unshipped
-versions must re-run the check that reads them.
+## Where the details live
 
-## Prerequisites
-
-- **Nothing depends on the tags.** A spec version is a `main` commit whose diff
-  touches `spec/**` (`spec/decisions/2026-08-28-versions-are-commits.md`); the
-  `spec-v*` tags are names for eleven of them, and a missing, late or wrong one
-  changes no behavior.
-
-- **The ledger records are sha-keyed, and the migration is done.** This entry
-  used to ask for it. `waviisoft/vellum-intent#22` ("ledger: key the records by
-  commit sha") rewrote `ledger/spec-vN.yaml` into `ledger/<sha>.yaml`; measured
-  on `main` while this wave was written, all eleven records are sha-keyed and
-  none carries `spec_version: spec-v*`. That matters more than housekeeping now
-  that `vellum backpressure` counts them: a name-keyed leftover is not a
-  version this CLI recognises, so it is reported as unreadable rather than
-  counted, and a ledger half-migrated would have measured a window short.
-
-- **Only one checkout keeps its credential.** `persist-credentials: false` is
-  set on every `actions/checkout` in both files except `on-spec-merge.yml`'s
-  `Check out main`, which is the one that pushes the tag and the ledger commit.
-  It matters most in `spec-ci.yml`, where the jobs run on `pull_request` in a
-  workspace whose root is the PR's merged tree, and where `VELLUM_TOKEN` reads
-  a private repository.
-- The intent repo needs a **`VELLUM_TOKEN`** secret holding a token that can
-  read `waviisoft/vellum`. This repo is private, so the intent repo's own job
-  token cannot read it. Both workflows check the secret first and fail with an
-  explicit message when it is missing, rather than failing later and less
-  legibly inside pip.
-- Both workflows check this repo out at `env.VELLUM_REF` (`main`) and
-  `pip install` that path. Point it at a tag once this repo cuts one. They
-  check the CLI out rather than installing from its git URL because the repo is
-  private and a token has to be supplied, which `pip install
-  "vellum @ git+https://..."` has nowhere to take. (It was also, originally,
-  because pip's VCS install recursively initialized the private `spec`
-  submodule and failed — that submodule is gone, and the private-repo reason
-  stands on its own.)
-- `on-spec-merge.yml` needs `contents: write` (to push the tag and the ledger
-  commit) and `issues: write` (to file work items). Branch protection on `main`
-  must allow the workflow token to push, or the ledger commit step fails.
-- Both check out with `fetch-depth: 0`: the version sequence *is* main's
-  history, and `vellum suite extract` dates scenarios by walking it. A shallow
-  clone silently re-dates every scenario below its graft **forward**, onto the
-  truncation point — right count, nothing pending, nothing raised, and wrong in
-  the direction that arms scenarios the product already satisfies. `suite.json`
-  carries `shallow: true` when it happens; treat that as the last line, not the
-  guard.
+Everything that used to be in this file about *how* each workflow works now sits
+in the workflow it describes — the guards, the injection boundaries, the
+detectors, and why each `run:` body that remains was left alone. Read
+[`../../.github/workflows/`](../../.github/workflows/), and
+[`.vellum/memory/areas/adapters-github.md`](../../.vellum/memory/areas/adapters-github.md)
+for the landmines.

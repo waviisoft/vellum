@@ -7,8 +7,9 @@ certification-and-releases), ``tick`` (orchestration, question-protocol), the
 three pipeline commands the forge workflows are shims over — ``mint``,
 ``backpressure`` and ``pin advance`` — and the mechanical guards: ``verify
 boundaries``, ``verify deps``, ``verify exit-duty``, ``ledger verify`` and
-``budget``. Each returns a process exit code; failure detail goes to stderr and
-nothing else is printed on success beyond what was asked for.
+``budget``, and the two installer commands ``init`` and ``doctor``
+(installation). Each returns a process exit code; failure detail goes to stderr
+and nothing else is printed on success beyond what was asked for.
 
 A guard is a command that reads neutral inputs — a checkout, two refs, a role —
 and answers one question about them. None of them writes anything, and none of
@@ -38,14 +39,23 @@ Exit codes, in the one place they are all visible:
 * ``1`` — the command answered, and the answer is bad news: a fence that drops
   scenarios, a shallow clone, a divergence window at its cap, a head no green
   certification covers, a wave parked past the question timebox, a cut whose
-  enforced suite was red or whose waves cannot be pinned.
+  enforced suite was red or whose waves cannot be pinned, an installed stub that
+  is not what ships.
 * ``2`` — the command could not answer: the path is not a spec tree, the sha is
   not a sha, the pin file is not a pin file, the config has no cap, a ``--ref``
   names no commit, ``--emit`` was handed an empty path, ``certify`` was pointed
   at a checkout with no ledger or named a work item that is not in the record,
   ``tick`` was handed observed state in a shape it could not read, ``release
   cut`` was pointed at a channel ``releases.yaml`` does not declare or a
-  product ``.vellum/workspace.yaml`` does not.
+  product ``.vellum/workspace.yaml`` does not, ``init`` or ``doctor`` was
+  pointed at a checkout with no workspace file or a forge they have no stubs
+  for.
+
+``init`` has no ``1`` at all: it writes or finds nothing to do, and "there is
+something wrong with this installation" is ``doctor``'s sentence to pass.
+``doctor``'s ref-currency section contributes to neither code — it is reported
+and never failed on (``spec/features/installation.md``), the posture
+``.github/workflows/ci.yml`` takes to a pin behind spec-head.
 
 The line is between *an answer you will not like* and *no answer*, and it is
 load-bearing for ``vellum backpressure`` in particular: the moment its
@@ -86,6 +96,9 @@ from vellum.deps import DEFAULT_MANIFESTS, DependencyError
 from vellum.deps import run as deps_run
 from vellum.exitduty import AREAS_TREE, DEFAULT_SOURCE_TREES, ExitDutyError
 from vellum.exitduty import run as exitduty_run
+from vellum.install import DEFAULT_BRANCH, HOST_REPO, FORGES, InstallError
+from vellum.install import run_doctor as doctor_run
+from vellum.install import run_init as init_run
 from vellum.ledger import (
     CERTIFICATION_RESULTS,
     LedgerError,
@@ -214,6 +227,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_release(sub)
     _add_budget(sub)
     _add_verify(sub)
+    _add_install(sub)
 
     return parser
 
@@ -672,6 +686,104 @@ def _add_verify(sub) -> None:
     )
 
 
+def _add_install(sub) -> None:
+    """``init`` and ``doctor``: the two halves of installing the adapters.
+
+    One writes and one judges, and the split is deliberate. ``init`` over a
+    checkout whose stubs differ from what ships reports that and leaves them
+    alone — restamping somebody's file is not a thing a command should do
+    quietly — and ``doctor`` is where a difference becomes a finding with an
+    exit code. So neither has to guess at the other's job.
+    """
+    init = sub.add_parser(
+        "init",
+        help="stamp the forge's caller stubs into an intent checkout",
+        description=(
+            "Run in an intent checkout whose repos already exist. Reads the intent "
+            "slug, the products and the forge from `.vellum/workspace.yaml` and "
+            "writes one caller stub per shipped workflow, pinned to --ref or, by "
+            "default, this CLI's own version. Idempotent: over an installed "
+            "checkout it writes nothing and says so. A stub that exists and "
+            "differs is reported and left alone unless --force is given. Exits 0 "
+            "whether it wrote or had nothing to do, and 2 when it cannot answer — "
+            "no workspace file, a forge it has no stubs for."
+        ),
+    )
+    init.add_argument(
+        "checkout", nargs="?", default=".", help="the intent repo checkout (default: .)"
+    )
+    init.add_argument(
+        "--ref",
+        help="the Vellum ref the stubs pin (default: v<this CLI's version>). "
+             "Whether that ref exists is not knowable from an intent checkout, "
+             "so the report says so rather than the command guessing one that does",
+    )
+    init.add_argument(
+        "--branch",
+        default=DEFAULT_BRANCH,
+        help=f"the default branch on-spec-merge watches (default: {DEFAULT_BRANCH}). "
+             f"Installation data, not logic: an installation whose default branch "
+             f"is not {DEFAULT_BRANCH} is not a drifted one, and `doctor` exempts "
+             f"the branch list from its `on:` comparison for that reason",
+    )
+    init.add_argument(
+        "--force",
+        action="store_true",
+        help="restamp a stub that exists and differs; this is how a ref is bumped",
+    )
+    _add_install_common(init)
+
+    doctor = sub.add_parser(
+        "doctor",
+        help="check that the installed stubs are what this CLI ships",
+        description=(
+            "Verifies installed-matches-shipped from the checkout alone: every "
+            "shipped workflow has a stub, each stub parses, names the shipped "
+            "workflow from a job with the shipped id, pins a ref, passes its "
+            "secret by name AND to the secret of that name, carries no logic of "
+            "its own — no second job, no `run:`, and nothing on the delegating "
+            "job but `uses`, `with` and `secrets` — and its caller half, the "
+            "`on:`, `permissions:` and `concurrency:` blocks, each of which "
+            "fails silently when wrong, is what ships. Any OTHER file under the "
+            "workflows directory that delegates here or runs `vellum` is "
+            "reported as a stray. Comments are not compared, and neither is the "
+            "branch list, which is the installation's own (`init --branch`). "
+            "Exits 1 on a finding, 2 when it cannot answer, 0 "
+            "when every stub matches. Ref currency is REPORTED, never failed on "
+            "(spec/features/installation.md), and what a checkout cannot know — "
+            "that the secret is set, that the forge permits reuse of a private "
+            "repo's workflows in the organization — is said rather than passed "
+            "over."
+        ),
+    )
+    doctor.add_argument(
+        "checkout", nargs="?", default=".", help="the intent repo checkout (default: .)"
+    )
+    _add_install_common(doctor)
+
+
+def _add_install_common(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--from",
+        dest="host",
+        default=HOST_REPO,
+        help=f"the repo hosting the reusable workflows (default: {HOST_REPO}); "
+             f"for a fork or an internal mirror",
+    )
+    p.add_argument(
+        "--forge",
+        choices=FORGES,
+        help="override the forge `.vellum/workspace.yaml` names",
+    )
+    p.add_argument(
+        "--releases-from",
+        help="a waviisoft/vellum checkout to read `v*` release tags from, so the "
+             "pinned ref can be compared with the newest release. Without one "
+             "the report says currency was not checked rather than implying it "
+             "was; currency is reported either way and never failed on",
+    )
+
+
 def _add_common_ledger_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--version",
@@ -712,6 +824,23 @@ def main(argv: list[str] | None = None) -> int:
             return _budget(args)
         if args.command == "verify":
             return _verify(args)
+        if args.command == "init":
+            return init_run(
+                args.checkout,
+                ref=args.ref,
+                host=args.host,
+                forge=args.forge,
+                force=args.force,
+                releases_from=args.releases_from,
+                branch=args.branch,
+            )
+        if args.command == "doctor":
+            return doctor_run(
+                args.checkout,
+                host=args.host,
+                forge=args.forge,
+                releases_from=args.releases_from,
+            )
     except SpecTreeError as exc:
         print(f"vellum: {exc}", file=sys.stderr)
         return 2
@@ -741,7 +870,7 @@ def main(argv: list[str] | None = None) -> int:
     # blocks a merge on; a mistyped `--role` reaching a caller as "this PR wrote
     # outside its trees" would be a red nobody can find the cause of.
     except (BoundaryError, ChainError, BudgetError, DependencyError, ExitDutyError,
-            TickError, ReleaseError) as exc:
+            InstallError, TickError, ReleaseError) as exc:
         print(f"vellum: {exc}", file=sys.stderr)
         return 2
     # A cut that cannot be made, a pointer that would move backwards, a shallow

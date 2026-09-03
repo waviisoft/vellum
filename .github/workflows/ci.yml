@@ -1,5 +1,8 @@
-# CI for THIS repo (the product repo). Distinct from adapters/github/, which
-# holds workflows written for the intent repo and is not run here.
+# CI for THIS repo (the product repo). Distinct from the three `workflow_call`
+# workflows beside it — `spec-ci.yml`, `on-spec-merge.yml`, `harness-ci.yml` —
+# which hold the logic an INTENT repo's caller stubs invoke and never run for
+# this repo: they have no trigger but `workflow_call`. This one is the
+# product repo's own tests and conformance check.
 #
 # Runners: this organisation schedules Actions on Blacksmith, not on
 # GitHub-hosted runners. `runs-on: ubuntu-latest` is never assigned a runner

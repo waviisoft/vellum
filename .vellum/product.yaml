@@ -19,7 +19,7 @@ intent:
 # loud wave closed; its decorative name arrives when the intent workflow tags it.
 #
 pin:
-  commit: 82aa1e869f4537f2356667bb5e25e1c7784327c0
+  commit: ce74822b5a48b6a198d64db6cffd655f0d5297f3
   name: null
 
 # This repo's entry in the intent repo's .vellum/workspace.yaml.
@@ -32,8 +32,11 @@ product:
 # checkout fact here — nothing mounts it — so that boundary is now the plain
 # one it always was for the intent repo: implementers hold no intent-repo
 # credentials (spec/features/repo-topology.md, least authority).
+# `.github/workflows/` joined the implementer's trees with the installer wave
+# (spec/features/installation.md): the adapter logic ships from here as
+# reusable workflows, so they are product code an implementer maintains.
 write_boundaries:
-  implementer: [src, tests, .vellum/memory, adapters, README.md]
+  implementer: [src, tests, .vellum/memory, adapters, README.md, .github/workflows]
 
 # The spec-first guard and the certification runner arrive in v0.2
 # (docs/design.md section 10); nothing in this repo enforces them yet.
