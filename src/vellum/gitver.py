@@ -104,6 +104,25 @@ def names(repo: Path) -> dict[str, str]:
     return {sha: name for sha, (_, name) in found.items()}
 
 
+def tags(repo: Path, pattern: str) -> list[str]:
+    """Tag names in *repo* matching a refname glob, unordered.
+
+    Deliberately returns names and nothing else: the caller decides what a name
+    means and how names order. `names()` above reads `spec-v<N>` for display;
+    `install.releases` reads `v<N.N.N>` to report an installation's currency.
+    Neither ordering belongs here — a shared "sort the tags" would have to pick
+    one, and lexical order is exactly the hazard both callers exist to avoid
+    (`v0.10.0` sorts below `v0.9.0`).
+    """
+    return [
+        line.strip()
+        for line in _git(
+            repo, "for-each-ref", f"refs/tags/{pattern}", "--format=%(refname:short)"
+        ).split("\n")
+        if line.strip()
+    ]
+
+
 def markdown_at(repo: Path, ref: str, prefix: str) -> list[str]:
     """Repo-relative paths of every ``.md`` file under *prefix* at *ref*."""
     args = ["ls-tree", "-r", "--name-only", ref]

@@ -19,7 +19,18 @@ behavior.
 
 This is the v0.1 milestone — the hand-built loop. It proves spec CI, scenario
 extraction and the ledger format. The agent reviews, the planner, the harness
-and auto-merge are v0.2 and are stubbed, loudly, in `adapters/github/`.
+and auto-merge are v0.2 and are stubbed, loudly, in the reusable workflows
+under `.github/workflows/`.
+
+**The forge adapters ship once and install thin.** This repo hosts the real
+logic of each adapter workflow — `spec-ci`, `on-spec-merge`, `harness-ci` — as
+a `workflow_call` workflow under `.github/workflows/`, and an intent repo
+carries one caller stub per workflow naming it at a pinned ref. `vellum init`
+stamps the stubs; `vellum doctor` checks that what is installed is what ships.
+Installing them **renames the required status checks** — a job calling a
+reusable workflow reports as `<calling job>/<called job name>` — so branch
+protection has to be updated with them. See
+[`adapters/github/README.md`](adapters/github/README.md).
 
 ## Setup
 
@@ -243,6 +254,56 @@ vellum pin advance . --to 0e9f3f57fd94fa0cbbda6602da9a79c609e1c231 \
 An intent checkout is required and there is no `--force`: a pin naming a
 non-version is the failure this command exists to prevent.
 
+### `vellum init [<intent-checkout>]`
+
+Stamps the forge's caller stubs into an intent checkout whose repos already
+exist. Reads the intent slug, the products and the forge from
+`.vellum/workspace.yaml`, and writes one stub per shipped workflow into
+`.github/workflows/`, pinned to `--ref` or, by default, this CLI's own version.
+
+```sh
+cd ../vellum-intent
+vellum init .                            # pins v<this CLI's version>
+vellum init . --ref main                 # or pin something else
+vellum init . --ref v0.2.0 --force       # upgrading is bumping the ref
+```
+
+Idempotent: run again over an installed checkout it writes nothing and says so.
+A stub that exists and *differs* is reported and left alone — writing is this
+command's job and judging is `doctor`'s — and `--force` restamps it. Exit 0
+whether it wrote or had nothing to do; 2 when it cannot answer (no workspace
+file, a forge it has no stubs for).
+
+**The default ref may not exist, and the report says so rather than guessing
+one that does.** Nothing in an intent checkout can see the product repo's tags;
+pass `--releases-from <a vellum checkout>` to have it read them. **This repo has
+cut no `v*` tag yet**, so install with `--ref main` until it does.
+
+### `vellum doctor [<intent-checkout>]`
+
+Verifies installed-matches-shipped from the checkout alone: every shipped
+workflow has a stub, each stub parses, names the shipped workflow, pins a ref,
+and passes its secret by name. **A stub edited in place to carry logic — a job
+of its own, or any `run:` — is a finding, named by file.** So is a caller half
+that has drifted: the `on:`, `permissions:` and `concurrency:` blocks are
+compared against what ships, because each of the three fails *silently* when
+wrong — a narrowed trigger is a required check that never reports, a narrowed
+permission is a job refused at the point of use. Comments are not compared.
+
+```sh
+vellum doctor .                                     # 1 on a finding, 0 when every stub matches
+vellum doctor . --releases-from ../vellum           # + compare the pinned ref to the newest release
+```
+
+**Ref currency is reported, never failed on**, mirroring the divergence posture
+(`spec/features/repo-topology.md`): an installation behind the newest release is
+divergence to summarise, not a broken install.
+
+**What a checkout cannot know, doctor says it cannot check** rather than passing
+over — whether the `VELLUM_TOKEN` secret is set, and whether the forge allows
+reuse of this private repo's workflows within the organization. Both are forge
+state, and both are printed on a green run too.
+
 ## The mechanical guards
 
 Five read-only checks, each answering one question about neutral inputs. None
@@ -370,7 +431,8 @@ item's cost from a caller that knows — the same shape as `backpressure
 | `src/vellum/` | The CLI. |
 | `tests/` | The `unittest` suite plus fixture spec trees, including failing ones. |
 | `.github/workflows/ci.yml` | CI for **this** repo: tests, plus a conformance check on the pin. |
-| `adapters/github/` | Workflows **for the intent repo** — see [`adapters/github/README.md`](adapters/github/README.md). |
+| `.github/workflows/{spec-ci,on-spec-merge,harness-ci}.yml` | The **reusable** (`workflow_call`) workflows every installation's intent repo calls. No trigger of their own, so they never run for this repo. |
+| `adapters/github/` | The **caller stubs** those installations carry, and their README — see [`adapters/github/README.md`](adapters/github/README.md). |
 | `.vellum/memory/` | Area notes, wave worklogs, and the map. Start at [`.vellum/memory/map.md`](.vellum/memory/map.md). |
 | `.vellum/product.yaml` | Backref to the intent repo, and **the pin of record**. |
 

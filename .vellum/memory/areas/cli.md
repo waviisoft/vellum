@@ -1,11 +1,12 @@
 # Area: the `vellum` CLI
 
-`src/vellum/`. Sixteen commands — `lint`, `suite extract|partition`,
+`src/vellum/`. Eighteen commands — `lint`, `suite extract|partition`,
 `ledger open|advance|verify`, `certify record|check`, `release cut`, `tick`, the
-three pipeline commands `mint`, `backpressure`, `pin advance`, and the five
+three pipeline commands `mint`, `backpressure`, `pin advance`, the five
 mechanical guards `verify boundaries|deps|exit-duty`, `ledger verify` and
-`budget` — dispatched from `build_parser()` in `src/vellum/cli.py`. Every claim
-below names a file or symbol you can grep for.
+`budget`, and the two installer commands `init` and `doctor` — dispatched from
+`build_parser()` in `src/vellum/cli.py`. Every claim below names a file or
+symbol you can grep for.
 
 ## Module map
 
@@ -17,13 +18,15 @@ below names a file or symbol you can grep for.
 | `src/vellum/links.py` | `find_references()`, `resolve()`, `heading_anchor()`, `heading_anchors()`. |
 | `src/vellum/lint.py` | `lint_tree()`, `Finding`, the `_check_*` functions. |
 | `src/vellum/suite.py` | `extract()`, `scan_file()`, `scenarios_in()`, `BlockError`, `DroppedScenarios`, `fingerprint()`, `version_history()`, `History`, `to_dict()`. |
-| `src/vellum/gitver.py` | `spec_commits()`, `names()`, `is_shallow()`, `markdown_at()`, `show()`. All subprocess git lives here. |
+| `src/vellum/gitver.py` | `spec_commits()`, `names()`, `tags()`, `is_shallow()`, `markdown_at()`, `show()`. All subprocess git lives here. |
 | `src/vellum/ledger.py` | `open_record()`, `advance()`, `find_record()`, `dump()`, `parse_time()`, `upsert_plan()`, `RECORD_KEYS`, `ITEM_KEYS`. Also the certification and lease half: `certify()`, `certification_authorizes()`, `take_lease()`, `clear_lease()`, `active_lease()`. |
 | `src/vellum/certify.py` | `check()` -> `Authorization`, `run_check()`, `run_record()`. The merge gate's evidence. |
 | `src/vellum/mint.py` | `mint()` -> `Mint`, `_commit_record()`. The `on-spec-merge` bookkeeping. |
 | `src/vellum/backpressure.py` | `measure()` -> `Window`, `run()`, `SETTLED_STATES`. The divergence gate. |
 | `src/vellum/pin.py` | `advance()` -> `Advance`, `verify_version()`, `_rewrite()`. The pin close. |
 | `src/vellum/config.py` | `load()`, `divergence_cap()`, `INTENT_ENV`. Reads `.vellum/config.yaml`. |
+| `src/vellum/workspace.py` | `load()`, `products()`, `intent()`, `forge()`, `WORKSPACE_RELPATH`, `DEFAULT_FORGE`. The one reader of `.vellum/workspace.yaml`. |
+| `src/vellum/install.py` | `init()` -> `Init`, `doctor()` -> `Doctor`, `render()`, `inspect()`, `releases()`, `currency()` -> `Currency`, `SHIPPED`, `HOST_REPO`, `CANNOT_KNOW`. The adapters install thin. |
 | `src/vellum/product.py` | `load()`, `write_boundaries()`, `normalise_tree()`, `under()`, `PRODUCT_RELPATH`. Reads `.vellum/product.yaml`. |
 | `src/vellum/boundaries.py` | `check()` -> `Boundaries`, `run()`. The write-boundary guard. |
 | `src/vellum/exitduty.py` | `check()` -> `ExitDuty`, `run()`, `AREAS_TREE`. The memory-update guard. |
@@ -31,7 +34,7 @@ below names a file or symbol you can grep for.
 | `src/vellum/chain.py` | `verify()` -> `Chain`, `Finding`, `CERTIFIABLE_STATES`. The ledger guard. |
 | `src/vellum/budget.py` | `measure()` -> `Spend`, `window_for()`, `parse_time()`, `PARK_MARKER`. The spend guard. |
 | `src/vellum/reconcile.py` | `reconcile()` -> `Tick`, `run()`, `Action`, `Observed`, `read_observed()`, `corpus_answer()`, `question_terms()`, `_Reconciler`, `ACTION_KINDS`. The stateless reconciler. |
-| `src/vellum/release.py` | `cut()` -> `Cut`, `partition()` -> `Partition`, `run_cut()`, `run_partition()`, `load_releases()`, `conformed_pointer()`, `products()`, `parse_versions()`, `ReleaseError`, `ReleaseRefused`. Cuts and the armed/enforced split. |
+| `src/vellum/release.py` | `cut()` -> `Cut`, `partition()` -> `Partition`, `run_cut()`, `run_partition()`, `load_releases()`, `conformed_pointer()`, `products()` (delegating to `workspace.products`), `parse_versions()`, `ReleaseError`, `ReleaseRefused`. Cuts and the armed/enforced split. |
 | `src/vellum/text.py` | `one_line()`. Flattening an untrusted string before it reaches a report. |
 
 ## Scenario identity
@@ -1413,6 +1416,102 @@ already doing it is what made the omission invisible.
 **`ledger.now()` is public now**, because a cut is stamped with it. One
 definition of how this project writes a moment, next to the `parse_time()` that
 reads one — the same reason `parse_time` moved out of `budget.py`.
+
+## The installer commands
+
+`vellum init` and `vellum doctor`, in `src/vellum/install.py`, plus
+`src/vellum/workspace.py` which reads the file both of them start from.
+`spec/features/installation.md`, issue waviisoft/vellum-intent#23 part 1.
+
+**One writes, the other judges, and neither does the other's job.** `init`
+stamps caller stubs; over a stub that exists and *differs* it reports "left
+alone" and touches nothing, and `--force` is the only way it overwrites. So a
+stale or hand-edited stub is never silently destroyed by the command that
+installs, and never passed over by the command that checks. `init` has no exit
+code 1 at all — 0 whether it wrote or had nothing to do, 2 when it could not
+answer — because "there is something wrong with this installation" is doctor's
+sentence to pass.
+
+**The stubs are RENDERED, not copied, and `adapters/github/` is the rendering.**
+An installed CLI is a wheel: `adapters/` and `.github/` are repository paths,
+not package data, so a command that read them would work from a development
+checkout and fail from a pip install. `render()` builds each stub from the
+`SHIPPED` table; the three committed files under `adapters/github/` are what
+that produces at `default_ref()`, and
+`tests/test_install.py::TheCommittedTemplatesAreWhatInitWrites` asserts them
+byte-identical. That check is the whole point — this wave exists because a
+committed copy went stale beside the thing it copied, and a second artifact
+without an equality test is the same mistake one level up. **When
+`__version__` changes, re-render the three files** (the test says how) or the
+test reddens, which is the intended alarm and not a nuisance.
+
+**The default ref is `v<__version__>` and the command says it cannot confirm
+it.** `spec/features/installation.md`: "pinning the ref it is given or the CLI's
+own version by default". An intent checkout cannot see the product repo's tags,
+so `Init.report()` states plainly that nothing here can confirm
+`waviisoft/vellum` carries that tag. `--releases-from <a vellum checkout>` is
+how either command gets to read them. **This repo has cut no `v*` tag**, so the
+committed stubs currently pin a tag that does not exist; install with
+`vellum init . --ref main` until a release is cut. Do not "fix" that by
+defaulting to `main` — a default that resolves is worse than one that does not
+when the resolution is to the wrong thing, and the report is the honest half.
+
+**Ref currency is reported and never failed on, and the code is shaped so it
+cannot leak into the verdict.** `Currency` has no failure mode: every way of not
+knowing — no checkout supplied, a path that is not a repo, a repo with no `v*`
+tags — comes back as a `Currency` with `unknown` set, never as an exception.
+`Doctor.findings` reads only `inspect()`'s output and never touches `currency`,
+and `test_a_stale_ref_alongside_a_finding_still_exits_one_for_the_finding` pins
+that the two are independent in both directions. Same posture as `ci.yml`'s
+"Report divergence from spec-head" and for the same reason: a report that can
+fail the check is not a report (`spec/features/repo-topology.md`).
+
+**Releases order as version tuples, not lexically.** `RELEASE_RE` +
+`sorted()` on the parsed integers in `releases()`. `v0.10.0` is newer than
+`v0.9.0` and a lexical sort says otherwise — the same hazard the old `max(spec-v*)
++ 1` minting had, and `test_releases_order_as_versions_not_lexically` is there
+because it is the one bug this function can have that still looks like it works.
+
+**`gitver.tags()` returns names and no order.** Two callers read tags for two
+different naming schemes (`names()` for `spec-v<N>`, `install.releases()` for
+`v<N.N.N>`) and a shared "sort the tags" would have to pick one ordering — which
+is exactly the thing both callers exist to get right for themselves.
+
+**`CANNOT_KNOW` prints on a green run too.** `spec/features/installation.md`:
+"What a checkout cannot know ... doctor says it cannot check, rather than
+passing over." A report that lists its blind spots only when something else went
+wrong is one nobody reads at the moment they matter, so
+`test_it_says_what_a_checkout_cannot_know` asserts it on the passing run
+specifically. The two are: whether `VELLUM_TOKEN` is set, and whether
+`waviisoft/vellum` permits reuse of its workflows within the organization
+(Actions > General > Access). Both are forge state and no checkout can see
+either.
+
+**A finding is read out of the parsed stub, never grepped for.** `inspect()`
+parses the YAML and reads `jobs`, `uses`, `secrets` and `with`. The stub's own
+comment contains the words `secrets: inherit` while explaining why it does not
+use them, so a text search answers a different question than the one asked —
+which is also why `test_the_secret_is_passed_by_name_and_never_inherited` reads
+the parsed mapping.
+
+**`carries-logic` is two tests, not one.** A second job is logic beside the
+delegation; a `run:` anywhere is logic inside it. `_walk()` finds the second
+regardless of how deeply it is nested, because "one extra step in the existing
+job" is the shape a local tweak actually takes.
+
+**`workspace.forge()` defaults to `github` and `check_forge()` refuses an
+unadapted one.** The default is safe *because* of the refusal: every workspace
+file written before the installer has no `forge` key — this installation's own
+included — so absent has to mean something, and the dangerous case (stamping
+GitHub stubs into a GitLab installation) needs the key present and naming a
+forge with no stubs, which raises.
+
+**`release.products()` delegates to `workspace.products()`.** It used to own the
+reading and said in a comment that it was the only reader; it is not any more.
+The delegation keeps its `ReleaseError` wrapper so a caller still learns which
+*command* refused — the same shape `config.write_boundaries` uses over
+`product.role_trees`, and for the same reason: two readers of one file is how
+the two come to disagree about what it says.
 
 ## Patterns worth keeping
 

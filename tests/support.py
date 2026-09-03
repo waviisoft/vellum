@@ -456,6 +456,65 @@ DEFAULT_INTENT_BOUNDARIES = {
 }
 
 
+def write_workspace(
+    root: Path,
+    intent: str = "waviisoft/vellum-intent",
+    products: dict | None = None,
+    forge=UNSET,
+) -> Path:
+    """Write `.vellum/workspace.yaml`, the file `init` and `doctor` read.
+
+    `forge` is `UNSET` for "write no forge key", which is the shape every
+    workspace file written before the installer has — this installation's own
+    included — and therefore the shape the default has to be right for.
+    """
+    (root / ".vellum").mkdir(parents=True, exist_ok=True)
+    path = root / ".vellum" / "workspace.yaml"
+    lines = []
+    if intent is not None:
+        lines.append(f"intent: {intent}")
+    if forge is not UNSET:
+        lines.append(f"forge: {forge}")
+    if products is None:
+        products = {"core": "waviisoft/vellum"}
+    if products:
+        lines.append("products:")
+        for name, repo in products.items():
+            lines.append(f"  {name}: {{repo: {repo}, trees: [src]}}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def make_installable_intent(root: Path, **kwargs) -> Path:
+    """The least an intent checkout needs to be one for `init` and `doctor`.
+
+    Deliberately not `make_intent_repo`: those two commands read the workspace
+    file and the `.github/workflows/` tree and nothing else, so a fixture
+    carrying a spec tree, a ledger and a config would be asserting that they
+    need things they do not.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    write_workspace(root, **kwargs)
+    return root
+
+
+def make_releases_repo(root: Path, tags: tuple[str, ...] = ("v0.1.0", "v0.2.0")) -> Path:
+    """A stand-in for a `waviisoft/vellum` checkout carrying release tags.
+
+    `vellum doctor --releases-from` reads `v*` tags to *report* currency, so the
+    fixture is a repo with tags and nothing else — the content those tags point
+    at is never read.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    git(root, "init", "-q", "-b", "main", ".")
+    (root / "README.md").write_text("# vellum\n", encoding="utf-8")
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "the product begins")
+    for tag in tags:
+        git(root, "tag", tag)
+    return root
+
+
 def make_git_intent_repo(root: Path, boundaries=UNSET, files: dict | None = None) -> Path:
     """An intent repo with git history and a `write_boundaries` block in its config.
 

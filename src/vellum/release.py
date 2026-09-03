@@ -87,16 +87,18 @@ from vellum.ledger import (
 )
 from vellum.ledger import now as ledger_now
 from vellum.suite import DroppedScenarios, extract, to_dict
+from vellum import workspace
 from vellum.text import one_line
 
 #: The file every command here reads and ``release cut`` writes.
 RELEASES_RELPATH = "releases.yaml"
 
 #: Where the products a cut may pin are declared: "``.vellum/workspace.yaml``
-#: maps the products" (``spec/features/repo-topology.md``). Read here rather
-#: than modelled in a module of its own, because this is its only reader —
-#: a schema written ahead of one is a second place for the shape to drift.
-WORKSPACE_RELPATH = Path(".vellum") / "workspace.yaml"
+#: maps the products" (``spec/features/repo-topology.md``). This is no longer
+#: its only reader — ``vellum init`` and ``vellum doctor`` read the same file —
+#: so the reading moved to ``vellum.workspace`` and this is the same constant
+#: re-exported, not a second definition of the path.
+WORKSPACE_RELPATH = workspace.WORKSPACE_RELPATH
 
 #: Fixed emission order for ``releases.yaml``, and for one cut inside it. The
 #: reason ``vellum.ledger`` fixes its own: a state change is then a one-line
@@ -225,27 +227,16 @@ def products(checkout: str | Path) -> dict[str, str]:
     Missing is an error, not an empty allowlist: the failure a silent default
     buys is a cut pinning ``cor=<sha>`` and saying nothing, which is precisely
     the version set a later release is composed from.
+
+    Read by ``vellum.workspace``, which ``vellum init`` and ``vellum doctor``
+    read the same file through, and re-raised as a ``ReleaseError`` so a caller
+    still learns which *command* refused — the same shape
+    ``vellum.config.write_boundaries`` uses over ``vellum.product.role_trees``.
     """
-    path = Path(checkout) / WORKSPACE_RELPATH
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except OSError as exc:
-        raise ReleaseError(
-            f"{path}: cannot read the workspace: {exc}. It maps this "
-            f"installation's product repos (spec/features/repo-topology.md), and "
-            f"a cut pins a version per repo, so the products it may name are read "
-            f"from here rather than accepted from the command line."
-        ) from exc
-    except yaml.YAMLError as exc:
-        raise ReleaseError(f"{path}: not valid YAML: {exc}") from exc
-    entries = data.get("products") if isinstance(data, dict) else None
-    if not isinstance(entries, dict) or not entries:
-        raise ReleaseError(f"{path}: declares no products, so a cut can pin nothing")
-    found: dict[str, str] = {}
-    for name, value in entries.items():
-        repo = value.get("repo") if isinstance(value, dict) else value
-        found[str(name)] = str(repo) if repo is not None else ""
-    return found
+        return workspace.products(checkout)
+    except workspace.WorkspaceError as exc:
+        raise ReleaseError(str(exc)) from exc
 
 
 def parse_versions(pairs: list[str], declared: dict[str, str], where: Path) -> dict[str, str]:
