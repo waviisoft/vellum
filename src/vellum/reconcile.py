@@ -1039,7 +1039,9 @@ class _Reconciler:
             self.act(
                 "open-question", version, item,
                 f"the corpus does not answer {one_line(question, 60)!r}; open a "
-                f"question issue mentioning the owner and park the item",
+                f"question issue mentioning the architect and park the item — the "
+                f"owner is the next rung, reached by the architect's judgment or the "
+                f"coding agent's appeal (spec/decisions/2026-09-03-architect-answers-first.md)",
             )
             if item is not None:
                 self.parked_items.add((version, item))

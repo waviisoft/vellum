@@ -541,6 +541,19 @@ class TestCorpusAnswerableQuestionsBounce(TickCase):
         self.assertIn("parked behind an open question",
                       " ".join(a.detail for a in tick.of_kind("hold")))
 
+    def test_an_unanswered_question_is_raised_to_the_architect_not_the_owner(self):
+        """``@id:architect-answers-before-owner``: the ladder is corpus, then
+        architect, then owner (spec/decisions/2026-09-03-architect-answers-first.md).
+        The forge half a tick emits for a corpus miss names the architect as the
+        issue's addressee; the owner is the next rung, reached only by the
+        architect's judgment or the coding agent's appeal — never by the tick."""
+        tick = self.raise_question("Should settlement use kafka or rabbitmq?")
+        (opened,) = tick.of_kind("open-question")
+        self.assertIn("mentioning the architect", opened.detail)
+        self.assertNotIn("mentioning the owner", opened.detail)
+        self.assertIn("appeal", opened.detail, "the appeal path is named, not implied")
+        self.assertFalse(opened.taken, "opening the issue is the forge's half")
+
     def test_answering_writes_nothing_to_the_ledger(self):
         """The reply is a forge action; the ledger records no question at all."""
         tick = self.raise_question("How is a flaky certification run retried?")
