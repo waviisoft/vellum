@@ -59,6 +59,15 @@ writes no harness path is not checked against any role by this job — closing
 that half means asking "does this diff fit inside *some* declared role's
 trees?", which is CLI surface no spec change has asked for.
 
+**`harness/conformance.md` is not a harness edit.** The map is a generated
+report of the spec tree against the installed CLI, and the suite job fails a PR
+whose committed map does not match a fresh run — so a spec PR adding a scenario
+(with its steps already on `main`) must regenerate the map in the same PR to be
+green. The role classifier ignores that one file, otherwise the same PR would be
+read as a harness PR and failed for also writing `spec/`, and no scenario-adding
+spec change could ever land. Writing a step definition is harness engineering;
+refreshing the report is not.
+
 **Both jobs run on every PR, with no `paths:` filter.** That is about branch
 protection rather than cost: a path-filtered required check never reports on
 the PRs it filters out, and GitHub leaves those waiting forever. Both of these

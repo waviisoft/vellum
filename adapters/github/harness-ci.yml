@@ -132,6 +132,17 @@ jobs:
       # answer can be "yes, it touches harness/" for a PR that did not: the
       # guard then runs and reports honestly against a wider diff. Wrong loudly,
       # never wrong quietly.
+      #
+      # `harness/conformance.md` does not count. It is a generated report of
+      # the spec tree against the installed CLI, and the suite job below fails
+      # any PR whose committed map does not match a fresh run — so a spec PR
+      # that adds a scenario, or a product wave that turns a CANNOT RUN YET
+      # into a PASS, must regenerate it in the same PR to be green. Reading
+      # that regeneration as "this is a harness PR" would then fail the same
+      # PR for also writing `spec/`, and the two checks together would make
+      # every scenario-adding spec change un-landable. Regenerating the map is
+      # not harness engineering; writing a step definition is. A harness PR is
+      # unaffected: the file is inside `harness/` either way.
       - name: Does this PR write harness/?
         id: harness
         env:
@@ -139,7 +150,8 @@ jobs:
           HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           base="$(git merge-base "$BASE" "$HEAD" || echo "$BASE")"
-          if git diff --name-only --no-renames "$base" "$HEAD" -- harness | grep -q .; then
+          if git diff --name-only --no-renames "$base" "$HEAD" -- harness \
+               | grep -v '^harness/conformance\.md$' | grep -q .; then
             echo "touched=yes" >> "$GITHUB_OUTPUT"
           else
             echo "touched=no" >> "$GITHUB_OUTPUT"

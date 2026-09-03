@@ -71,6 +71,12 @@ forever. That is also why the check the intent repo most needs could not live in
 `.vellum/config.yaml`, and the breach being guarded — a harness session also
 editing `.vellum/memory/` — is a diff that touches none of them.
 
+**`harness/conformance.md` is excluded from the harness-PR classifier.** A spec
+PR that adds a scenario must regenerate the map in the same PR (the suite job
+compares it to a fresh run), and reading that as a harness PR would fail it for
+also writing `spec/`. Measured need: the installation and question-routing spec
+PRs (waviisoft/vellum-intent#64, #65) could not go green under the original rule.
+
 **The harness job's role comes out of the diff, and the half it leaves open is
 stated rather than hidden.** A PR writing `harness/` is a harness PR and must
 write nothing else; a PR writing no harness path is checked against no role at
