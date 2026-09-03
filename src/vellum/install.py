@@ -49,16 +49,38 @@ parsed rather than as text, so a stub somebody annotated is not a finding. What
 used to drift was a copied `run:` body; there is none here, and the blocks that
 remain are checked.
 
+The delegating job itself is held to ``JOB_KEYS`` — ``uses``, ``with``,
+``secrets`` and nothing else — because the same argument runs one level down and
+gets sharper: several of the keys that can be added there fail by *passing*. A
+job with ``if: false`` is **skipped**, and a skipped job reports **success** to
+branch protection, so the write-boundary gate goes green having run nothing.
+
+The one thing in a stub that is the *installation's* and not this product's
+------------------------------------------------------------------------------
+The branch ``on-spec-merge`` watches. ``init --branch`` stamps it and doctor's
+``on:`` compare exempts ``on.push.branches`` alone (``_comparable_on``), because
+a repository whose default branch is not ``main`` is not a drifted installation
+— and a check that reports a correct configuration as drift is one people learn
+to ignore, which costs more than the case it was catching. The exemption is one
+key wide on purpose: ``push`` must still be there, its ``paths:`` are still
+compared, and a trigger added beside it is still drift.
+
 The ref, and the two places it appears
 --------------------------------------
-``uses: ...@<ref>`` pins the workflow file; ``with: vellum-ref: <ref>`` pins the
-CLI the workflow installs. They are stamped equal and ``doctor`` reports when
-they have come apart, which is the honest shape: the ``@<ref>`` alone does not
-pin the CLI, because the checkout of ``waviisoft/vellum`` inside the body needs
-a ref it can be handed. Deriving the second from ``github.job_workflow_sha``
-would remove the second line at the cost of making the CLI version invisible in
-the installed file, and an installation's version has to be readable in the
-repository that runs it.
+``uses: ...@<ref>`` pins the workflow file; ``with: vellum-ref: "<ref>"`` pins
+the CLI the workflow installs. They are stamped equal and ``doctor`` reports
+when they have come apart, which is the honest shape: the ``@<ref>`` alone does
+not pin the CLI, because the checkout of ``waviisoft/vellum`` inside the body
+needs a ref it can be handed. Deriving the second from
+``github.job_workflow_sha`` would remove the second line at the cost of making
+the CLI version invisible in the installed file, and an installation's version
+has to be readable in the repository that runs it.
+
+The second is **quoted**, and that is a bug fix. Unquoted, ``--ref 1.10`` came
+back from the YAML reader as the float ``1.1`` and ``010`` as the int ``10``
+while the ``@<ref>`` half — part of a longer scalar — stayed a string, so a
+*freshly stamped* installation failed its own doctor with ``ref-mismatch``.
+``REF_RE`` forbids quotes, so nothing a caller passes can escape them.
 
 What a checkout cannot know
 ---------------------------
@@ -84,7 +106,6 @@ from vellum import __version__
 from vellum.gitver import GitUnavailable, tags
 from vellum.text import one_line
 from vellum.workspace import SLUG_RE, WorkspaceError, forge as workspace_forge
-from vellum.workspace import load as workspace_load
 from vellum.workspace import intent as workspace_intent
 from vellum.workspace import products as workspace_products
 from vellum.workspace import workspace_path
@@ -110,7 +131,21 @@ FORGES = tuple(sorted(WORKFLOWS_DIR))
 #: A pinnable ref: a tag, a branch, or a sha. Narrow because it is pasted into
 #: a ``uses:`` line the forge then resolves — a value carrying whitespace, a
 #: quote or a newline is a value that reshapes the file it is written into.
-REF_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._/-]*$")
+#:
+#: The four look-aheads are ``git check-ref-format``'s rules, kept because this
+#: value is *also* stamped into a branch list: a ref that git itself will not
+#: accept is one the forge resolves to nothing, and a stub that resolves to
+#: nothing fails at ``uses:`` on every run rather than here, once.
+REF_RE = re.compile(
+    r"^(?!.*\.\.)(?!.*//)(?!.*\.lock(?:/|$))[A-Za-z0-9_][A-Za-z0-9._/-]*$"
+)
+
+#: The branch an installation's ``on-spec-merge`` watches. Installation *data*,
+#: not logic: a repository whose default branch is `trunk` is not a drifted
+#: installation, and hard-coding `main` made one that could never be
+#: doctor-green. ``init --branch`` stamps it and doctor's ``on:`` compare exempts
+#: the branch list for that reason (see ``_comparable_on``).
+DEFAULT_BRANCH = "main"
 
 #: A release of this product: ``v`` and a dotted integer version. Read for
 #: *reporting* currency and nothing else, so a tag that does not match is
@@ -123,6 +158,31 @@ SECRET = "VELLUM_TOKEN"
 
 #: The input every shipped workflow declares.
 REF_INPUT = "vellum-ref"
+
+#: How a stub passes a secret: by name, and to the secret of the same name.
+#: ``doctor`` reads the referenced name back out rather than comparing the text,
+#: so a stub whose spacing an operator changed is not a finding and
+#: ``VELLUM_TOKEN: ${{ secrets.ORG_ADMIN_PAT }}`` — which satisfies any check
+#: made by key alone — is.
+SECRET_REF_RE = re.compile(r"^\$\{\{\s*secrets\.([A-Za-z0-9_]+)\s*\}\}$")
+
+
+def secret_ref(name: str) -> str:
+    """The expression a stub passes *name* as: ``${{ secrets.<name> }}``."""
+    return f"${{{{ secrets.{name} }}}}"
+
+
+#: Every key the delegating job may carry. An allowlist rather than a denylist
+#: because the failure is silent in both directions and the list of ways to be
+#: wrong is open-ended: ``if: false`` makes a *skipped* job, which reports
+#: success to branch protection and quietly neuters the gate; a ``strategy:``
+#: matrix runs the reusable workflow N times, which for ``on-spec-merge`` is N
+#: minters racing the ledger push inside one run; ``needs:``, ``timeout-minutes``
+#: and ``continue-on-error`` each change whether or how a required check
+#: reports, and a job-level ``permissions:`` narrower than the shipped grant is
+#: refused at the point of use. None of those reddens on its own. Only these
+#: three are rendered, so anything else is an edit somebody made.
+JOB_KEYS = ("uses", "with", "secrets")
 
 
 class InstallError(Exception):
@@ -152,7 +212,10 @@ class Shipped:
     name: str
     #: Prose for the top of the stub, after the generated banner.
     about: str
-    #: The stub's ``on:`` block, verbatim.
+    #: The stub's ``on:`` block, as a template formatted with ``branch`` — the
+    #: one piece of a trigger that is the *installation's* data rather than this
+    #: product's shape. A literal brace in here has to be doubled; none of the
+    #: three carries one, and ``render`` raising is how a fourth would find out.
     triggers: str
     #: The stub's ``permissions:`` block, verbatim, with the note that explains it.
     permissions: str
@@ -198,7 +261,7 @@ ON_SPEC_MERGE = Shipped(
 # the suite, files work items and pushes (spec/features/spec-pipeline.md).""",
     triggers="""on:
   push:
-    branches: [main]
+    branches: ["{branch}"]
     paths:
       - 'spec/**'
   workflow_dispatch:
@@ -276,8 +339,10 @@ jobs:
     uses: {host}/{workflows_dir}/{filename}@{ref}
     with:
       # The ref the CLI itself is checked out and installed from, kept equal to
-      # the ref above so one installation runs one version of both.
-      {ref_input}: {ref}
+      # the ref above so one installation runs one version of both. QUOTED: a
+      # bare `1.10`, `010`, `null`, `true` or `on` is not a string to a YAML
+      # reader, and an installation stamped with one failed its own doctor.
+      {ref_input}: "{ref}"
     # By name, never `secrets: inherit`: the reusable workflow holds exactly the
     # credential its jobs name and nothing else in this installation
     # (spec/features/installation.md).
@@ -286,15 +351,22 @@ jobs:
 """
 
 
-def render(shipped: Shipped, *, host: str = HOST_REPO, ref: str, forge: str = "github") -> str:
+def render(
+    shipped: Shipped,
+    *,
+    host: str = HOST_REPO,
+    ref: str,
+    forge: str = "github",
+    branch: str = DEFAULT_BRANCH,
+) -> str:
     """One caller stub, as the text ``init`` writes and ``adapters/`` holds.
 
-    Both interpolated values are validated, and for one reason: they are pasted
-    into a `uses:` line in a workflow file a forge then executes. A `--from`
-    carrying a newline and two spaces of indent does not name a fork — it closes
-    the `uses:` line and opens a second job, in a file this command stamps with
-    `pull-requests: write`. Neither value is more trusted than the other because
-    both arrive on the command line.
+    All three interpolated values are validated, and for one reason: they are
+    pasted into a workflow file a forge then executes. A `--from` carrying a
+    newline and two spaces of indent does not name a fork — it closes the
+    `uses:` line and opens a second job, in a file this command stamps with
+    `pull-requests: write`. None is more trusted than the others because all
+    three arrive on the command line.
     """
     if not SLUG_RE.match(host):
         raise InstallError(
@@ -305,7 +377,14 @@ def render(shipped: Shipped, *, host: str = HOST_REPO, ref: str, forge: str = "g
     if not REF_RE.match(ref):
         raise InstallError(
             f"--ref {ref!r} is not a usable ref. It is pasted into a `uses:` line "
-            f"the forge resolves, so it must be a plain tag, branch or sha."
+            f"the forge resolves, so it must be a plain tag, branch or sha that "
+            f"`git check-ref-format` would accept."
+        )
+    if not REF_RE.match(branch):
+        raise InstallError(
+            f"--branch {branch!r} is not a usable branch name. It is stamped into "
+            f"the `branches:` list of a trigger, so it must be a plain branch name "
+            f"that `git check-ref-format` would accept."
         )
     return BANNER.format(name=shipped.name, host=host, about=shipped.about) + BODY.format(
         name=shipped.name,
@@ -315,7 +394,7 @@ def render(shipped: Shipped, *, host: str = HOST_REPO, ref: str, forge: str = "g
         ref=ref,
         ref_input=REF_INPUT,
         secret=SECRET,
-        triggers=shipped.triggers,
+        triggers=shipped.triggers.format(branch=branch),
         permissions=shipped.permissions,
         concurrency=shipped.concurrency,
     )
@@ -460,6 +539,7 @@ class Init:
     products: dict[str, str]
     host: str
     ref: str
+    branch: str
     currency: Currency
     stamps: list[Stamp]
 
@@ -467,6 +547,7 @@ class Init:
         lines = [
             f"vellum init — {self.forge} caller stubs in {self.checkout}",
             f"  intent repo:  {self.intent}",
+            f"  branch:       {self.branch} (what on-spec-merge watches)",
             f"  workflows:    {self.host} at {self.ref}",
             "  products:     " + ", ".join(
                 # Read out of `.vellum/workspace.yaml`, which anyone who can
@@ -542,6 +623,7 @@ def init(
     forge: str | None = None,
     force: bool = False,
     releases_from: str | Path | None = None,
+    branch: str = DEFAULT_BRANCH,
 ) -> Init:
     """Stamp the caller stubs into an intent checkout. Idempotent."""
     root = Path(checkout)
@@ -559,7 +641,7 @@ def init(
     stamps: list[Stamp] = []
     for shipped in SHIPPED:
         path = directory / shipped.filename
-        text = render(shipped, host=host, ref=pinned, forge=chosen)
+        text = render(shipped, host=host, ref=pinned, forge=chosen, branch=branch)
         existing: str | None = None
         if path.exists():
             try:
@@ -597,6 +679,7 @@ def init(
         products=declared,
         host=host,
         ref=pinned,
+        branch=branch,
         currency=currency(releases_from),
         stamps=stamps,
     )
@@ -609,12 +692,13 @@ def run_init(
     forge: str | None = None,
     force: bool = False,
     releases_from: str | None = None,
+    branch: str = DEFAULT_BRANCH,
     out=None,
 ) -> int:
     """Report what was stamped. Exit 0: it wrote, or there was nothing to do."""
     stream = out if out is not None else sys.stdout
     print(init(checkout, ref=ref, host=host, forge=forge, force=force,
-               releases_from=releases_from).report(), file=stream)
+               releases_from=releases_from, branch=branch).report(), file=stream)
     return 0
 
 
@@ -672,6 +756,24 @@ def _caller_half(data: dict) -> dict:
     }
 
 
+def _comparable_on(block):
+    """An ``on:`` block with the installation's own branch list taken out.
+
+    The one piece of a trigger that is *installation data* and not this
+    product's shape: ``on-spec-merge`` watches the repository's default branch,
+    and an installation whose default branch is not ``main`` is not a drifted
+    installation — hard-coding it made one that could never be doctor-green.
+
+    Narrow on purpose. ``push`` itself must still be present and a mapping (an
+    ``on-spec-merge`` that does not run on a push does not run), everything else
+    under it — ``paths``, above all — is still compared, and a trigger *added*
+    beside ``push`` still differs. Only the branch list is exempt.
+    """
+    if not isinstance(block, dict) or not isinstance(block.get("push"), dict):
+        return block
+    return {**block, "push": {k: v for k, v in block["push"].items() if k != "branches"}}
+
+
 def inspect(
     path: Path, shipped: Shipped, *, host: str, forge: str, relative: str
 ) -> tuple[list[Finding], str | None]:
@@ -723,7 +825,10 @@ def inspect(
                                                       ref=default_ref())))
     installed_half = _caller_half(data)
     for block in CALLER_HALF:
-        if installed_half[block] != shipped_half[block]:
+        left, right = installed_half[block], shipped_half[block]
+        if block == "on":
+            left, right = _comparable_on(left), _comparable_on(right)
+        if left != right:
             found.append(Finding(relative, "drifted", (
                 f"its `{block}:` is not what ships. Installed "
                 f"{one_line(str(installed_half[block]))}; ships "
@@ -744,7 +849,12 @@ def inspect(
             f"is one job that delegates. A job of its own is logic that can drift "
             f"from what ships (spec/features/installation.md)."
         )))
-    runs = [node for node in _walk(data) if "run" in node]
+    # `jobs` only, never the whole document: a top-level `defaults: {run: {shell:
+    # bash}}` is a declaration, not a body, and calling it logic made a false
+    # finding out of a legal file. Everything outside `jobs` that a stub may
+    # carry is enumerated by CALLER_HALF and JOB_KEYS, so scanning the document
+    # for `run:` was never what stopped a second `on:` block either.
+    runs = [node for job in jobs.values() for node in _walk(job) if "run" in node]
     if runs:
         found.append(Finding(relative, "carries-logic", (
             f"carries {len(runs)} `run:` body/bodies. A stub holds no logic — that "
@@ -755,10 +865,12 @@ def inspect(
     want = f"{host}/{WORKFLOWS_DIR[forge].as_posix()}/{shipped.filename}"
     ref: str | None = None
     caller = None
+    caller_name = None
     for name, job in jobs.items():
         uses = job.get("uses") if isinstance(job, dict) else None
         if isinstance(uses, str) and uses.split("@", 1)[0] == want:
-            caller, ref = job, (uses.split("@", 1)[1] if "@" in uses else None)
+            caller, caller_name = job, name
+            ref = uses.split("@", 1)[1] if "@" in uses else None
             break
     if caller is None:
         named = sorted(
@@ -771,6 +883,53 @@ def inspect(
             f"A stub names the shipped workflow it stands for."
         )))
         return found, None
+
+    # ------------------------------------------------------------------
+    # The delegating job's OWN keys.
+    #
+    # Checking the `uses:` and stopping there read the delegation and nothing
+    # about the job carrying it, and every key that can be added beside it fails
+    # SILENTLY, several of them while reporting success:
+    #
+    #   `if: false`         a SKIPPED job reports success to branch protection.
+    #                       The write-boundary gate is neutered and green.
+    #   `strategy: matrix`  runs the reusable workflow N times; for
+    #                       `on-spec-merge` that is N minters racing one ledger
+    #                       push inside a single run.
+    #   `needs:`            the job never starts when its dependency does not.
+    #   `permissions:`      job-level, narrower than the shipped grant, refused
+    #                       at the point of use.
+    #   `timeout-minutes`,  each turns a required check into one that reports
+    #   `continue-on-error` the wrong answer or none at all.
+    #   `env:`, `container:` reach the callee's environment.
+    #
+    # An allowlist, not a denylist, because that list is open-ended and only
+    # three keys are ever rendered.
+    # ------------------------------------------------------------------
+    extra = sorted(str(key) for key in caller if str(key) not in JOB_KEYS)
+    if extra:
+        found.append(Finding(relative, "carries-logic", (
+            f"its delegating job carries `{one_line(', '.join(extra))}` beside the "
+            f"delegation; a stub's job is `{'`, `'.join(JOB_KEYS)}` and nothing "
+            f"else. Every one of these fails silently and some report success "
+            f"while doing it — a skipped job (`if:`) is a green required check "
+            f"that ran nothing. `vellum init --force` restamps it "
+            f"(spec/features/installation.md)."
+        )))
+
+    # The job id, because the forge derives the check NAME from it: a job that
+    # calls a reusable workflow reports as `<job id> / <called job name>`, so a
+    # renamed job means every required check in branch protection goes on
+    # requiring a name that no longer reports, and every PR waits forever. That
+    # is the same silent failure as a narrowed trigger, one level down.
+    if caller_name != shipped.name:
+        found.append(Finding(relative, "renamed-job", (
+            f"delegates from a job named {one_line(str(caller_name))!r}; the "
+            f"shipped id is {shipped.name!r}. The forge names this stub's checks "
+            f"`{one_line(str(caller_name))} / <job>`, so a rename leaves branch "
+            f"protection requiring checks that never report and PRs waiting "
+            f"forever. Nothing here can see branch protection to warn twice."
+        )))
 
     if not ref:
         found.append(Finding(relative, "unpinned", (
@@ -791,22 +950,110 @@ def inspect(
             f"checks it out {host} with it; without it every run fails in its first "
             f"step."
         )))
+    else:
+        # "By name" has to mean the value too. `VELLUM_TOKEN:
+        # ${{ secrets.ORG_ADMIN_PAT }}` passes any check made by key alone, and
+        # what reaches the reusable workflow under the name it audits is a
+        # different credential — very possibly a wider one. The referenced name
+        # is read back out of the expression rather than the text compared, so
+        # spacing an operator changed is not a finding.
+        for name, value in secrets.items():
+            match = SECRET_REF_RE.match(str(value))
+            if match and match.group(1) == str(name):
+                continue
+            found.append(Finding(relative, "secret-remapped", (
+                f"passes `{one_line(str(name))}` as "
+                f"{one_line(str(value))!r}, not as "
+                f"`{secret_ref(str(name))}`. A stub passes each secret by name so "
+                f"the reusable workflow holds exactly the credential its job names "
+                f"(spec/features/installation.md); a remapped value hands it a "
+                f"different one under an audited name."
+            )))
 
     inputs = caller.get("with")
     passed = inputs.get(REF_INPUT) if isinstance(inputs, dict) else None
     if passed is None:
         found.append(Finding(relative, "no-cli-ref", (
             f"passes no `{REF_INPUT}`. The shipped workflow checks the CLI out of "
-            f"{host} at that ref and declares it required."
+            f"{host} at that ref and declares it required. A `{REF_INPUT}: null` "
+            f"reads as absent, which is why the stamped value is quoted."
         )))
     elif ref and str(passed) != ref:
+        # Read back as a STRING. The `@ref` on the `uses:` line is always one —
+        # it is part of a longer scalar — and the input is one too now that the
+        # render quotes it; an unquoted `1.10`, `010`, `true` or `on` came back
+        # from the YAML reader as a float, an int or a bool, and the two halves
+        # of a freshly stamped install disagreed with each other.
         found.append(Finding(relative, "ref-mismatch", (
             f"pins the workflow at {one_line(ref)!r} and the CLI at "
-            f"{one_line(passed)!r}. One "
-            f"installation runs one version of both; `vellum init --ref <ref> "
-            f"--force` restamps them together."
+            f"{one_line(str(passed))!r}"
+            + ("" if isinstance(passed, str) else
+               f" (read back as {type(passed).__name__}, not a string: quote it)")
+            + ". One installation runs one version of both; `vellum init --ref "
+              "<ref> --force` restamps them together."
         )))
     return found, ref
+
+
+def strays(directory: Path, *, host: str, known: set[str], relative_to: Path) -> list[Finding]:
+    """Findings for OTHER workflow files that look like a retired full copy.
+
+    The one place this wave's own history can come back: before the stubs, each
+    adapter was a full copy pasted into ``.github/workflows/``. Renaming one
+    aside — ``spec-ci-legacy.yml`` — leaves a file that still runs on every PR,
+    still holds the logic it drifted from, and is invisible to a check that only
+    ever opens the three files it stamped.
+
+    Two signals, either of which is enough: it delegates to *this* host's
+    workflows (a second, unmanaged caller), or it runs ``vellum`` in a body of
+    its own (the copy). Deliberately not "any other workflow file" — an intent
+    repo's own unrelated CI is not this command's business — and deliberately
+    not silent about a legitimate one: if an installation really does need a
+    workflow that runs the CLI, saying so once per doctor run is the cost of
+    catching the copy.
+
+    A file that cannot be read or parsed is passed over rather than reported: a
+    workflow the forge cannot parse is one that does not run, which is the thing
+    being looked for the absence of.
+    """
+    found: list[Finding] = []
+    if not directory.is_dir():
+        return found
+    for path in sorted(directory.iterdir()):
+        if path.name in known or path.suffix not in (".yml", ".yaml"):
+            continue
+        try:
+            data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, yaml.YAMLError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        jobs = _jobs(data) or {}
+        why = []
+        delegating = sorted(
+            one_line(str(job.get("uses"))) for job in jobs.values()
+            if isinstance(job, dict) and str(job.get("uses", "")).startswith(f"{host}/")
+        )
+        if delegating:
+            why.append(f"delegates to {', '.join(delegating)}")
+        bodies = [
+            node for job in jobs.values() for node in _walk(job)
+            if isinstance(node.get("run"), str) and "vellum" in node["run"].lower()
+        ]
+        if bodies:
+            why.append(f"carries {len(bodies)} `run:` step(s) naming `vellum`")
+        if not why:
+            continue
+        found.append(Finding(
+            (relative_to / path.name).as_posix(), "stray-workflow",
+            f"is not one of the {len(known)} stubs and {' and '.join(why)}. A "
+            f"retired full copy left beside the stubs goes on running on every "
+            f"event it triggers on, holding logic that has nothing keeping it "
+            f"equal to what ships — which is the shape this installation moved "
+            f"away from (spec/features/installation.md). Delete it, or move what "
+            f"it does into the reusable workflow in {host}.",
+        ))
+    return found
 
 
 @dataclass
@@ -816,18 +1063,22 @@ class Doctor:
     checkout: Path
     forge: str
     host: str
+    intent: str
     currency: Currency
     #: ``(relative path, findings, pinned ref)`` per shipped workflow, in the
     #: order they ship. No ``Shipped`` beside the path: nothing reads one.
     stubs: list[tuple[str, list[Finding], str | None]]
+    #: Findings about files under the workflows directory that are not stubs.
+    strays: list[Finding] = field(default_factory=list)
 
     @property
     def findings(self) -> list[Finding]:
-        return [f for _, found, _ in self.stubs for f in found]
+        return [f for _, found, _ in self.stubs for f in found] + self.strays
 
     def report(self) -> str:
         lines = [
             f"vellum doctor — {self.forge} caller stubs in {self.checkout}",
+            f"  intent repo:  {self.intent}",
             f"  shipped from: {self.host}",
             "",
         ]
@@ -837,6 +1088,9 @@ class Doctor:
                          + (f"  @{ref}" if ref else ""))
             for finding in found:
                 lines.append(f"           - [{finding.code}] {finding.detail}")
+        for finding in self.strays:
+            lines.append(f"  {'FINDING':<8} {finding.file}")
+            lines.append(f"           - [{finding.code}] {finding.detail}")
         lines.append("")
         if self.findings:
             lines.append(
@@ -898,8 +1152,14 @@ def doctor(
     # missing stubs and exited 1 — "a finding" for what is plainly "I could not
     # answer", plus a stderr line naming a workspace file that does not exist.
     # A checkout with no workspace is not an installation to have findings about.
+    #
+    # Through `workspace.intent()`, the same accessor `init` uses, so the two
+    # commands refuse the same files: a workspace with no `intent:` key is one
+    # neither of them can name the installation from, and doctor reporting it as
+    # three missing stubs was that same "a finding for what is I-cannot-answer"
+    # one key further in.
     try:
-        workspace_load(root)
+        intent_slug = workspace_intent(root)
     except WorkspaceError as exc:
         raise InstallError(str(exc)) from exc
     directory = WORKFLOWS_DIR[chosen]
@@ -912,8 +1172,12 @@ def doctor(
         )
         stubs.append((relative, found, ref))
     return Doctor(
-        checkout=root, forge=chosen, host=host,
+        checkout=root, forge=chosen, host=host, intent=intent_slug,
         currency=currency(releases_from), stubs=stubs,
+        strays=strays(
+            root / directory, host=host,
+            known={s.filename for s in SHIPPED}, relative_to=directory,
+        ),
     )
 
 

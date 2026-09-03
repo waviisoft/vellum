@@ -96,7 +96,7 @@ from vellum.deps import DEFAULT_MANIFESTS, DependencyError
 from vellum.deps import run as deps_run
 from vellum.exitduty import AREAS_TREE, DEFAULT_SOURCE_TREES, ExitDutyError
 from vellum.exitduty import run as exitduty_run
-from vellum.install import HOST_REPO, FORGES, InstallError
+from vellum.install import DEFAULT_BRANCH, HOST_REPO, FORGES, InstallError
 from vellum.install import run_doctor as doctor_run
 from vellum.install import run_init as init_run
 from vellum.ledger import (
@@ -719,6 +719,14 @@ def _add_install(sub) -> None:
              "so the report says so rather than the command guessing one that does",
     )
     init.add_argument(
+        "--branch",
+        default=DEFAULT_BRANCH,
+        help=f"the default branch on-spec-merge watches (default: {DEFAULT_BRANCH}). "
+             f"Installation data, not logic: an installation whose default branch "
+             f"is not {DEFAULT_BRANCH} is not a drifted one, and `doctor` exempts "
+             f"the branch list from its `on:` comparison for that reason",
+    )
+    init.add_argument(
         "--force",
         action="store_true",
         help="restamp a stub that exists and differs; this is how a ref is bumped",
@@ -731,11 +739,16 @@ def _add_install(sub) -> None:
         description=(
             "Verifies installed-matches-shipped from the checkout alone: every "
             "shipped workflow has a stub, each stub parses, names the shipped "
-            "workflow and pins a ref, passes its secret by name, carries no "
-            "logic of its own, and its caller half — the `on:`, `permissions:` "
-            "and `concurrency:` blocks, each of which fails silently when wrong "
-            "— is what ships. Comments are not compared. Exits 1 on a finding, "
-            "2 when it cannot answer, 0 "
+            "workflow from a job with the shipped id, pins a ref, passes its "
+            "secret by name AND to the secret of that name, carries no logic of "
+            "its own — no second job, no `run:`, and nothing on the delegating "
+            "job but `uses`, `with` and `secrets` — and its caller half, the "
+            "`on:`, `permissions:` and `concurrency:` blocks, each of which "
+            "fails silently when wrong, is what ships. Any OTHER file under the "
+            "workflows directory that delegates here or runs `vellum` is "
+            "reported as a stray. Comments are not compared, and neither is the "
+            "branch list, which is the installation's own (`init --branch`). "
+            "Exits 1 on a finding, 2 when it cannot answer, 0 "
             "when every stub matches. Ref currency is REPORTED, never failed on "
             "(spec/features/installation.md), and what a checkout cannot know — "
             "that the secret is set, that the forge permits reuse of a private "
@@ -819,6 +832,7 @@ def main(argv: list[str] | None = None) -> int:
                 forge=args.forge,
                 force=args.force,
                 releases_from=args.releases_from,
+                branch=args.branch,
             )
         if args.command == "doctor":
             return doctor_run(

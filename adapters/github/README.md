@@ -18,6 +18,7 @@ pass the one secret it needs. The logic lives in
 cd ../vellum-intent
 vellum init .                    # pins this CLI's own version
 vellum init . --ref main         # or pin something else
+vellum init . --branch trunk     # if the default branch is not `main`
 vellum doctor .                  # what is installed is what ships
 ```
 
@@ -26,6 +27,15 @@ and the forge — and writes one stub per shipped workflow into
 `.github/workflows/`. It is idempotent: run again over an installed checkout it
 writes nothing and says so. A stub that exists and *differs* is reported and
 left alone; `--force` restamps it, which is also how a ref is bumped.
+
+**`--branch` is the branch `on-spec-merge` watches**, and it is the one piece of
+a trigger that belongs to the installation rather than to this product. It
+defaults to `main`. Hard-coding it made an installation on `trunk` one that
+could never be doctor-green — the check reporting the repository's own correct
+configuration as drift — so the branch list is stamped from `--branch` and
+`doctor` exempts it from the `on:` comparison. Only it: `push` must still be
+there, its `paths:` are still compared, and a trigger added beside it is still
+drift.
 
 Copying by hand works too — the three files here are exactly what `init`
 writes, and `tests/test_install.py` asserts that byte for byte. **But the
@@ -40,7 +50,11 @@ vellum init . --ref v0.2.0 --force
 ```
 
 Two lines change per stub: the `@<ref>` on `uses:`, and the `vellum-ref:` input
-that the workflow checks the CLI out at. They are stamped equal and
+that the workflow checks the CLI out at. **The input is quoted** — `vellum-ref:
+"v0.2.0"` — because a bare `1.10`, `010`, `null`, `true` or `on` is not a string
+to a YAML reader, and a stub carrying an unquoted one fails its own doctor with
+`ref-mismatch` or `no-cli-ref`. The `@<ref>` half was never affected: it is part
+of a longer scalar. They are stamped equal and
 `vellum doctor` reports when they have come apart. The `@<ref>` alone does not
 pin the CLI: the checkout of `waviisoft/vellum` inside the workflow body needs a
 ref it can be handed, and an installation's CLI version has to be readable in
@@ -65,6 +79,33 @@ finding, named by file**. If an installation needs something the shipped
 workflow does not do, that is a change to the shipped workflow, not a local
 edit: a local edit is precisely the thing that used to drift.
 
+**The delegating job carries `uses:`, `with:` and `secrets:` and nothing else.**
+An allowlist, because the ways to add logic beside a delegation are open-ended
+and several of them *report success while doing it*:
+
+| Added key | What it does that nothing else would catch |
+|---|---|
+| `if:` | A **skipped** job reports **success** to branch protection. `if: false` on `harness-ci` is a green write-boundary gate that ran nothing. |
+| `strategy:` | Runs the reusable workflow N times. On `on-spec-merge` that is N minters racing the same ledger push inside one run. |
+| `needs:` | The job never starts when its dependency does not. |
+| `permissions:` | Job-level, below the shipped grant: refused at the point of use, and the top-level block still compares equal. |
+| `timeout-minutes`, `continue-on-error` | A required check that reports the wrong answer, or none. |
+| `env:`, `container:` | Reach the callee's environment. |
+
+**And the job's *id* is the shipped one.** A job calling a reusable workflow
+reports its checks as `<job id> / <called job name>`, so renaming
+`spec-ci:` to anything else leaves branch protection requiring names that no
+longer report — see "Installing changes your required check names" below, which
+is the same failure arrived at from the other direction.
+
+**A stray workflow beside the stubs is a finding too.** Any *other* file under
+`.github/workflows/` that delegates to `waviisoft/vellum`'s workflows, or runs
+`vellum` in a `run:` body of its own, is reported as `stray-workflow`. That is
+where a retired full copy hides: rename one aside as `spec-ci-legacy.yml` and it
+goes on running on every PR, holding logic nothing keeps equal to what ships,
+invisible to a check that only opens the three files it stamped. An intent
+repo's own unrelated CI is not reported.
+
 **What a stub does carry, and why none of it can drift into a wrong answer:**
 
 - **Triggers.** They are statements about the caller's repository, and a
@@ -80,7 +121,12 @@ edit: a local edit is precisely the thing that used to drift.
   "a stub passes each secret by name and never inherits the caller's whole
   secret set, so a reusable workflow holds exactly the credential its job names
   and nothing else in the installation." `inherit` is a doctor finding, not a
-  style note.
+  style note. **By name means the value too**: `VELLUM_TOKEN: ${{
+  secrets.ORG_ADMIN_PAT }}` satisfies any check made by key alone while handing
+  the reusable workflow a different — very possibly wider — credential under the
+  name it audits. Doctor reads the referenced secret back out of the expression
+  and compares it to the key, so spacing an operator changed is not a finding
+  and a remap is (`secret-remapped`).
 
 ## Installing changes your required check names
 

@@ -265,8 +265,14 @@ exist. Reads the intent slug, the products and the forge from
 cd ../vellum-intent
 vellum init .                            # pins v<this CLI's version>
 vellum init . --ref main                 # or pin something else
+vellum init . --branch trunk             # if the default branch is not `main`
 vellum init . --ref v0.2.0 --force       # upgrading is bumping the ref
 ```
+
+`--branch` is the branch `on-spec-merge` watches, and it is installation *data*,
+not this product's shape: an installation whose default branch is not `main` is
+not a drifted one, and `doctor` exempts the branch list from its `on:`
+comparison for exactly that reason.
 
 Idempotent: run again over an installed checkout it writes nothing and says so.
 A stub that exists and *differs* is reported and left alone — writing is this
@@ -283,12 +289,35 @@ cut no `v*` tag yet**, so install with `--ref main` until it does.
 
 Verifies installed-matches-shipped from the checkout alone: every shipped
 workflow has a stub, each stub parses, names the shipped workflow, pins a ref,
-and passes its secret by name. **A stub edited in place to carry logic — a job
-of its own, or any `run:` — is a finding, named by file.** So is a caller half
-that has drifted: the `on:`, `permissions:` and `concurrency:` blocks are
-compared against what ships, because each of the three fails *silently* when
-wrong — a narrowed trigger is a required check that never reports, a narrowed
-permission is a job refused at the point of use. Comments are not compared.
+and passes its secret by name **and by value** — `VELLUM_TOKEN: ${{
+secrets.ORG_ADMIN_PAT }}` satisfies any check made by key alone and hands the
+reusable workflow a different credential under the name it audits, so it is a
+`secret-remapped` finding.
+
+**A stub edited in place to carry logic — a job of its own, or any `run:` — is a
+finding, named by file.** So is anything on the delegating job beyond `uses:`,
+`with:` and `secrets:`, which is an allowlist because the ways to be wrong there
+are open-ended and several of them *report success*: `if: false` makes a skipped
+job, and a skipped job reports success to branch protection, so a write-boundary
+gate goes green having run nothing. `strategy:` runs the reusable workflow N
+times — for `on-spec-merge`, N minters racing one ledger push. `needs:`,
+`timeout-minutes`, `continue-on-error`, a job-level `permissions:`, `env:` and
+`container:` are each a finding for the same reason. So is a **renamed
+delegating job**: the forge derives the check name from the job id, so a rename
+leaves branch protection requiring names that never report.
+
+So is a caller half that has drifted: the `on:`, `permissions:` and
+`concurrency:` blocks are compared against what ships, because each of the three
+fails *silently* when wrong — a narrowed trigger is a required check that never
+reports, a narrowed permission is a job refused at the point of use. Comments
+are not compared, and neither is `on.push.branches`, which is the installation's
+own default branch (`init --branch`) rather than this product's shape.
+
+Finally, a **`stray-workflow`** finding for any *other* file under
+`.github/workflows/` that delegates to this repo's workflows or runs `vellum` in
+a body of its own — the place a retired full copy (`spec-ci-legacy.yml`) could
+go on running on every PR unseen, which is the shape this installer exists to
+replace.
 
 ```sh
 vellum doctor .                                     # 1 on a finding, 0 when every stub matches

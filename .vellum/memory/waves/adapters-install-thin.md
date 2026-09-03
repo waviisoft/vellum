@@ -88,6 +88,45 @@ four of them are the same mistake:
 Both are now covered: `DoctorChecksTheCallerHalf` and the four exit-code tests
 in `InitCannotAnswer` / `DoctorOverAFreshCheckout`.
 
+## What the review bench caught on the open PR, and what it says
+
+A blind reviewer and a security-privacy reviewer over PR #20 found no blocking
+defect and six should-fixes. Five of them are the *first* lesson above happening
+again one level in: **`doctor` still checked less than "installed matches
+shipped" claims**, and every test written for it had edited the half the code
+already read.
+
+- **The delegating job's own keys were never read.** `if: false` — a *skipped*
+  job reports *success* to branch protection, so the write-boundary gate went
+  green having run nothing — plus `strategy:` (N minters racing one ledger
+  push), `needs:`, a job-level `permissions:`, `timeout-minutes`,
+  `continue-on-error`, `env:`, `container:`, and a renamed job id (check names
+  derive from it). Fixed as an allowlist, `JOB_KEYS`, plus `renamed-job`.
+- **A remapped secret passed.** `VELLUM_TOKEN: ${{ secrets.ORG_ADMIN_PAT }}`
+  satisfies a check made by key alone. `secret-remapped` reads the referenced
+  name back out of the expression.
+- **The check fired on installations for being themselves, twice.** The drift
+  compare hard-coded `branches: [main]`, so a repository whose default branch is
+  `trunk` could never be doctor-green; and `_walk(data)` scanned the whole
+  document for `run:`, so a legal top-level `defaults: {run: {shell: bash}}` was
+  a `carries-logic` finding. Fixed by `init --branch` plus an exemption narrowed
+  to `on.push.branches`, and by walking `jobs` only. **This is the counterweight
+  to the first lesson and has to be held with it: a check that claims a broad
+  property must be tested against the broad property, AND it must not fail a
+  correct installation for being itself. Widening on the first without the
+  second is how a check gets ignored instead of fixed.**
+- **A stamped installation could fail its own doctor.** `vellum-ref:` was an
+  unquoted scalar, so `--ref 1.10` came back as the float `1.1` and `010` as the
+  int `10` while the `@<ref>` half stayed a string. Quoted, and `REF_RE` is now
+  `git check-ref-format`'s rules.
+- **`doctor` opened only the files it stamps**, so a retired full copy renamed
+  aside (`spec-ci-legacy.yml`) went on running on every PR unseen — the copies
+  coming back by not being stubs. `stray-workflow`.
+- Nits: `doctor` reads `intent:` through the accessor `init` uses, so a
+  workspace lacking it is exit 2 from both rather than three findings from one;
+  `tests/test_workflows.py` reads `install.HOST_REPO` rather than spelling the
+  slug a second time.
+
 ## Open, and named rather than fixed
 
 - **`waviisoft/vellum` has cut no `v*` tag**, so `vellum init`'s default ref

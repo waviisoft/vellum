@@ -26,7 +26,7 @@ symbol you can grep for.
 | `src/vellum/pin.py` | `advance()` -> `Advance`, `verify_version()`, `_rewrite()`. The pin close. |
 | `src/vellum/config.py` | `load()`, `divergence_cap()`, `INTENT_ENV`. Reads `.vellum/config.yaml`. |
 | `src/vellum/workspace.py` | `load()`, `products()`, `intent()`, `forge()`, `WORKSPACE_RELPATH`, `DEFAULT_FORGE`. The one reader of `.vellum/workspace.yaml`. |
-| `src/vellum/install.py` | `init()` -> `Init`, `doctor()` -> `Doctor`, `render()`, `inspect()`, `releases()`, `currency()` -> `Currency`, `SHIPPED`, `HOST_REPO`, `CANNOT_KNOW`. The adapters install thin. |
+| `src/vellum/install.py` | `init()` -> `Init`, `doctor()` -> `Doctor`, `render()`, `inspect()`, `strays()`, `releases()`, `currency()` -> `Currency`, `SHIPPED`, `HOST_REPO`, `JOB_KEYS`, `DEFAULT_BRANCH`, `CANNOT_KNOW`. The adapters install thin. |
 | `src/vellum/product.py` | `load()`, `write_boundaries()`, `normalise_tree()`, `under()`, `PRODUCT_RELPATH`. Reads `.vellum/product.yaml`. |
 | `src/vellum/boundaries.py` | `check()` -> `Boundaries`, `run()`. The write-boundary guard. |
 | `src/vellum/exitduty.py` | `check()` -> `ExitDuty`, `run()`, `AREAS_TREE`. The memory-update guard. |
@@ -1494,10 +1494,94 @@ use them, so a text search answers a different question than the one asked —
 which is also why `test_the_secret_is_passed_by_name_and_never_inherited` reads
 the parsed mapping.
 
-**`carries-logic` is two tests, not one.** A second job is logic beside the
-delegation; a `run:` anywhere is logic inside it. `_walk()` finds the second
-regardless of how deeply it is nested, because "one extra step in the existing
-job" is the shape a local tweak actually takes.
+**`carries-logic` is three tests, not one.** A second job is logic beside the
+delegation; a `run:` inside a job is logic inside it; and a key on the
+delegating job beyond `JOB_KEYS` is logic wearing the delegation's clothes.
+`_walk()` finds the second regardless of how deeply it is nested, because "one
+extra step in the existing job" is the shape a local tweak actually takes.
+
+**`_walk()` runs over `jobs` only, not the document.** Over the whole document
+it made a `carries-logic` finding out of a legal top-level `defaults: {run:
+{shell: bash}}` — a declaration, not a body. A check that fires on correct files
+is one people learn to work around, which costs more than the case it was
+catching. Everything outside `jobs:` a stub may carry is enumerated by
+`CALLER_HALF` and `JOB_KEYS`, so nothing was lost by narrowing it. Walk each
+job's *value*, not the `jobs` mapping: a job legitimately named `run` would
+otherwise be a finding.
+
+**`JOB_KEYS` is an allowlist and the reason is that several of these fail by
+PASSING.** Reading the `uses:` and stopping there checked the delegation and
+nothing about the job carrying it, so every one of these exited 0 "ok":
+`if: false` (a **skipped** job reports **success** to branch protection — on
+`harness-ci` that is a green write-boundary gate that ran nothing, which is
+worse than no gate), `strategy: {matrix: ...}` (N runs of the reusable workflow
+inside one caller run; on `on-spec-merge`, N minters racing one ledger push),
+`needs:`, a job-level `permissions:` under the shipped grant, `timeout-minutes`,
+`continue-on-error`, `env:`, `container:`. A denylist would have had to be
+complete against a list GitHub goes on extending; only three keys are ever
+rendered, so the allowlist is both shorter and closed.
+
+**The job *id* is checked because the forge derives the check NAME from it.**
+`<job id> / <called job name>` — so a renamed delegating job leaves branch
+protection requiring names that never report and PRs waiting forever, which is
+the same silent failure as a narrowed trigger one level down, and the same one
+`adapters/github/README.md`'s "Installing changes your required check names"
+warns about from the operator's side. `renamed-job`, and nothing in a checkout
+can see branch protection to say it twice.
+
+**"By name" is a claim about the value, not just the key.**
+`VELLUM_TOKEN: ${{ secrets.ORG_ADMIN_PAT }}` satisfies a `SECRET in secrets`
+check and hands the reusable workflow a different — very possibly wider —
+credential under the name its audit trail knows. `SECRET_REF_RE` reads the
+referenced secret back out of the expression and compares it to the key, rather
+than comparing the text: spacing an operator changed is not a finding, and a
+remap is (`secret-remapped`).
+
+**The `vellum-ref:` input is QUOTED in the render, and that is a bug fix, not a
+style choice.** `--ref 1.10` stamped `vellum-ref: 1.10`, which a YAML reader
+hands back as the float `1.1`; `010` as the int `10`; `null`, `true` and `on` as
+`None` and booleans. So a *freshly stamped* installation failed its own doctor
+with `ref-mismatch` or `no-cli-ref` — the check calling wrong the thing it had
+just written. The `@<ref>` half was never affected because it is part of a
+longer scalar, which is exactly why the two halves disagreed. `REF_RE` forbids
+quotes, so the quoting cannot be escaped by the value.
+
+**`REF_RE` is `git check-ref-format`'s rules now**: no `..`, no `//`, no leading
+`.`, no `.lock` component. A ref git itself refuses is one the forge resolves to
+nothing, and the failure then lands at `uses:` on every run instead of here,
+once. The same expression now also validates `--branch`, which is a ref.
+
+**`--branch` exists because the branch list is installation DATA.** The compare
+hard-coded `branches: [main]`, so an installation whose default branch is
+`trunk` could never be doctor-green: the check reported the repository's own
+correct configuration as drift, which is the failure mode that teaches people to
+ignore a check. `init --branch` stamps it and `_comparable_on()` exempts
+`on.push.branches` from the comparison — *only* it: `push` must still be present
+and a mapping, its `paths:` are still compared, and a trigger added beside it is
+still drift. The general rule the two halves make: **a check must not fail an
+installation for being itself, and the way to keep that from widening into
+"ignore the block" is to name the one key that is data.**
+
+**`stray-workflow` is where this wave's own history could come back.** Doctor
+opened the three files it stamps and nothing else, so a retired full copy
+renamed aside — `spec-ci-legacy.yml` — went on running on every PR, holding
+logic nothing kept equal to what ships, invisible to the command whose whole job
+is noticing that. Two signals, either sufficient: it delegates to `HOST_REPO`'s
+workflows, or it runs `vellum` in a body of its own. Deliberately not "any other
+workflow file" — an intent repo's own CI is not this command's business — and
+deliberately not silent about a legitimate one, because catching the copy is
+worth one line per doctor run. A file that does not parse is passed over: a
+workflow the forge cannot read is one that does not run, which is the thing
+being looked for the absence of.
+
+**`doctor` reads `intent:` through `workspace.intent()`, the accessor `init`
+uses.** It read `workspace.load()` instead, so a workspace missing the one key
+that names the installation came back as three `missing` findings and exit 1 —
+"a finding" for what is plainly "I could not answer", one key further in than
+the `--forge` short-circuit that had already been fixed for the same reason. One
+accessor means the two commands refuse the same files. The slug now has a reader
+(the report names the installation it judged) rather than being read and
+discarded.
 
 **`workspace.forge()` defaults to `github` and `check_forge()` refuses an
 unadapted one.** The default is safe *because* of the refusal: every workspace

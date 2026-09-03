@@ -71,8 +71,9 @@ class InitStampsTheStubs(InstallCase):
                 text,
             )
             # The CLI's own ref travels with it: the `@ref` pins the workflow
-            # file and this pins the CLI the workflow installs.
-            self.assertIn("vellum-ref: v9.9.9", text)
+            # file and this pins the CLI the workflow installs. QUOTED — see
+            # `TheRefSurvivesBeingReadBack`.
+            self.assertIn('vellum-ref: "v9.9.9"', text)
 
     def test_the_secret_is_passed_by_name_and_never_inherited(self):
         """Read out of the parsed stub, not grepped for.
@@ -354,7 +355,9 @@ class DoctorOverAnInstalledCheckout(InstallCase):
         checkout = self.install(ref="v0.1.0")
         stub = checkout / WORKFLOWS / "spec-ci.yml"
         stub.write_text(
-            stub.read_text(encoding="utf-8").replace("vellum-ref: v0.1.0", "vellum-ref: main"),
+            stub.read_text(encoding="utf-8").replace(
+                'vellum-ref: "v0.1.0"', 'vellum-ref: "main"'
+            ),
             encoding="utf-8",
         )
         code, out = run_cli(["doctor", str(checkout)])
@@ -390,14 +393,6 @@ class DoctorChecksTheCallerHalf(InstallCase):
         text = stub.read_text(encoding="utf-8")
         assert text.count(old) == 1, (name, old)
         stub.write_text(text.replace(old, new), encoding="utf-8")
-
-    def test_a_narrowed_trigger_branch_is_a_finding(self):
-        checkout = self.install()
-        self.edit(checkout, "on-spec-merge", "branches: [main]", "branches: [nope]")
-        code, out = run_cli(["doctor", str(checkout)])
-        self.assertEqual(code, 1, out)
-        self.assertIn("drifted", out)
-        self.assertIn("`on:`", out)
 
     def test_a_paths_filter_added_to_harness_ci_is_a_finding(self):
         """The landmine harness-ci's own header documents."""
@@ -449,6 +444,81 @@ class DoctorChecksTheCallerHalf(InstallCase):
         run_cli(["init", str(checkout), "--ref", "v0.0.1"])
         code, out = run_cli(["doctor", str(checkout)])
         self.assertEqual(code, 0, out)
+
+
+class TheBranchIsInstallationDataNotLogic(InstallCase):
+    """`on-spec-merge` watches the repository's default branch, whatever it is.
+
+    Hard-coding `branches: [main]` in the compare made an installation whose
+    default branch is `trunk` one that could never be doctor-green — the check
+    reporting the installation's own correct configuration as drift, which is
+    the failure mode that teaches people to ignore a check. So the branch list
+    is `init --branch` data and doctor's `on:` compare exempts it.
+
+    Exempts *it*, and nothing around it: the tests below pin that `push` must
+    still be there, that everything else under it is still compared, and that a
+    trigger added beside it is still drift.
+    """
+
+    def test_a_stub_on_another_default_branch_is_not_drift(self):
+        checkout = self.intent()
+        code, out = run_cli(["init", str(checkout), "--branch", "trunk"])
+        self.assertEqual(code, 0, out)
+        stub = (checkout / WORKFLOWS / "on-spec-merge.yml").read_text(encoding="utf-8")
+        self.assertIn('branches: ["trunk"]', stub)
+        code, out = run_cli(["doctor", str(checkout)])
+        self.assertEqual(code, 0, out)
+
+    def test_an_added_trigger_is_still_drift(self):
+        """The exemption is the branch list, not the `on:` block."""
+        checkout = self.intent()
+        run_cli(["init", str(checkout)])
+        stub = checkout / WORKFLOWS / "harness-ci.yml"
+        stub.write_text(
+            stub.read_text(encoding="utf-8").replace(
+                "on:\n  pull_request:", "on:\n  pull_request:\n  workflow_dispatch:"
+            ),
+            encoding="utf-8",
+        )
+        code, out = run_cli(["doctor", str(checkout)])
+        self.assertEqual(code, 1, out)
+        self.assertIn("drifted", out)
+        self.assertIn("`on:`", out)
+
+    def test_a_paths_filter_beside_the_branch_list_is_still_drift(self):
+        """Everything else under `push:` is compared as it always was."""
+        checkout = self.intent()
+        run_cli(["init", str(checkout)])
+        stub = checkout / WORKFLOWS / "on-spec-merge.yml"
+        stub.write_text(
+            stub.read_text(encoding="utf-8").replace("      - 'spec/**'", "      - 'nope/**'"),
+            encoding="utf-8",
+        )
+        code, out = run_cli(["doctor", str(checkout)])
+        self.assertEqual(code, 1, out)
+        self.assertIn("drifted", out)
+
+    def test_a_stub_that_no_longer_runs_on_a_push_is_drift(self):
+        """`push` must be present: on-spec-merge is the push half of the pipeline."""
+        checkout = self.intent()
+        run_cli(["init", str(checkout)])
+        stub = checkout / WORKFLOWS / "on-spec-merge.yml"
+        text = stub.read_text(encoding="utf-8")
+        text = text.replace(
+            "on:\n  push:\n    branches: [\"main\"]\n    paths:\n      - 'spec/**'\n",
+            "on:\n",
+        )
+        stub.write_text(text, encoding="utf-8")
+        code, out = run_cli(["doctor", str(checkout)])
+        self.assertEqual(code, 1, out)
+        self.assertIn("`on:`", out)
+
+    def test_a_branch_that_would_reshape_the_trigger_is_refused(self):
+        """`--branch` lands in a YAML flow sequence, so it is held to REF_RE too."""
+        checkout = self.intent()
+        code, out = run_cli(["init", str(checkout), "--branch", 'main"], evil: [x'])
+        self.assertEqual(code, 2, out)
+        self.assertFalse((checkout / WORKFLOWS).exists())
 
 
 class DoctorFailsAStubCarryingLogic(InstallCase):
@@ -504,6 +574,354 @@ class DoctorFailsAStubCarryingLogic(InstallCase):
         self.assertEqual(code, 1, out)
         self.assertIn("carries-logic", out)
         self.assertIn("harness-ci.yml", out)
+
+
+class TheDelegatingJobCarriesNothingOfItsOwn(InstallCase):
+    """Item by item, every key that can be added beside `uses:`.
+
+    Reading the `uses:` and stopping there checked the delegation and nothing
+    about the job carrying it, so each row below exited 0 "ok" while changing
+    what the installation actually does — and several of them while *reporting
+    success*. `if: false` is the sharpest: a skipped job reports success to
+    branch protection, so the write-boundary gate goes green having run nothing,
+    which is worse than a gate that is missing.
+
+    An allowlist rather than a row of detectors, because the list of ways to be
+    wrong here is open-ended; these tests are the rows that were named, not the
+    rows the check knows about.
+    """
+
+    def install(self) -> Path:
+        checkout = self.intent()
+        run_cli(["init", str(checkout), "--ref", "v0.1.0"])
+        return checkout
+
+    def add_key(self, checkout: Path, block: str, name: str = "spec-ci") -> None:
+        """Put *block* on the delegating job, above its `uses:` line."""
+        stub = checkout / WORKFLOWS / f"{name}.yml"
+        text = stub.read_text(encoding="utf-8")
+        marker = "    uses: waviisoft/vellum/"
+        assert text.count(marker) == 1, name
+        stub.write_text(text.replace(marker, f"{block}\n{marker}"), encoding="utf-8")
+
+    def assert_carries_logic(self, checkout: Path, key: str) -> None:
+        code, out = run_cli(["doctor", str(checkout)])
+        self.assertEqual(code, 1, out)
+        self.assertIn("carries-logic", out)
+        self.assertIn(key, out)
+
+    def test_if_false_is_a_finding(self):
+        """A SKIPPED job reports SUCCESS to branch protection.
+
+        So `if: false` on `harness-ci`'s delegation is a write-boundary gate
+        that is green on every PR and has run nothing — the one row here that
+        fails by passing.
+        """
+        checkout = self.install()
+        self.add_key(checkout, "    if: false", name="harness-ci")
+        self.assert_carries_logic(checkout, "if")
+
+    def test_a_matrix_is_a_finding(self):
+        """N runs of the reusable workflow inside one run of the caller.
+
+        For `on-spec-merge` that is N minters racing the same ledger push.
+        """
+        checkout = self.install()
+        self.add_key(
+            checkout, "    strategy:\n      matrix:\n        n: [1, 2, 3]",
+            name="on-spec-merge",
+        )
+        self.assert_carries_logic(checkout, "strategy")
+
+    def test_needs_is_a_finding(self):
+        checkout = self.install()
+        self.add_key(checkout, "    needs: [something]")
+        self.assert_carries_logic(checkout, "needs")
+
+    def test_a_job_level_permissions_grant_is_a_finding(self):
+        """Narrower than the shipped grant, and refused at the point of use.
+
+        The top-level block compares equal, so nothing else here would see it.
+        """
+        checkout = self.install()
+        self.add_key(checkout, "    permissions:\n      contents: read")
+        self.assert_carries_logic(checkout, "permissions")
+
+    def test_a_timeout_is_a_finding(self):
+        checkout = self.install()
+        self.add_key(checkout, "    timeout-minutes: 1")
+        self.assert_carries_logic(checkout, "timeout-minutes")
+
+    def test_continue_on_error_is_a_finding(self):
+        """A required check that reports success whatever the callee decided."""
+        checkout = self.install()
+        self.add_key(checkout, "    continue-on-error: true")
+        self.assert_carries_logic(checkout, "continue-on-error")
+
+    def test_env_is_a_finding(self):
+        checkout = self.install()
+        self.add_key(checkout, "    env:\n      VELLUM_REF: somewhere-else")
+        self.assert_carries_logic(checkout, "env")
+
+    def test_a_container_is_a_finding(self):
+        checkout = self.install()
+        self.add_key(checkout, "    container: alpine:3")
+        self.assert_carries_logic(checkout, "container")
+
+    def test_a_renamed_delegating_job_is_a_finding(self):
+        """The forge derives the CHECK NAME from the job id.
+
+        A job that calls a reusable workflow reports as `<job id> / <called job
+        name>`, so renaming it leaves branch protection requiring names that no
+        longer report and every PR waiting forever — and nothing in a checkout
+        can see branch protection to say so twice.
+        """
+        checkout = self.install()
+        stub = checkout / WORKFLOWS / "spec-ci.yml"
+        stub.write_text(
+            stub.read_text(encoding="utf-8").replace(
+                "jobs:\n  spec-ci:\n", "jobs:\n  vellum-spec-ci:\n"
+            ),
+            encoding="utf-8",
+        )
+        code, out = run_cli(["doctor", str(checkout)])
+        self.assertEqual(code, 1, out)
+        self.assertIn("renamed-job", out)
+        self.assertIn("vellum-spec-ci", out)
+
+    def test_a_freshly_stamped_job_carries_only_the_three(self):
+        """The allowlist is what `render` writes, checked from the other side."""
+        checkout = self.install()
+        for shipped in SHIPPED:
+            data = yaml.safe_load(self.stub(checkout, shipped.name).read_text("utf-8"))
+            (job,) = data["jobs"].values()
+            self.assertEqual(sorted(job), sorted(["uses", "with", "secrets"]))
+
+
+class TheSecretIsPassedByNameAndByValue(InstallCase):
+    """`VELLUM_TOKEN: ${{ secrets.ORG_ADMIN_PAT }}` passes a by-key check.
+
+    And hands the reusable workflow a different credential under the name it
+    audits — very possibly a wider one. "Passes each secret by name" is a claim
+    about the value as much as the key, so doctor reads the referenced secret
+    back out of the expression and compares it to the key it is passed as.
+    """
+
+    def install(self) -> Path:
+        checkout = self.intent()
+        run_cli(["init", str(checkout)])
+        return checkout
+
+    def remap(self, checkout: Path, value: str) -> tuple[int, str]:
+        stub = checkout / WORKFLOWS / "spec-ci.yml"
+        stub.write_text(
+            stub.read_text(encoding="utf-8").replace(
+                "VELLUM_TOKEN: ${{ secrets.VELLUM_TOKEN }}", f"VELLUM_TOKEN: {value}"
+            ),
+            encoding="utf-8",
+        )
+        return run_cli(["doctor", str(checkout)])
+
+    def test_a_remapped_secret_is_a_finding(self):
+        code, out = self.remap(self.install(), "${{ secrets.ORG_ADMIN_PAT }}")
+        self.assertEqual(code, 1, out)
+        self.assertIn("secret-remapped", out)
+        self.assertIn("ORG_ADMIN_PAT", out)
+
+    def test_a_literal_value_is_a_finding(self):
+        code, out = self.remap(self.install(), "'hunter2'")
+        self.assertEqual(code, 1, out)
+        self.assertIn("secret-remapped", out)
+
+    def test_spacing_an_operator_changed_is_not_a_finding(self):
+        """Read back, not text-compared — the same posture as the caller half."""
+        code, out = self.remap(self.install(), "${{   secrets.VELLUM_TOKEN   }}")
+        self.assertEqual(code, 0, out)
+
+
+class TheRefSurvivesBeingReadBack(InstallCase):
+    """A ref is a string, and an unquoted scalar is whatever YAML says it is.
+
+    `--ref 1.10` stamped `vellum-ref: 1.10`, which reads back as the float 1.1;
+    `010` as the int 10 in YAML 1.1; `null`, `true` and `on` as None and
+    booleans. So a freshly stamped installation failed its OWN doctor with
+    `ref-mismatch` or `no-cli-ref` — the check calling the thing it had just
+    written wrong. The `@ref` half was never affected: it is part of a longer
+    scalar. Quoting the input makes the two halves the same kind of thing.
+    """
+
+    def round_trip(self, ref: str) -> tuple[int, str]:
+        checkout = self.intent()
+        code, out = run_cli(["init", str(checkout), "--ref", ref])
+        self.assertEqual(code, 0, out)
+        return run_cli(["doctor", str(checkout)])
+
+    def test_a_dotted_ref_that_looks_like_a_float_round_trips_green(self):
+        code, out = self.round_trip("1.10")
+        self.assertEqual(code, 0, out)
+
+    def test_a_zero_padded_ref_that_looks_like_an_int_round_trips_green(self):
+        code, out = self.round_trip("010")
+        self.assertEqual(code, 0, out)
+
+    def test_the_stamped_input_is_quoted_and_reads_back_as_a_string(self):
+        checkout = self.intent()
+        run_cli(["init", str(checkout), "--ref", "1.10"])
+        for shipped in SHIPPED:
+            data = yaml.safe_load(self.stub(checkout, shipped.name).read_text("utf-8"))
+            (job,) = data["jobs"].values()
+            self.assertEqual(job["with"]["vellum-ref"], "1.10")
+
+    def test_an_unquoted_ref_left_by_hand_is_a_finding_that_says_why(self):
+        """The shape an installation stamped by an older CLI still has."""
+        checkout = self.intent()
+        run_cli(["init", str(checkout), "--ref", "1.10"])
+        stub = checkout / WORKFLOWS / "spec-ci.yml"
+        stub.write_text(
+            stub.read_text(encoding="utf-8").replace(
+                'vellum-ref: "1.10"', "vellum-ref: 1.10"
+            ),
+            encoding="utf-8",
+        )
+        code, out = run_cli(["doctor", str(checkout)])
+        self.assertEqual(code, 1, out)
+        self.assertIn("ref-mismatch", out)
+        self.assertIn("not a string", out)
+
+    def test_refs_git_itself_would_refuse_are_refused(self):
+        """`git check-ref-format`: no `..`, no `//`, no leading `.`, no `.lock`.
+
+        A ref git will not accept is one the forge resolves to nothing, which
+        fails at `uses:` on every run rather than here, once.
+        """
+        for i, bad in enumerate(("v1..2", "heads//main", ".hidden", "main.lock",
+                                 "refs/x.lock/y")):
+            with self.subTest(ref=bad):
+                checkout = make_installable_intent(self.root / f"intent-{i}")
+                code, out = run_cli(["init", str(checkout), "--ref", bad])
+                self.assertEqual(code, 2, out)
+                self.assertFalse((checkout / WORKFLOWS).exists())
+
+
+class DoctorLooksForLogicInJobsOnly(InstallCase):
+    """`defaults: {run: {shell: bash}}` is a declaration, not a body.
+
+    Walking the whole document for a `run:` key made a false `carries-logic`
+    out of a legal top-level block — and a check that fires on correct files is
+    one people learn to work around. Everything outside `jobs:` a stub may carry
+    is enumerated by the caller half and the job-key allowlist instead.
+    """
+
+    def test_a_top_level_defaults_run_is_not_a_finding(self):
+        checkout = self.intent()
+        run_cli(["init", str(checkout)])
+        stub = checkout / WORKFLOWS / "spec-ci.yml"
+        stub.write_text(
+            stub.read_text(encoding="utf-8").replace(
+                "jobs:\n", "defaults:\n  run:\n    shell: bash\n\njobs:\n"
+            ),
+            encoding="utf-8",
+        )
+        code, out = run_cli(["doctor", str(checkout)])
+        self.assertEqual(code, 0, out)
+
+    def test_a_run_nested_in_a_job_is_still_a_finding(self):
+        """Narrowing the walk must not narrow what it finds inside a job."""
+        checkout = self.intent()
+        run_cli(["init", str(checkout)])
+        stub = checkout / WORKFLOWS / "spec-ci.yml"
+        stub.write_text(
+            stub.read_text(encoding="utf-8")
+            + "  extra:\n    runs-on: blacksmith-2vcpu-ubuntu-2204\n    steps:\n"
+              "      - run: echo 'a local tweak'\n",
+            encoding="utf-8",
+        )
+        code, out = run_cli(["doctor", str(checkout)])
+        self.assertEqual(code, 1, out)
+        self.assertIn("carries-logic", out)
+
+
+class DoctorFindsAStrayWorkflow(InstallCase):
+    """The retired full copy is where this wave's own history comes back.
+
+    Before the stubs each adapter was a full copy in `.github/workflows/`.
+    Renaming one aside — `spec-ci-legacy.yml` — leaves a file that still runs on
+    every PR, still holds logic nothing keeps equal to what ships, and is
+    invisible to a check that only ever opens the three files it stamped.
+    """
+
+    def install(self) -> Path:
+        checkout = self.intent()
+        run_cli(["init", str(checkout)])
+        return checkout
+
+    def write(self, checkout: Path, name: str, text: str) -> None:
+        (checkout / WORKFLOWS / name).write_text(text, encoding="utf-8")
+
+    def test_a_retired_copy_running_vellum_is_a_finding_naming_the_file(self):
+        checkout = self.install()
+        self.write(checkout, "spec-ci-legacy.yml", (
+            "name: spec-ci-legacy\non:\n  pull_request:\njobs:\n"
+            "  lint:\n    runs-on: blacksmith-2vcpu-ubuntu-2204\n    steps:\n"
+            "      - run: vellum lint .\n"
+        ))
+        code, out = run_cli(["doctor", str(checkout)])
+        self.assertEqual(code, 1, out)
+        self.assertIn("stray-workflow", out)
+        self.assertIn("spec-ci-legacy.yml", out)
+
+    def test_a_second_unmanaged_caller_is_a_finding(self):
+        checkout = self.install()
+        self.write(checkout, "spec-ci-also.yml", (
+            "name: also\non:\n  pull_request:\njobs:\n"
+            "  also:\n    uses: waviisoft/vellum/.github/workflows/spec-ci.yml@main\n"
+        ))
+        code, out = run_cli(["doctor", str(checkout)])
+        self.assertEqual(code, 1, out)
+        self.assertIn("stray-workflow", out)
+        self.assertIn("spec-ci-also.yml", out)
+
+    def test_an_unrelated_workflow_is_not_this_commands_business(self):
+        """An intent repo's own CI is not a stray, and saying so would be noise."""
+        checkout = self.install()
+        self.write(checkout, "docs.yml", (
+            "name: docs\non:\n  pull_request:\njobs:\n"
+            "  build:\n    runs-on: blacksmith-2vcpu-ubuntu-2204\n    steps:\n"
+            "      - run: make docs\n"
+        ))
+        code, out = run_cli(["doctor", str(checkout)])
+        self.assertEqual(code, 0, out)
+
+    def test_a_file_the_forge_could_not_parse_is_passed_over(self):
+        """A workflow that does not parse does not run, which is the point."""
+        checkout = self.install()
+        self.write(checkout, "broken.yml", "jobs: [\n")
+        code, out = run_cli(["doctor", str(checkout)])
+        self.assertEqual(code, 0, out)
+
+
+class DoctorReadsTheWorkspaceLikeInitDoes(InstallCase):
+    def test_a_workspace_with_no_intent_key_is_two_from_both(self):
+        """One accessor, so the two commands refuse the same files.
+
+        Reading less than `init` did left doctor reporting a workspace it could
+        not name the installation from as three missing stubs and exit 1 — "a
+        finding" for what is plainly "I could not answer".
+        """
+        checkout = self.root / "no-intent"
+        checkout.mkdir(parents=True)
+        write_workspace(checkout, intent=None)
+        self.assertEqual(run_cli(["init", str(checkout)])[0], 2)
+        code, out = run_cli(["doctor", str(checkout)])
+        self.assertEqual(code, 2, out)
+        self.assertIn("intent", out)
+
+    def test_the_report_names_the_installation_it_judged(self):
+        checkout = self.intent(intent="acme/product-intent")
+        run_cli(["init", str(checkout)])
+        code, out = run_cli(["doctor", str(checkout)])
+        self.assertEqual(code, 0, out)
+        self.assertIn("acme/product-intent", out)
 
 
 class DoctorReportsAStaleRef(InstallCase):

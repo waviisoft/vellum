@@ -40,8 +40,10 @@ jobs:
     uses: waviisoft/vellum/.github/workflows/harness-ci.yml@v0.1.0
     with:
       # The ref the CLI itself is checked out and installed from, kept equal to
-      # the ref above so one installation runs one version of both.
-      vellum-ref: v0.1.0
+      # the ref above so one installation runs one version of both. QUOTED: a
+      # bare `1.10`, `010`, `null`, `true` or `on` is not a string to a YAML
+      # reader, and an installation stamped with one failed its own doctor.
+      vellum-ref: "v0.1.0"
     # By name, never `secrets: inherit`: the reusable workflow holds exactly the
     # credential its jobs name and nothing else in this installation
     # (spec/features/installation.md).

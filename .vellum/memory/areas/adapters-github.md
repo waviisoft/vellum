@@ -91,6 +91,49 @@ workflow does not have, that is a change to the shipped workflow. A local edit
 to a stub is the thing that used to drift, and `doctor` reports it as
 `carries-logic`, named by file.
 
+**A copy does not have to be a stub to be a copy.** The first version of
+`doctor` opened the three files it stamps and nothing else, so the copies could
+come back by simply not being stubs: rename one aside as `spec-ci-legacy.yml`
+and it still triggers on every PR, still holds the logic, and the command whose
+whole job is noticing that never opens it. `stray-workflow` closes it — any
+other file under `.github/workflows/` that delegates to `waviisoft/vellum`'s
+workflows or runs `vellum` in a body of its own. **The general lesson is the
+same one this section already carries, applied to the check instead of the
+files: a check scoped to the shape you expect misses the shape you retired.**
+
+**The stub's delegating job carries three keys and the rest are findings.**
+`uses:`, `with:`, `secrets:` — an allowlist, because the interesting failures
+here *report success*. `if: false` is the one to remember: a **skipped** job
+reports **success** to branch protection, so `if: false` on the `harness-ci`
+stub is a write-boundary gate that is green on every PR and has run nothing. A
+`strategy:` matrix is the second: it runs the reusable workflow N times inside
+one caller run, and on `on-spec-merge` that is N `vellum mint` runs racing the
+same ledger push. Neither reddens anywhere. The full table is in
+`adapters/github/README.md`; the reasoning is in
+`.vellum/memory/areas/cli.md`.
+
+**The job id is a required-check name.** `<job id> / <called job name>` is how a
+called workflow's checks are reported, which is already recorded below as the
+thing that has to be renamed in branch protection at install time. It is also
+why `doctor` requires the shipped job id: a renamed job is the same breakage
+arrived at from inside the repo instead of from the branch-protection settings,
+and nothing in a checkout can see those settings to catch it twice.
+
+**The branch list is the installation's, not this product's.** `on-spec-merge`
+watches the repository's default branch; `vellum init --branch` stamps it and
+`doctor` exempts `on.push.branches` from its `on:` comparison. Hard-coding
+`main` made an installation on `trunk` one that could never be doctor-green —
+the check reporting the repository's own correct configuration as drift. Only
+the branch list is exempt: `push` must be present, its `paths:` are compared,
+and a trigger added beside it is still drift.
+
+**`vellum-ref:` is quoted in the stub.** A bare `1.10` reads back as the float
+`1.1` and `010` as the int `10`, so an installation pinned to either failed its
+own doctor the moment it was stamped, while the `@<ref>` on the `uses:` line —
+part of a longer scalar — stayed a string. **Any workflow value that is a
+version, a ref or a number-like name gets quoted**; this file's runner labels
+and image tags are the other places that rule bites.
+
 ## Reusable-workflow mechanics, learned writing these
 
 Nothing here could be verified by running a forge — an implementer holds no

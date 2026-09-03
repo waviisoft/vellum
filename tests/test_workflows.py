@@ -34,7 +34,7 @@ from pathlib import Path
 
 import yaml
 
-from vellum.install import SHIPPED, WORKFLOWS_DIR, default_ref, render
+from vellum.install import HOST_REPO, SHIPPED, WORKFLOWS_DIR, default_ref, render
 
 REPO = Path(__file__).resolve().parents[1]
 WORKFLOWS = REPO / WORKFLOWS_DIR["github"]
@@ -111,7 +111,11 @@ class TheShippedWorkflowsAreReusable(unittest.TestCase):
                 repo = (step.get("with") or {}).get("repository")
                 if repo is None:
                     continue
-                self.assertEqual(repo, "waviisoft/vellum", f"{shipped.filename}:{job}")
+                # `install.HOST_REPO`, not a second spelling of the slug:
+                # two definitions of "the repo hosting the workflows" is how
+                # this test comes to pass against a value the stubs no longer
+                # name.
+                self.assertEqual(repo, HOST_REPO, f"{shipped.filename}:{job}")
                 self.assertEqual(
                     (step.get("with") or {}).get("ref"),
                     "${{ inputs.vellum-ref }}",
