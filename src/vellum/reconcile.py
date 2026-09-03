@@ -1038,9 +1038,8 @@ class _Reconciler:
                 continue
             self.act(
                 "open-question", version, item,
-                f"the corpus does not answer {one_line(question, 40)!r}; open a "
-                f"question issue mentioning the architect (owner only on appeal) "
-                f"and park the item",
+                f"open a question issue mentioning the architect and park the item; "
+                f"the corpus does not answer {one_line(question, 60)!r}",
             )
             if item is not None:
                 self.parked_items.add((version, item))

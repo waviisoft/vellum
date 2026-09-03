@@ -550,8 +550,9 @@ class TestCorpusAnswerableQuestionsBounce(TickCase):
         tick = self.raise_question("Should settlement use kafka or rabbitmq?")
         (opened,) = tick.of_kind("open-question")
         self.assertIn("mentioning the architect", opened.detail)
-        self.assertNotIn("mentioning the owner", opened.detail)
-        self.assertIn("appeal", opened.detail, "the appeal path is named, not implied")
+        self.assertNotIn("owner", opened.detail, "the tick never addresses the owner")
+        self.assertIn("Should settlement use", opened.detail,
+                      "the question's opening survives the one-line narrowing")
         self.assertFalse(opened.taken, "opening the issue is the forge's half")
 
     def test_answering_writes_nothing_to_the_ledger(self):
