@@ -4,20 +4,27 @@
 # this repo: they have no trigger but `workflow_call`. This one is the
 # product repo's own tests and conformance check.
 #
-# Runners: this organisation schedules Actions on Blacksmith, not on
-# GitHub-hosted runners. `runs-on: ubuntu-latest` is never assigned a runner
-# here — the job is accepted and then fails in a few seconds with no logs, no
-# steps and runner_id 0, which reads like an infrastructure blip and is not
-# one. Use a `blacksmith-<vcpu>vcpu-ubuntu-<release>` label. Sizes run 2-32
-# vCPU; 2 is right for this repo, whose slowest job is a few seconds of
-# unittest.
+# Runners: WAVIISoft, the organisation that publishes this repo, schedules its
+# Actions on Blacksmith rather than on GitHub-hosted runners. That is a hosting
+# choice, not something Vellum requires — but it is the setup THIS file runs
+# in, so `runs-on: ubuntu-latest` is never assigned a runner here: the job is
+# accepted and then fails in a few seconds with no logs, no steps and
+# runner_id 0, which reads like an infrastructure blip and is not one. Use a
+# `blacksmith-<vcpu>vcpu-ubuntu-<release>` label. Sizes run 2-32 vCPU; 2 is
+# right for this repo, whose slowest job is a few seconds of unittest. A fork
+# in an organisation without the Blacksmith app changes these labels to
+# whatever its own runners answer to — every `runs-on:` in this file, and
+# nothing else.
 #
 # The pin of record is `.vellum/product.yaml` (spec/decisions/2026-08-28-pin-file.md);
-# there is no spec submodule any more. The intent repo is private, and a
-# workflow's default GITHUB_TOKEN is scoped to this repository alone — it
-# cannot clone it. So the tests run without the spec tree (they are written to
-# skip the handful of checks that need it), and the conformance job fetches the
-# intent repo explicitly, at the pin, with a credential that can read it.
+# there is no spec submodule any more. The intent repo this installation is
+# paired with — `waviisoft/vellum-intent`, which holds the spec — is private and
+# stays private; a workflow's default GITHUB_TOKEN is scoped to this repository
+# alone and cannot clone it. So the tests run without the spec tree (they are
+# written to skip the handful of checks that need it), and the conformance job
+# fetches the intent repo explicitly, at the pin, with a credential that can
+# read it. A fork has its own intent repo and its own such credential; nothing
+# here reaches this one.
 
 name: ci
 

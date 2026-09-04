@@ -214,32 +214,80 @@ credential its jobs name and nothing else in the installation. `doctor` treats
 workflow for the issue-filing step, scoped to the caller with the permissions
 the stub granted, and needs no declaration.
 
-**`required: true` on a declared secret does not catch an EMPTY one.** It catches
-a caller that omits the key. So every shipped workflow keeps its "Require the
-VELLUM_TOKEN secret" step, which is what turns an unset secret into a named
-`::error` instead of an opaque pip failure.
+**`VELLUM_TOKEN` IS OPTIONAL — `required: false` — and the checkout falls back.**
+The go-live wave (waviisoft/vellum-intent#74) turned the secret from mandatory
+into a thing an installation may or may not need, because `waviisoft/vellum` is
+being made public and a public repo is readable by the caller's own
+`github.token`. Three things moved together and none of them works alone:
+
+- `secrets: VELLUM_TOKEN: required: false` in all three `workflow_call` blocks.
+  `required: true` refuses the *run* of a caller that omits the key.
+- `token: ${{ secrets.VELLUM_TOKEN || github.token }}` on every checkout of
+  `waviisoft/vellum`. **An empty `token:` is not "use the default"** —
+  `actions/checkout` reads it as a required input, so an unset secret produced
+  "Input required and not supplied: token" before the clone was attempted. That
+  is the whole reason the secret used to be mandatory in fact as well as in
+  declaration. The `||` supplies the default explicitly.
+- the "Require the VELLUM_TOKEN secret" step became "Say whether VELLUM_TOKEN
+  was supplied", a `::notice` and no `exit 1`. Left as a gate it would have kept
+  the secret mandatory from inside the body whatever `secrets:` said.
+  `test_no_shipped_workflow_fails_a_run_for_a_missing_token` pins that, matched
+  on what such a step would have to *do* rather than on its name.
+
+**Why not two checkout steps with opposite `if:` conditions.** Because the
+`secrets` context is not available in an `if:` at all — GitHub's context
+availability table does not list it for `jobs.<id>.steps.if` — so that shape
+needs the secret laundered through a step output or an env var first, and a
+mis-set output runs both checkouts or neither *without reddening*. One
+expression in `with:`, where the `secrets` context IS available, has no such
+half-state. Both values are registered secrets and masked in the log either way.
+
+**The old note this replaces was true and is now beside the point**, and it is
+worth keeping the fact it carried: `required: true` never caught an EMPTY
+secret, only an omitted key. That is still why the notice step exists — it
+reports the case the declaration cannot.
+
+**UNVERIFIED, like everything else in this section: that the caller's own
+`github.token` reads a PUBLIC `waviisoft/vellum` from another organisation.** It
+is documented GitHub behaviour — a repo-scoped token is a valid credential and a
+public repo is readable by any credential, or none — and it is `actions/checkout`'s
+own default for cross-repo public checkouts. No forge was available to run it.
+It settles on the first installation run, and it fails loudly at the checkout if
+it is wrong.
+
+**Until `waviisoft/vellum` is actually public, an installation that passes no
+token still fails at that checkout.** The change is safe to land ahead of the
+repo flipping because every existing stub goes on passing the secret by name;
+what it buys is that the stub is no longer *required* to.
 
 ## Landmines
 
-**Runners are Blacksmith, not GitHub-hosted.** `runs-on: ubuntu-latest` is never
-assigned a runner in this organisation: the job is accepted and then fails in
-3-8 seconds with `conclusion: failure`, no logs (the download 404s), no `steps`
-array, and `runner_id: 0` with an empty `runner_name`, while the workflow
-reports `state: active`. Five runs and one re-run failed that way. It reads like
-an infrastructure blip and is not one — do not "fix" the workflow in response to
-it, and never swap the label back to `ubuntu-latest`. Confirmed working:
+**Runners are Blacksmith, not GitHub-hosted — a WAVIISoft hosting choice, not a
+Vellum requirement.** WAVIISoft, the organisation that publishes this repo,
+schedules its Actions on Blacksmith, so in *its* setup `runs-on: ubuntu-latest`
+is never assigned a runner: the job is accepted and then fails in 3-8 seconds
+with `conclusion: failure`, no logs (the download 404s), no `steps` array, and
+`runner_id: 0` with an empty `runner_name`, while the workflow reports
+`state: active`. Five runs and one re-run failed that way. It reads like an
+infrastructure blip and is not one — do not "fix" the workflow in response to
+it, and never swap the label back to `ubuntu-latest` *here*. Confirmed working:
 `blacksmith-2vcpu-ubuntu-2204`. A healthy job shows a real `runner_name` (e.g.
 `blacksmith-01m13gdj...-2vcpu`), a populated `steps` array, and Blacksmith's
 `job_completed.sh` hook in the log. `test_no_job_asks_for_a_github_hosted_runner`
-now pins it.
+now pins it — and note what that test therefore asserts: this organisation's
+labels, not a portable property. A fork on GitHub-hosted runners has to change
+that test with the workflows.
 
 **The labels are in the SHIPPED workflows now, and an installation cannot
 change them from its stub.** That is a real cost of hosting the bodies
 centrally: an installation in an organisation without the Blacksmith app has no
-way to override the label. The fix when a second organisation needs it is a
-`runs-on` input with a default; nothing has asked yet, and inventing the input
-ahead of the ask is how these files acquire configuration nobody uses. Named in
-`adapters/github/README.md` rather than hidden.
+way to override the label, and inherits labels its runners will never answer to.
+Today its options are to install Blacksmith, or to fork this repo, edit
+`runs-on:` in the three files and point its stubs at the fork with
+`vellum init . --from <owner>/<fork>`. The proper fix when a second organisation
+needs it is a `runs-on` input with a default; nothing has asked yet, and
+inventing the input ahead of the ask is how these files acquire configuration
+nobody uses. Named in `adapters/github/README.md` rather than hidden.
 
 **`harness-ci.yml` runs on every PR *because* a `paths:` filter and a required
 check do not compose.** GitHub never reports a path-filtered job on a PR it
@@ -287,27 +335,33 @@ check becomes impossible rather than strict, and impossible red is how a team
 learns to ignore red. The real fix belongs in `harness/run.py` — an option to
 omit the header — and `harness/` is not a tree this repo may write.
 
-**The CLI is checked out, not `pip install`ed from its git URL, and that shape
-is load-bearing.** `waviisoft/vellum` is private, so the intent repo's own job
-token cannot read it — hence the `VELLUM_TOKEN` secret, which every shipped
-workflow asserts before use so a missing secret fails with a named error instead
-of an opaque pip failure. The private-repo half is the whole reason now and it is
-sufficient on its own — a token has to be supplied either way, and `pip install
-"vellum @ git+https://..."` has nowhere to put one. The *original* reason was
-narrower and is spent: pip's VCS install runs `git submodule update --init
---recursive`, which cloned the private `spec` submodule with no credentials and
-failed. That submodule is gone (`spec/decisions/2026-08-28-pin-file.md`), so do
-not cite it as a live constraint, and do not read its removal as permission to
-"simplify" this back into a one-line pip install.
+**The CLI is checked out, not `pip install`ed from its git URL — and BOTH of the
+original reasons are now spent.** They are recorded because a later wave will
+otherwise re-derive them wrongly. (1) pip's VCS install runs `git submodule
+update --init --recursive`, which cloned the private `spec` submodule with no
+credentials and failed; that submodule is gone
+(`spec/decisions/2026-08-28-pin-file.md`). (2) `waviisoft/vellum` was private, so
+a credential had to be supplied and `pip install "vellum @ git+https://..."` has
+nowhere to put one; it is going public. What keeps the checkout is smaller and
+still true: it takes a ref directly, so `inputs.vellum-ref` pins the CLI in one
+readable place, and it is the one shape that works whether or not a token is
+supplied. **This is now a shape somebody could reasonably propose simplifying**,
+and the honest answer is "it would work, and it would move the pin into a pip
+URL". That is a call for a wave that wants to make it, not a hole to fall into.
 
 **Reuse of a private repo's workflows is an ACTIONS SETTING on this repo.**
-`waviisoft/vellum` is private, so `uses: waviisoft/vellum/...` from another repo
-resolves only when Settings > Actions > General > Access is "Accessible from
-repositories in the organization". Without it the caller's run fails at `uses:`
-with a resolution error before any step runs. **No checkout can see this
-setting**, so `vellum doctor` says it cannot check it — and neither could this
-wave. It is the single most likely first-run failure and it is not a defect in
-these files.
+While `waviisoft/vellum` is private, `uses: waviisoft/vellum/...` from another
+repo resolves only when Settings > Actions > General > Access is "Accessible
+from repositories in the organization" — and that phrasing is also the limit:
+only repositories in the SAME organization can call them, however the setting is
+turned. Without it the caller's run fails at `uses:` with a resolution error
+before any step runs. **No checkout can see this setting**, so `vellum doctor`
+says it cannot check it — and neither could the wave that wrote these files. It
+is the single most likely first-run failure and it is not a defect in them.
+Making the repo public retires both halves at once: any repository may then call
+these workflows, and the setting stops applying. Do not delete this paragraph
+when that happens — a repo can be made private again, and the failure it
+describes would arrive looking like a new one.
 
 **Backpressure is real now and deliberately not blocking.** `vellum
 backpressure` counts records that are neither `shipped` nor `superseded`, and
