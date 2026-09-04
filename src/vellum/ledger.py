@@ -35,9 +35,12 @@ from __future__ import annotations
 
 import datetime
 import re
+import urllib.parse
 from pathlib import Path
 
 import yaml
+
+from vellum.text import one_line
 
 #: A spec version is a commit. Abbreviations are accepted because a human
 #: types them; git's own 7-character floor is the floor here too.
@@ -502,6 +505,62 @@ def parse_certified_sha(value, what: str = "certified commit") -> str:
     return sha
 
 
+def clean_run_reference(run) -> tuple[str | None, tuple[str, ...]]:
+    """``(the value to store, what was removed from it)``.
+
+    ``--run`` is a *reference* to where the certification run is recorded, and
+    it is published twice over: written into a ledger record that is committed
+    to the intent repo, and printed by every ``certify check`` that reads it —
+    which in CI means a job log and, piped to a step summary, a page. So the
+    two places a token rides in a URL go: ``https://user:tok@host/run/7?token=y``
+    is stored and printed as ``https://host/run/7``.
+
+    A credential is stripped rather than refused, and that is deliberate: a
+    ``certify record`` that failed would leave the ledger unable to say a run
+    happened at all, which is the same reason recording a *red* result exits 0.
+    The path and any fragment survive, because ``#step:3:1`` is how a forge
+    addresses a line of a run log and losing it costs a reader the thing the
+    reference exists for.
+
+    The second half of the pair exists so the command can say *what* it
+    dropped rather than diffing two strings and guessing. Userinfo and a query
+    string are not the same news — one means a credential is now in a shell
+    history and wants rotating, the other means a `?check_suite_focus=true`
+    went with the rule — and a report that called both a credential would
+    train a reader to ignore the one that is.
+
+    This is a backstop, not a laundering service. ``--run`` must be
+    credential-free at the point it is typed: by the time a value reaches here
+    it has already been through a shell history, a process table and whatever
+    workflow expression composed it, and none of those are undone by a
+    substring being dropped on the way to disk.
+    """
+    if run is None:
+        return None, ()
+    text = str(run).strip()
+    parts = urllib.parse.urlsplit(text)
+    if not parts.netloc:
+        # Not URL-shaped — a bare run id, or a forge's own `owner/repo#7`.
+        # There is no userinfo or query to find in one, and guessing at a
+        # structure it does not have would mangle a perfectly good reference.
+        return text, ()
+    host = parts.netloc.rpartition("@")[2]
+    removed = tuple(
+        what
+        for what, present in (("userinfo", host != parts.netloc), ("query string", bool(parts.query)))
+        if present
+    )
+    cleaned = urllib.parse.urlunsplit(
+        (parts.scheme, host, parts.path, "", parts.fragment)
+    )
+    return cleaned, removed
+
+
+def credential_free_run(run):
+    """The value ``clean_run_reference`` would store, for callers printing one."""
+    return clean_run_reference(run)[0]
+
+
 def new_certification(sha: str, result: str, run: str | None = None, at: str | None = None) -> dict:
     """``certification: {sha, run, at, result}`` (``spec/features/ledger.md``)."""
     if result not in CERTIFICATION_RESULTS:
@@ -511,7 +570,7 @@ def new_certification(sha: str, result: str, run: str | None = None, at: str | N
         )
     return {
         "sha": parse_certified_sha(sha),
-        "run": run,
+        "run": credential_free_run(run),
         "at": at or now(),
         "result": result,
     }
@@ -585,12 +644,28 @@ def certification_authorizes(item: dict, head: str) -> tuple[bool, str]:
             f"a mapping ({type(certification).__name__}); it records no run, so it "
             f"authorizes nothing."
         )
-    certified = str(certification.get("sha") or "").strip().lower()
-    result = str(certification.get("result") or "").strip().lower()
+    certified = certification.get("sha")
+    result = certification.get("result")
     if not certified:
         return False, (
             f"work item {item.get('issue')} has a certification naming no sha, so "
             f"there is no commit it is evidence about."
+        )
+    # Read exactly what a write would have produced, and nothing else. The
+    # comparison used to normalise both fields on the way in — `.strip()` and
+    # `.lower()` — while `new_certification` and `parse_certified_sha` accept
+    # only the strict forms. That asymmetry is the whole defect: a hand-written
+    # `Green`, or a sha with a stray space, authorized a merge although no run
+    # this CLI performed could ever have written one. A record it could not
+    # have written is a record it cannot vouch for, and the denial branch is
+    # already the right home for that — every non-green shape is one answer
+    # with a different sentence.
+    if not isinstance(certified, str) or not FULL_SHA_RE.match(certified):
+        return False, (
+            f"work item {item.get('issue')} has a certification whose sha is "
+            f"{one_line(certified)!r}, which is not the full lowercase forty a "
+            f"recorded run writes. Nothing this CLI wrote looks like that, so it "
+            f"is evidence about no commit in particular."
         )
     if certified != head:
         return False, (
@@ -599,9 +674,13 @@ def certification_authorizes(item: dict, head: str) -> tuple[bool, str]:
             f"a sha: a commit pushed after the run was not covered by it."
         )
     if result != GREEN:
+        recorded = "no result" if result in (None, "") else one_line(result)
         return False, (
-            f"the certification at {head[:12]} recorded {result or 'no result'!r}, "
-            f"not {GREEN!r}."
+            f"the certification at {head[:12]} recorded {recorded!r}, "
+            f"not {GREEN!r}. The result is matched exactly as recorded: "
+            f"`certify record` writes only {' or '.join(CERTIFICATION_RESULTS)}, "
+            f"so a value that has to be trimmed or lowercased to read as "
+            f"{GREEN!r} was not written by a certification run."
         )
     return True, f"green certification recorded at {head[:12]}."
 

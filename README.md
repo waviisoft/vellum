@@ -174,6 +174,52 @@ workflow needs: the record either exists for this commit or it does not. Cost fl
 invocation records into the same work-item entry. Records default to `./ledger`;
 use `--ledger-dir` to point elsewhere.
 
+### `vellum certify record|check`
+
+The recorded proof an auto-merge is gated on. `record` is written by the
+certification runner when a run finishes; `check` is read by the gate that
+would merge. Both take the intent checkout, the version whose record holds the
+work item, and the item's issue number.
+
+```sh
+vellum certify record "$VELLUM_INTENT_REPO" --version "$V" --item 121 \
+    --sha 1ce87cb5dd140bf2d9b125f9124d256fc4a19303 --result green \
+    --run https://ci.example/run/7
+vellum certify check "$VELLUM_INTENT_REPO" --version "$V" --item 121 \
+    --head 1ce87cb5dd140bf2d9b125f9124d256fc4a19303
+```
+
+`check` exits 0 when a green certification is recorded at exactly `--head`, and
+1 when it is not — no certification, a red one, or one bound to another commit.
+2 stays "could not answer": no ledger, no record for that version, no such work
+item. It reaches no forge and runs nothing; the head is supplied by the caller
+that can see the PR, and it is never told whether in-session checks passed,
+because the examined party's report about itself is not the evidence. Recording
+a red result exits 0 — the recorder has not failed at anything, and the denial
+is `check`'s to give.
+
+**`--sha` and `--head` take the full forty**, and an abbreviation is refused
+rather than resolved: a prefix names a set of commits, and an authorization is
+about exactly one. The sha `record` echoes back is the normalised one it
+stored, not the casing you typed.
+
+**Only a record this CLI could have written authorizes.** The recorded
+`result` is matched against `green` exactly and the recorded `sha` against the
+full lowercase forty — a hand-written `Green`, or a sha with a stray space,
+denies and the report says which value it read and why. The read invariant and
+the write invariant are the same rule, because a merge gate whose read side is
+looser than its write side is one anyone with commit access to the ledger can
+walk through by hand.
+
+**`--run` must be credential-free.** It is published twice — committed to the
+intent repo, and printed by every `certify check` that reads it — so userinfo
+and the query string are stripped from a URL-shaped value on store *and* on
+print: `https://user:tok@host/run/7?token=y` is stored and shown as
+`https://host/run/7`. `record` names what it dropped rather than editing
+quietly, and says "rotate" only for the half that is a credential. Treat it as
+a backstop: by the time a value reaches the command it has been through a
+shell history and a process table, and a dropped substring undoes neither.
+
 ### `vellum mint <intent-checkout>`
 
 The bookkeeping a spec merge leaves behind: opens the ledger record for the

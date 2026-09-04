@@ -19,7 +19,7 @@ symbol you can grep for.
 | `src/vellum/lint.py` | `lint_tree()`, `Finding`, the `_check_*` functions. |
 | `src/vellum/suite.py` | `extract()`, `scan_file()`, `scenarios_in()`, `BlockError`, `DroppedScenarios`, `fingerprint()`, `version_history()`, `History`, `to_dict()`. |
 | `src/vellum/gitver.py` | `spec_commits()`, `names()`, `tags()`, `is_shallow()`, `markdown_at()`, `show()`. All subprocess git lives here. |
-| `src/vellum/ledger.py` | `open_record()`, `advance()`, `find_record()`, `dump()`, `parse_time()`, `upsert_plan()`, `RECORD_KEYS`, `ITEM_KEYS`. Also the certification and lease half: `certify()`, `certification_authorizes()`, `take_lease()`, `clear_lease()`, `active_lease()`. |
+| `src/vellum/ledger.py` | `open_record()`, `advance()`, `find_record()`, `dump()`, `parse_time()`, `upsert_plan()`, `RECORD_KEYS`, `ITEM_KEYS`. Also the certification and lease half: `certify()`, `certification_authorizes()`, `new_certification()`, `clean_run_reference()`, `credential_free_run()`, `take_lease()`, `clear_lease()`, `active_lease()`. |
 | `src/vellum/certify.py` | `check()` -> `Authorization`, `run_check()`, `run_record()`. The merge gate's evidence. |
 | `src/vellum/mint.py` | `mint()` -> `Mint`, `_commit_record()`. The `on-spec-merge` bookkeeping. |
 | `src/vellum/backpressure.py` | `measure()` -> `Window`, `run()`, `SETTLED_STATES`. The divergence gate. |
@@ -1005,6 +1005,69 @@ notion of *later* and so cannot be fooled by a force-push that rewrites what
 "subsequent" means. `certification_authorizes()` returns `(bool, reason)` and
 every non-green shape — absent, red, another sha, a corrupt field — is the same
 answer with a different sentence.
+
+**The read invariant is the write invariant, or the write one is advisory.**
+`certification_authorizes()` used to normalise the recorded fields on the way
+in — `str(...).strip().lower()` on both `result` and `sha` — while
+`new_certification()` accepts only `green`/`red` exactly and
+`parse_certified_sha()` writes only the full lowercase forty. So a hand-written
+`Green`, or a sha with a stray space, authorized a merge although no run this
+CLI performed could have written one (waviisoft/vellum#14). Both are now
+matched strictly, and the mismatch is a *denial* rather than a raise, because a
+record this CLI could not have written is exactly the "no green certification
+exists at this head" the spec already describes — one answer with another
+sentence. The report names the value it read and says a value needing trimming
+or lowercasing was not written by a run, because a refusal a reader cannot act
+on sends them hunting for a missing run rather than at the record.
+
+Do not put the normalisation back "so an operator's `Green` works". That is the
+defect: a merge gate whose read side is looser than its write side is one that
+anyone with commit access to the ledger can walk through by hand, and the
+looseness is invisible to everything except a hand-edited record.
+`TestTheRecordedResultIsMatchedExactly` exists in both
+`tests/test_certify.py` (through the CLI) and `tests/test_ledger.py` (below
+it), each opening with the green-authorizes control, so a rule that denied
+everything cannot pass either.
+
+Measured: **no record in the intent repo has ever carried a certification** —
+18 ledger records, 0 work items, 0 certifications, 0 run references — so the
+strictness changes no existing authorization. Re-measure rather than re-reading
+this line; it is a `yaml.safe_load` over `ledger/*.yaml` counting
+`work_items[].certification`.
+
+**`--run` is published twice, so it is stripped twice.** A run reference is
+written into a ledger record that is committed to the intent repo *and* printed
+by every `certify check` that reads it — a job log, and a step-summary page
+when piped. `clean_run_reference()` in `src/vellum/ledger.py` drops userinfo
+and the query string from a URL-shaped value, and it runs on **store**
+(`new_certification()`) and on **print** (`Authorization.report()`, through the
+`credential_free_run()` shorthand for callers that want the value alone). Both,
+not one: stripping only on store leaves every record edited by hand publishing
+its token on every check, and stripping only on print leaves it committed.
+
+Three judgment calls inside it. The fragment **survives** — `#step:3:1` is how
+a forge addresses a line of a run log, so dropping it costs a reader the thing
+the reference exists for, and it is not where a credential rides. A value with
+no netloc is **left alone**: a bare id or `owner/repo#7` has no userinfo or
+query to find, and guessing at a structure it does not have would mangle a good
+reference. And a credential is **stripped rather than refused**, for the reason
+recording a red result exits 0 — a `certify record` that failed would leave the
+ledger unable to say a run happened at all. What the command does instead is
+*say* what it dropped, so the operator rotates rather than assuming the value
+never left: it has already been through a shell history and a process table by
+then, and this is a backstop, not a laundering service. `--run`'s help text and
+the README say credential-free is the contract.
+
+`clean_run_reference()` returns `(value, removed)` rather than leaving the
+command to diff two strings, and that is not tidiness. Userinfo and a query
+string are not the same news — one means a credential is loose and wants
+rotating, the other that a `?check_suite_focus=true` went with the rule — and a
+diff cannot tell them apart, so a report built on one would call both a
+credential and train a reader to ignore the times it is. Only the userinfo case
+says "rotate", and a reference with nothing to remove says nothing at all;
+`test_a_reference_with_nothing_to_remove_reports_nothing` is the control on
+that, since a rule that always claimed to have removed something would pass
+every other assertion.
 
 **A denial is exit 1, not 2.** It is an answer, and a merge gate that cannot
 tell "this head is uncertified" from "that is not an intent checkout" reports

@@ -176,6 +176,16 @@ class TestRecording(CertifyCase):
              "result": "green"},
         )
 
+    def test_the_echoed_sha_is_the_one_that_was_stored(self):
+        # Echoing the caller's own casing back reads as confirmation that what
+        # they typed is what the record holds, and the two are not the same
+        # string: `parse_certified_sha` normalises before writing.
+        code, output = self.record(sha=HEAD.upper())
+        self.assertEqual(code, 0)
+        self.assertIn(HEAD[:12], output)
+        self.assertNotIn(HEAD[:12].upper(), output)
+        self.assertEqual(self.item()["certification"]["sha"], HEAD)
+
     def test_a_red_run_is_recorded_and_the_command_succeeds(self):
         # Recording a red is not a failure of the recorder; the denial is
         # `check`'s to give, and a red that could not be written would leave
@@ -260,6 +270,134 @@ class TestCorruptCertification(CertifyCase):
         code, output = self.deny({"sha": HEAD, "run": None, "at": None, "result": None})
         self.assertEqual(code, 1)
         self.assertIn("no result", output)
+
+
+class TestTheRecordedResultIsMatchedExactly(CertifyCase):
+    """A record this CLI could not have written does not authorize a merge.
+
+    ``certification_authorizes`` normalised the recorded ``result`` on the way
+    in — ``.strip().lower()`` — while ``certify record`` accepts only ``green``
+    or ``red`` exactly. The read invariant was therefore looser than the write
+    one, and a merge gate whose read side is looser than its write side is a
+    gate anyone with commit access to the ledger can walk through by hand. The
+    two are now the same rule.
+    """
+
+    def recorded(self, **over):
+        path = record_path(self.dir, VERSION)
+        record = load(path)
+        cert = {"sha": HEAD, "run": None, "at": "2026-09-01T00:00:00Z",
+                "result": "green"}
+        cert.update(over)
+        find_item(record, ISSUE)["certification"] = cert
+        from vellum.ledger import write
+        write(path, record)
+        return self.check()
+
+    def test_a_result_written_by_the_command_still_authorizes(self):
+        # First, so that a rule denying everything cannot pass this class.
+        self.assertEqual(self.recorded()[0], 0)
+
+    def test_a_hand_written_uppercase_green_is_denied(self):
+        code, output = self.recorded(result="Green")
+        self.assertEqual(code, 1)
+        self.assertIn("'Green'", output)
+
+    def test_the_denial_says_why_a_value_that_looks_green_is_not(self):
+        # Denying is half the job; a gate whose refusal a reader cannot act on
+        # sends them looking for a missing run rather than at the record.
+        self.assertIn("trimmed or lowercased", self.recorded(result="GREEN ")[1])
+
+    def test_a_sha_that_is_not_the_full_lowercase_forty_is_denied(self):
+        code, output = self.recorded(sha=HEAD.upper())
+        self.assertEqual(code, 1)
+        self.assertIn("full lowercase forty", output)
+
+    def test_a_denial_here_is_still_exit_1_and_not_2(self):
+        # 2 means "could not answer". A malformed certification is an answer:
+        # no green certification exists at this head, whatever the record says
+        # it once was — which is the spec's own sentence.
+        self.assertEqual(self.recorded(result="Green")[0], 1)
+        self.assertEqual(self.recorded(sha=" " + HEAD)[0], 1)
+
+
+class TestRunReferencesCarryNoCredential(CertifyCase):
+    """``--run`` is committed to the intent repo and printed by every check.
+
+    Two publications of one value, so it is stripped at both: on store, and on
+    print — the second because a record written before this rule, or edited by
+    hand, still holds whatever it holds.
+    """
+
+    SECRET_URL = "https://ci-bot:s3cr3t@ci.example/run/7?token=z3cr3t"
+
+    def stored_run(self):
+        return self.item()["certification"]["run"]
+
+    def test_a_url_is_stored_without_its_userinfo_or_query(self):
+        code, output = self.record(extra=("--run", self.SECRET_URL))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.stored_run(), "https://ci.example/run/7")
+        written = record_path(self.dir, VERSION).read_text(encoding="utf-8")
+        self.assertNotIn("s3cr3t", written)
+        self.assertNotIn("z3cr3t", written)
+
+    def test_a_benign_query_string_is_reported_without_a_rotate_warning(self):
+        # `?check_suite_focus=true` goes with the rule, and calling that a
+        # credential would train a reader to ignore the times it is one.
+        code, output = self.record(
+            extra=("--run", "https://ci.example/run/7?check_suite_focus=true")
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("dropped its query string", output)
+        self.assertNotIn("Rotate", output)
+        self.assertEqual(self.stored_run(), "https://ci.example/run/7")
+
+    def test_recording_says_what_it_stored_instead_of_quietly_editing_it(self):
+        # The operator's credential has already been through a shell history
+        # and a process table; dropping a substring here does not undo that, so
+        # they are told to rotate it rather than left to assume it never left.
+        output = self.record(extra=("--run", self.SECRET_URL))[1]
+        self.assertIn("https://ci.example/run/7", output)
+        self.assertIn("dropped its userinfo and query string", output)
+        self.assertIn("Rotate the credential", output)
+        self.assertNotIn("s3cr3t", output)
+
+    def test_the_check_prints_the_reference_without_the_credential(self):
+        self.record(extra=("--run", self.SECRET_URL))
+        code, output = self.check()
+        self.assertEqual(code, 0)
+        self.assertIn("run https://ci.example/run/7", output)
+        self.assertNotIn("s3cr3t", output)
+        self.assertNotIn("z3cr3t", output)
+
+    def test_a_record_already_holding_a_credential_is_stripped_on_print(self):
+        # Stripping on store alone would leave every record written before this
+        # wave — or edited by hand — publishing its token on every check.
+        self.record()
+        path = record_path(self.dir, VERSION)
+        record = load(path)
+        find_item(record, ISSUE)["certification"]["run"] = self.SECRET_URL
+        from vellum.ledger import write
+        write(path, record)
+        code, output = self.check()
+        self.assertEqual(code, 0)
+        self.assertIn("run https://ci.example/run/7", output)
+        self.assertNotIn("s3cr3t", output)
+
+    def test_a_bare_run_reference_is_stored_and_printed_as_written(self):
+        # The negative control: the rule strips credentials, it does not
+        # reshape references. And nothing is said about a value it left alone.
+        code, output = self.record(extra=("--run", "waviisoft/vellum#7"))
+        self.assertEqual(code, 0)
+        self.assertNotIn("Rotate", output)
+        self.assertEqual(self.stored_run(), "waviisoft/vellum#7")
+        self.assertIn("run waviisoft/vellum#7", self.check()[1])
+
+    def test_recording_a_credential_is_still_exit_0(self):
+        # A `certify record` that failed would leave the ledger unable to say a
+        # run happened at all — the same reason recording a red result is 0.
+        self.assertEqual(self.record(extra=("--run", self.SECRET_URL))[0], 0)
 
 
 class TestLease(CertifyCase):
