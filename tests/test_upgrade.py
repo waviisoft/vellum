@@ -89,12 +89,15 @@ SANDBOX_ENTRY = """
 """
 
 _TMP: tempfile.TemporaryDirectory | None = None
+
 #: The sandbox `waviisoft/vellum` checkout, and the provisioned installation
-#: every test copies. Built once: neither is mutated by any test, and
-#: provisioning runs lint and doctor over its seed, which is not worth paying
-#: for per test.
-SANDBOX: Path
-TEMPLATE: Path
+#: every test copies. Both are replaced by `setUpModule` and nothing reads them
+#: before it runs; they are bound here rather than merely annotated so a reader
+#: (and a linter) can see that they are module state and not a typo. Built once:
+#: neither is mutated by any test, and provisioning runs lint and doctor over
+#: its seed, which is not worth paying for per test.
+SANDBOX = Path()
+TEMPLATE = Path()
 
 
 def _git(repo: Path, *args: str) -> str:
