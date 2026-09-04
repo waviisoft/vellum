@@ -72,6 +72,22 @@ pin the CLI: the checkout of `waviisoft/vellum` inside the workflow body needs a
 ref it can be handed, and an installation's CLI version has to be readable in
 the repository that runs it.
 
+**The stubs are one of three things a release moves, and `vellum upgrade` moves
+all three.**
+
+```sh
+vellum upgrade . --to v0.3.0 --from ../vellum --plan   # see it first
+vellum upgrade . --to v0.3.0 --from ../vellum
+```
+
+It re-stamps the stubs at the new ref, rewrites every other file
+`.vellum/install.yaml` names as Vellum's, records the release in that manifest,
+and lands the lot on `vellum/upgrade-v0.3.0` as a pull request — never as a push
+to the default branch every stub watches. An owned file this installation has
+edited stops it: exit 1 naming the file, nothing written. `vellum init --ref
+<new> --force` above is still the right command when the *stubs alone* are what
+you are moving.
+
 ## Why stubs, and what a stub may not become
 
 `spec/features/installation.md`: "A stub holds no logic, so it has nothing to

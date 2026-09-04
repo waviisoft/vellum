@@ -8,7 +8,7 @@ notes live in `.vellum/memory/areas/`; wave worklogs in `.vellum/memory/waves/`.
 | Path | What |
 |---|---|
 | `src/vellum/` | The CLI. One module per concern; see `.vellum/memory/areas/cli.md`. |
-| `src/vellum/seeds/` | The harness skeleton `vellum init --shape …` seeds into a new installation. Package data rather than repository paths, for the reason the caller stubs are generated rather than copied: an installed CLI is a wheel. Every file in it is a module of a real package, which is what makes a wheel carry it with no `[tool.setuptools.package-data]` declaration — `seeds/harness/__init__.py` has the argument. |
+| `src/vellum/seeds/` | What `vellum init --shape …` seeds into a new installation, and what `vellum upgrade` compares against: the harness skeleton under `harness/`, the seeded config, release ledger and memory map under `templates/`, and `CHANGES.yaml`, the installation-shape changelog. Package data rather than repository paths, for the reason the caller stubs are generated rather than copied: an installed CLI is a wheel. Every `.py` in it is a module of a real package and ships whatever setuptools is told — `seeds/harness/__init__.py` has the argument — and the files that are not `.py` are declared in `pyproject.toml`'s `[tool.setuptools.package-data]`. Templates are FILES rather than string constants because `vellum upgrade` reads a release's copy with `git show <ref>:<path>`. |
 | `tests/` | `unittest` suite plus fixture spec trees under `tests/fixtures/`. |
 | `.github/workflows/` | `ci.yml` tests this repo; `spec-ci.yml`, `on-spec-merge.yml` and `harness-ci.yml` are **reusable** (`workflow_call`) workflows an installation's intent repo calls, and never run here. See `.vellum/memory/areas/adapters-github.md`. |
 | `adapters/github/` | The **caller stubs** an intent repo carries, rendered by `vellum init` from `vellum.install.SHIPPED`. See `.vellum/memory/areas/adapters-github.md`. |
@@ -17,7 +17,7 @@ notes live in `.vellum/memory/areas/`; wave worklogs in `.vellum/memory/waves/`.
 
 ## Areas
 
-- [`.vellum/memory/areas/cli.md`](areas/cli.md) — `vellum lint`, `vellum suite extract`, `vellum ledger`, the pipeline commands `vellum mint`, `vellum backpressure`, `vellum pin advance`, the mechanical guards, and the installer commands `vellum init` / `vellum doctor`.
+- [`.vellum/memory/areas/cli.md`](areas/cli.md) — `vellum lint`, `vellum suite extract`, `vellum ledger`, the pipeline commands `vellum mint`, `vellum backpressure`, `vellum pin advance`, the mechanical guards, and the installer commands `vellum init` / `vellum doctor` / `vellum upgrade`.
 - [`.vellum/memory/areas/adapters-github.md`](areas/adapters-github.md) — the reusable GitHub Actions workflows and the caller stubs that invoke them.
 
 ## Waves
@@ -31,6 +31,7 @@ notes live in `.vellum/memory/areas/`; wave worklogs in `.vellum/memory/waves/`.
 - [`.vellum/memory/waves/adapters-install-thin.md`](waves/adapters-install-thin.md) — the adapters became reusable workflows plus caller stubs; `vellum init` and `vellum doctor`.
 - [`.vellum/memory/waves/go-live-prep.md`](waves/go-live-prep.md) — MIT licence and packaging metadata; `VELLUM_TOKEN` became optional; a stranger's read over the prose.
 - [`.vellum/memory/waves/installer-provisions-the-pair.md`](waves/installer-provisions-the-pair.md) — `vellum init` grew a provisioning mode: three shapes, a plan, `gh` as the transport, and the seed.
+- [`.vellum/memory/waves/installation-upgrades.md`](waves/installation-upgrades.md) — an installation names the files Vellum owns (`.vellum/install.yaml`), and `vellum upgrade` rewrites only those, as a pull request.
 
 Worklogs up to `spec-v6.md` are named for the version they landed at. This one
 is named for what it did, because a version's name is decoration now

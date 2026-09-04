@@ -27,6 +27,7 @@ from support import (
     run_cli_streams,
     write_workspace,
 )
+from vellum import manifest, owned
 from vellum.install import SHIPPED, WORKFLOWS_DIR, default_ref, render
 
 WORKFLOWS = WORKFLOWS_DIR["github"]
@@ -1102,3 +1103,211 @@ class TheCommittedTemplatesAreWhatInitWrites(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# =====================================================================
+# The installation manifest (spec/features/installation.md, and
+# spec/decisions/2026-09-04-vellum-owned-files-and-upgrades.md)
+# =====================================================================
+
+
+class TheStampWritesTheManifest(InstallCase):
+    """`init` writes `.vellum/install.yaml`, and what it puts in it is narrow.
+
+    A stamp runs in a checkout whose repos already exist. It knows which files
+    it wrote — the caller stubs — and it knows nothing about the rest of the
+    tree, so the owned set it records is the stubs and nothing else. Recording
+    more would be inferring ownership from a directory, which is the inference
+    the decision refused.
+    """
+
+    def test_a_stamp_over_an_installation_with_no_manifest_writes_one(self):
+        checkout = self.intent()
+        code, out = run_cli(["init", str(checkout)])
+        self.assertEqual(code, 0, out)
+        found = manifest.load(checkout)
+        self.assertEqual(found.release, default_ref())
+        self.assertEqual(list(found.owned), list(owned.stub_paths("github")))
+
+    def test_it_says_the_owned_set_is_the_stubs_and_nothing_else(self):
+        checkout = self.intent()
+        code, out = run_cli(["init", str(checkout)])
+        self.assertEqual(code, 0, out)
+        self.assertIn("had no manifest", out)
+        self.assertIn("caller stub(s) as the owned set", out)
+
+    def test_a_stamp_refreshes_the_release_and_keeps_the_owned_list(self):
+        checkout = self.intent()
+        run_cli(["init", str(checkout)])
+        manifest.write(checkout, default_ref(),
+                       [*manifest.load(checkout).owned, ".vellum/config.yaml"])
+        code, out = run_cli(["init", str(checkout), "--ref", "v9.9.9", "--force"])
+        self.assertEqual(code, 0, out)
+        found = manifest.load(checkout)
+        self.assertEqual(found.release, "v9.9.9")
+        # The operator's addition survives: `init` refreshes the release line
+        # and never recomputes the list.
+        self.assertIn(".vellum/config.yaml", found.owned)
+
+    def test_a_second_identical_stamp_writes_nothing(self):
+        checkout = self.intent()
+        run_cli(["init", str(checkout)])
+        before = (checkout / manifest.MANIFEST_RELPATH).stat().st_mtime_ns
+        code, out = run_cli(["init", str(checkout)])
+        self.assertEqual(code, 0, out)
+        self.assertIn("already current", out)
+        self.assertEqual(
+            (checkout / manifest.MANIFEST_RELPATH).stat().st_mtime_ns, before
+        )
+
+    def test_a_stamp_that_left_a_stub_alone_records_nothing(self):
+        # The release line is a claim that the installation was BROUGHT TO that
+        # ref. A run that declined to rewrite a stub did not bring it anywhere,
+        # and recording the release anyway would leave the next upgrade
+        # comparing that stub against the wrong release's template.
+        checkout = self.intent()
+        run_cli(["init", str(checkout), "--ref", "v0.0.1"])
+        self.stub(checkout, "spec-ci").write_text("# mine now\n", encoding="utf-8")
+        code, out = run_cli(["init", str(checkout), "--ref", "v9.9.9"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("has not been brought to v9.9.9", out)
+        self.assertEqual(manifest.load(checkout).release, "v0.0.1")
+
+    def test_a_malformed_manifest_is_two_and_is_not_overwritten(self):
+        # Replacing an unreadable manifest with a default would silently take
+        # back ownership of every file the operator had removed from it.
+        checkout = self.intent()
+        path = checkout / manifest.MANIFEST_RELPATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("vellum: [not, a, release]\n", encoding="utf-8")
+        code, out = run_cli(["init", str(checkout)])
+        self.assertEqual(code, 2, out)
+        self.assertEqual(path.read_text(encoding="utf-8"),
+                         "vellum: [not, a, release]\n")
+
+
+class DoctorReportsTheManifest(InstallCase):
+    def installed(self, **kwargs) -> Path:
+        checkout = self.intent(**kwargs)
+        code, out = run_cli(["init", str(checkout)])
+        self.assertEqual(code, 0, out)
+        return checkout
+
+    def test_a_missing_manifest_is_a_finding(self):
+        checkout = self.installed()
+        (checkout / manifest.MANIFEST_RELPATH).unlink()
+        code, out = run_cli(["doctor", str(checkout)])
+        self.assertEqual(code, 1, out)
+        self.assertIn("no-manifest", out)
+        self.assertIn(manifest.MANIFEST_RELPATH.as_posix(), out)
+
+    def test_a_malformed_manifest_is_a_finding(self):
+        checkout = self.installed()
+        (checkout / manifest.MANIFEST_RELPATH).write_text(
+            "vellum: v0.1.0\n", encoding="utf-8"
+        )
+        code, out = run_cli(["doctor", str(checkout)])
+        self.assertEqual(code, 1, out)
+        self.assertIn("manifest-malformed", out)
+
+    def test_a_manifest_is_reported_green_and_summarised(self):
+        checkout = self.installed()
+        code, out = run_cli(["doctor", str(checkout)])
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"brought to {default_ref()}", out)
+        self.assertIn(f"ok       {manifest.MANIFEST_RELPATH.as_posix()}", out)
+
+
+class TheManifestFormat(unittest.TestCase):
+    """Two keys, and every path on the list is one `upgrade` may safely write."""
+
+    def parse(self, text: str):
+        return manifest.parse(text, ".")
+
+    def test_it_round_trips(self):
+        text = manifest.dump("v0.2.0", ["b.yaml", "a/x.py", "a/x.py"])
+        found = self.parse(text)
+        self.assertEqual(found.release, "v0.2.0")
+        self.assertEqual(found.owned, ("a/x.py", "b.yaml"))
+        self.assertEqual(manifest.dump(found.release, found.owned), text)
+
+    def test_an_installation_that_owns_nothing_is_legal_and_explicit(self):
+        text = manifest.dump("v0.2.0", [])
+        self.assertIn(f"{manifest.OWNED_KEY}: {manifest.EMPTY_OWNED}", text)
+        self.assertEqual(self.parse(text).owned, ())
+
+    def test_a_release_that_reads_back_as_a_number_is_refused(self):
+        # The same round-trip the stubs' `vellum-ref:` is quoted to survive: a
+        # YAML reader hands `1.10` back as the float 1.1, and a release compared
+        # against a tag nothing carries is worse than no comparison.
+        with self.assertRaises(manifest.ManifestError):
+            self.parse("vellum: 1.10\nowned: []\n")
+        self.assertIn('vellum: "1.10"', manifest.dump("1.10", []))
+
+    def test_an_absent_owned_key_is_refused_and_says_why(self):
+        with self.assertRaises(manifest.ManifestError) as raised:
+            self.parse("vellum: v0.2.0\n")
+        self.assertIn(manifest.EMPTY_OWNED, str(raised.exception))
+
+    def test_a_null_owned_key_is_not_an_empty_list(self):
+        with self.assertRaises(manifest.ManifestError):
+            self.parse("vellum: v0.2.0\nowned:\n")
+
+    def test_a_path_that_climbs_out_of_the_checkout_is_refused(self):
+        # `upgrade` WRITES every path on this list, and the list is a file
+        # anyone who can land a pull request can edit.
+        for path in ("../../etc/passwd", "/etc/passwd", "a/../../b", "."):
+            with self.assertRaises(manifest.ManifestError, msg=path):
+                self.parse(f"vellum: v0.2.0\nowned:\n  - {path}\n")
+
+    def test_the_manifest_may_not_own_itself(self):
+        with self.assertRaises(manifest.ManifestError):
+            self.parse(
+                f"vellum: v0.2.0\nowned:\n  - {manifest.MANIFEST_RELPATH.as_posix()}\n"
+            )
+
+    def test_absent_and_malformed_are_different_answers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertIsNone(manifest.read(root))
+            manifest.path_for(root).parent.mkdir(parents=True)
+            manifest.path_for(root).write_text("- not a mapping\n", encoding="utf-8")
+            with self.assertRaises(manifest.ManifestError):
+                manifest.read(root)
+
+
+class TheOwnershipTableSaysWhyForEveryRow(unittest.TestCase):
+    def test_every_side_of_the_pair_has_an_owned_set(self):
+        self.assertTrue(owned.for_side(owned.INTENT))
+        self.assertTrue(owned.for_side(owned.PRODUCT))
+
+    def test_the_two_sides_do_not_overlap(self):
+        self.assertEqual(
+            set(owned.for_side(owned.INTENT)) & set(owned.for_side(owned.PRODUCT)),
+            set(),
+        )
+
+    def test_the_stubs_are_owned_and_the_spec_tree_is_not(self):
+        table = owned.table("github")
+        for shipped in SHIPPED:
+            self.assertIn((WORKFLOWS / shipped.filename).as_posix(), table)
+        for path in table:
+            self.assertFalse(path.startswith("spec/"), path)
+            self.assertFalse(path.startswith("docs/"), path)
+
+    def test_the_files_the_seeded_readme_calls_yours_are_not_owned(self):
+        # `harness/README.md`: "Two files are yours: `steps/` ... and
+        # `support/adapter.py`". The ownership table reads the product's own
+        # documentation rather than inventing a second rule.
+        table = owned.table("github")
+        self.assertNotIn("harness/support/adapter.py", table)
+        self.assertNotIn("harness/steps/__init__.py", table)
+        self.assertIn("harness/support/runner.py", table)
+
+    def test_every_row_says_why_and_names_a_template_it_can_read(self):
+        for path, row in owned.table("github").items():
+            self.assertTrue(row.why.strip(), path)
+            if row.kind == owned.SEED:
+                self.assertTrue(row.source and row.source.startswith("src/vellum/"), path)
+            else:
+                self.assertIsNotNone(row.shipped, path)

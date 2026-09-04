@@ -99,6 +99,9 @@ from vellum.exitduty import run as exitduty_run
 from vellum.install import DEFAULT_BRANCH, HOST_REPO, FORGES, InstallError
 from vellum.install import run_doctor as doctor_run
 from vellum.install import run_init as init_run
+from vellum.manifest import ManifestError
+from vellum.upgrade import UpgradeError
+from vellum.upgrade import run_upgrade as upgrade_run
 from vellum.ledger import (
     CERTIFICATION_RESULTS,
     LedgerError,
@@ -777,6 +780,62 @@ def _add_install(sub) -> None:
     )
     _add_install_common(doctor)
 
+    upgrade = sub.add_parser(
+        "upgrade",
+        help="rewrite the files this installation says Vellum owns, as a pull request",
+        description=(
+            "Run in an intent or product checkout. Reads "
+            "`.vellum/install.yaml` for the release this installation was last "
+            "brought to and the paths Vellum owns; for every owned file, "
+            "compares it against the template of THAT release and — when it "
+            "matches — rewrites it from --to's. An owned file the installation "
+            "has edited is a refusal: exit 1 naming it, nothing written, no "
+            "branch. Ownership is data and is never inferred from a file's "
+            "contents or history. The stubs are re-stamped at --to, the manifest "
+            "records it, and the whole change lands on "
+            "`vellum/upgrade-<release>` off the default branch, as a pull "
+            "request — never as a push to the default branch. A missing owned "
+            "file is skipped with a note, not recreated, unless --restore. "
+            "Exits 0 done or planned, 1 on an edited owned file, 2 when it "
+            "cannot answer."
+        ),
+    )
+    upgrade.add_argument(
+        "checkout", nargs="?", default=".",
+        help="the installation checkout, either side of the pair (default: .)",
+    )
+    upgrade.add_argument(
+        "--to", required=True,
+        help="the release to bring this installation to: a tag on "
+             f"{HOST_REPO}, e.g. v0.3.0",
+    )
+    upgrade.add_argument(
+        "--from", dest="from_checkout", metavar="CHECKOUT",
+        help=f"a checkout of {HOST_REPO} to read the releases' templates out of, "
+             f"with `git show <ref>:<path>`. Two refs are read — the one the "
+             f"manifest names and --to — so this is required unless this CLI is "
+             f"itself the release being asked about. Nothing here reaches a "
+             f"network",
+    )
+    upgrade.add_argument(
+        "--plan", action="store_true", dest="plan_only",
+        help="print every owned file this would rewrite, which are unchanged "
+             "between the releases, and the installation-shape changes of the "
+             "range crossed. Creates nothing: no branch, no file, no pull request",
+    )
+    upgrade.add_argument(
+        "--restore", action="store_true",
+        help="write back an owned file the installation has removed. Without it "
+             "a missing owned file is skipped with a note: a removal was somebody's "
+             "decision and an upgrade is not where it gets re-opened",
+    )
+    upgrade.add_argument(
+        "--yes", action="store_true",
+        help="push the branch and open the pull request with `gh`. Without it "
+             "the local half is done and committed and the two commands are "
+             "printed exactly as they should be run",
+    )
+
 
 def _add_provision(p: argparse.ArgumentParser) -> None:
     """``init``'s provisioning mode (installation, part 2).
@@ -935,6 +994,15 @@ def main(argv: list[str] | None = None) -> int:
                 releases_from=args.releases_from,
                 branch=args.branch or DEFAULT_BRANCH,
             )
+        if args.command == "upgrade":
+            return upgrade_run(
+                args.checkout,
+                to=args.to,
+                from_checkout=args.from_checkout,
+                plan_only=args.plan_only,
+                restore=args.restore,
+                yes=args.yes,
+            )
         if args.command == "doctor":
             return doctor_run(
                 args.checkout,
@@ -975,8 +1043,8 @@ def main(argv: list[str] | None = None) -> int:
     # could not answer rather than a finding about anybody's spec — and reaching
     # a caller as a traceback would make it look like a crash in the seed.
     except (BoundaryError, ChainError, BudgetError, DependencyError, ExitDutyError,
-            InstallError, ProvisionError, SeedsMissing, TickError,
-            ReleaseError) as exc:
+            InstallError, ManifestError, ProvisionError, SeedsMissing, TickError,
+            ReleaseError, UpgradeError) as exc:
         print(f"vellum: {exc}", file=sys.stderr)
         return 2
     # A cut that cannot be made, a pointer that would move backwards, a shallow

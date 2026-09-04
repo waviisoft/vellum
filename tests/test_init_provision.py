@@ -41,8 +41,8 @@ from pathlib import Path
 import yaml
 
 from support import run_cli, run_cli_streams, write_workspace
-from vellum import provision
-from vellum.install import SHIPPED, WORKFLOWS_DIR
+from vellum import manifest, owned, provision
+from vellum.install import SHIPPED, WORKFLOWS_DIR, default_ref
 
 WORKFLOWS = WORKFLOWS_DIR["github"]
 
@@ -406,6 +406,43 @@ class AGreenfieldSeedIsGreen(ProvisionCase):
 
     def test_the_product_repo_gets_its_memory_map(self):
         self.assertTrue((self.product / ".vellum" / "memory" / "map.md").is_file())
+
+    def test_each_side_of_the_pair_gets_a_manifest(self):
+        # "on each side of the pair" (spec/features/installation.md): a product
+        # repo carries a Vellum-seeded file too — its memory map — and a side
+        # with no manifest is a side no upgrade can reason about.
+        for checkout, side in ((self.intent, owned.INTENT),
+                               (self.product, owned.PRODUCT)):
+            found = manifest.load(checkout)
+            self.assertEqual(found.release, default_ref(), side)
+            self.assertEqual(list(found.owned), list(owned.for_side(side)), side)
+
+    def test_the_seeded_manifest_owns_the_stubs_the_config_and_the_machinery(self):
+        listed = manifest.load(self.intent).owned
+        for relative in (".vellum/config.yaml", "ledger/releases.yaml",
+                         "harness/run.py", "harness/support/runner.py",
+                         (WORKFLOWS / "spec-ci.yml").as_posix()):
+            self.assertIn(relative, listed, relative)
+
+    def test_the_seeded_manifest_owns_no_spec_file_and_nothing_that_is_ours(self):
+        # The spec is the product's own words; the workspace file is the repo
+        # map an installation edits every time it adds a product; the pin is the
+        # pin. `vellum.owned`'s table says why for each, one row at a time.
+        listed = manifest.load(self.intent).owned
+        for relative in ("spec/product.md", "spec/index.md",
+                         "spec/features/billing.md", ".vellum/workspace.yaml",
+                         "harness/README.md", "harness/support/adapter.py",
+                         "harness/steps/__init__.py"):
+            self.assertNotIn(relative, listed, relative)
+        self.assertNotIn(".vellum/product.yaml", manifest.load(self.product).owned)
+
+    def test_every_owned_path_is_a_file_the_seed_actually_wrote(self):
+        # The manifest is written from `vellum.owned`'s table and the seed from
+        # `intent_seed`; a row that named a file the seed does not write would
+        # be an installation whose first upgrade reports a missing owned file.
+        for checkout in (self.intent, self.product):
+            for relative in manifest.load(checkout).owned:
+                self.assertTrue((checkout / relative).is_file(), relative)
 
     def test_the_shipped_skeleton_is_exactly_this_set_of_files(self):
         # The seed comes out of package data, and a wheel carries it only
@@ -1138,12 +1175,20 @@ class TheAdoptionIsAGuestInTheCheckout(ProvisionCase):
         self.assertEqual(code, 2, out)
         self.assertIn("--branch", out)
 
-    def test_the_adoption_commit_carries_the_two_seeded_files_and_nothing_else(self):
+    def test_the_adoption_commit_carries_the_seeded_files_and_nothing_else(self):
+        # Three since the upgrades wave: the manifest is a seeded file like any
+        # other (`vellum.manifest`), so it arrives in the adoption pull request
+        # rather than being written into somebody's default branch afterwards.
+        # Asserted against `product_seed`'s own keys, so a fourth seeded file
+        # updates this in one place and a file that is NOT seeded still fails it.
         code, out = self.adopt()
         self.assertEqual(code, 0, out)
+        answers = provision.resolve(_flags(shape=provision.BROWNFIELD,
+                                           product_repo="legacy"),
+                                    provision.Console(tty=False))
         self.assertEqual(
             sorted(self.host("show", "--name-only", "--format=", "HEAD").split()),
-            [".vellum/memory/map.md", ".vellum/product.yaml"],
+            sorted(provision.product_seed(answers, "0" * 40)),
         )
 
     def test_the_adoption_commit_is_parented_on_the_default_branch(self):
