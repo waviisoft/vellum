@@ -46,18 +46,31 @@ from vellum.install import SHIPPED, WORKFLOWS_DIR
 
 WORKFLOWS = WORKFLOWS_DIR["github"]
 
+#: What the plan calls the staging directory before there is one. A checklist
+#: still carrying it would be a checklist naming a directory that never existed.
+STAGING_PLACEHOLDER = provision.STAGING
+
 #: A fake ``gh``: it records every invocation as one JSON line and answers the
 #: two questions the real one is asked. ``repo view`` exits 1 (the repository
 #: does not exist), which is the answer greenfield needs; everything else
-#: succeeds. Stdin is read ONLY for `secret set`, because a fake that read it
-#: unconditionally would block on an inherited terminal.
+#: succeeds.
+#:
+#: Stdin is read ONLY for a `secret set` that carries no `--body`, which is what
+#: the real `gh` does: its `getBody()` returns `--body`'s value whenever that
+#: value is non-empty and falls back to stdin only when the flag is absent. So
+#: `--body -` does not mean "read stdin" — it sets the secret to the literal
+#: string `-`, and the value on the pipe is never read. A fake that read stdin
+#: unconditionally would have recorded the token either way and called the bug
+#: passing; this one reproduces the real command's actual rule, which is why
+#: `test_the_secret_value_arrived_on_stdin_and_never_in_argv` now fails against
+#: the argv that carried `--body -`.
 FAKE_GH = """#!{python}
 import json, os, subprocess, sys
 from pathlib import Path
 
 argv = sys.argv[1:]
 entry = {{"argv": argv}}
-if argv[:2] == ["secret", "set"]:
+if argv[:2] == ["secret", "set"] and "--body" not in argv:
     entry["stdin"] = sys.stdin.read()
 with open(os.environ["GH_TRACE"], "a", encoding="utf-8") as trace:
     trace.write(json.dumps(entry) + "\\n")
@@ -84,6 +97,18 @@ if argv[:2] == ["repo", "clone"]:
     git("-C", str(seed), "push", "-q", str(bare), "main")
     git("clone", "-q", str(bare), argv[4])
     sys.exit(0)
+
+# A forge that says no part way through. `GH_FAIL_CREATE=2` fails the SECOND
+# `repo create`, which is the interesting shape: the first one succeeded and is
+# real, so the run cannot be retried and cannot be rolled back.
+fail = os.environ.get("GH_FAIL_CREATE")
+if fail and argv[:2] == ["repo", "create"]:
+    with open(os.environ["GH_TRACE"], encoding="utf-8") as trace:
+        seen = sum(1 for line in trace if line.strip()
+                   and json.loads(line)["argv"][:2] == ["repo", "create"])
+    if seen == int(fail):
+        sys.stderr.write("HTTP 500: the forge said no\\n")
+        sys.exit(1)
 
 sys.exit(1 if argv[:2] == ["repo", "view"] and argv[2].endswith("-intent") else
          (1 if argv[:2] == ["repo", "view"] and os.environ.get("GH_NO_REPOS") else 0))
@@ -145,7 +170,9 @@ class ProvisionCase(unittest.TestCase):
         name to EXIST, which is the one difference between the two fixtures.
         """
         self.addCleanup(os.environ.__setitem__, "PATH", os.environ["PATH"])
-        self.addCleanup(self._restore, ["GH_TRACE", "GH_REMOTES", "GH_NO_REPOS", *secrets])
+        self.addCleanup(self._restore, ["GH_TRACE", "GH_REMOTES", "GH_NO_REPOS",
+                                        "GH_FAIL_CREATE", *secrets])
+        os.environ.pop("GH_FAIL_CREATE", None)
         os.environ["PATH"] = self._bin("bin-gh", with_gh=True)
         os.environ["GH_TRACE"] = str(self.trace)
         remotes = self.root / "forge"
@@ -225,8 +252,16 @@ class ThePlanIsCompleteAndCreatesNothing(ProvisionCase):
         for path in provision.product_seed(answers, provision.PIN_PLACEHOLDER):
             self.assertIn(path, out, path)
 
-    def test_it_names_the_actions_access_change_on_the_product_repo(self):
-        self.assertIn("access_level=organization", self.plan())
+    def test_it_names_the_reuse_setting_as_one_no_transport_takes(self):
+        # The plan used to promise `access_level=organization` on the product
+        # repo. It is not a change this installation needs — the workflows the
+        # stubs resolve against are the host's — so the plan now says nothing is
+        # changed on either repo and names the host's setting as the operator's.
+        out = self.plan()
+        self.assertNotIn("access_level=organization", out)
+        self.assertIn("nothing is changed on waviisoft/acme-intent or waviisoft/acme",
+                      out)
+        self.assertIn("confirm waviisoft/vellum", out)
 
     def test_it_names_the_steps_no_transport_takes(self):
         out = self.plan()
@@ -428,15 +463,40 @@ class WithoutAForgeCliTheStepsAreAChecklist(ProvisionCase):
         wanted = [
             "gh repo create waviisoft/acme-intent --private",
             "gh repo create waviisoft/acme --private",
-            "gh secret set VELLUM_TOKEN --repo waviisoft/acme-intent --body -",
-            "gh secret set SPEC_TOKEN --repo waviisoft/acme --body -",
-            "gh api -X PUT repos/waviisoft/acme/actions/permissions/access "
-            "-f access_level=organization",
+            'printf %s "$VELLUM_TOKEN" | gh secret set VELLUM_TOKEN '
+            "--repo waviisoft/acme-intent",
+            'printf %s "$SPEC_TOKEN" | gh secret set SPEC_TOKEN '
+            "--repo waviisoft/acme",
         ]
         found = [checklist.find(text) for text in wanted]
         for text, at in zip(wanted, found):
             self.assertNotEqual(at, -1, f"{text!r} is not in the checklist")
         self.assertEqual(found, sorted(found), "the checklist is out of order")
+
+    def test_each_secret_line_pipes_the_variable_that_holds_that_secret(self):
+        # `$TOKEN` was a variable nothing in the plan ever told the operator to
+        # set, and it was the same on both lines — so following the checklist
+        # set one repo's secret to the other's value, or to nothing.
+        checklist = self.out.split("Do these yourself, in order")[1]
+        self.assertNotIn("$TOKEN", checklist)
+        self.assertIn('printf %s "$VELLUM_TOKEN" | gh secret set VELLUM_TOKEN',
+                      checklist)
+        self.assertIn('printf %s "$SPEC_TOKEN" | gh secret set SPEC_TOKEN',
+                      checklist)
+
+    def test_no_checklist_line_carries_a_body_flag(self):
+        # The line is executable as printed only without it: `--body -` sets the
+        # secret to `-`. `printf … |` is a pipe, not a terminal, so `gh` reads
+        # the value from stdin exactly as the transport's `subprocess` does.
+        self.assertNotIn("--body", self.out.split("Do these yourself, in order")[1])
+
+    def test_the_host_repos_reuse_setting_is_the_one_named_and_it_is_manual(self):
+        # The product repo's Actions access step is gone; what replaced it is
+        # nothing, because the setting that matters is on the host repo and no
+        # transport here can reach it.
+        self.assertNotIn("access_level=organization", self.out)
+        self.assertIn("confirm waviisoft/vellum", self.out)
+        self.assertIn("nothing here can set it", self.out)
 
     def test_the_checklist_is_the_list_the_plan_carried(self):
         # One list, printed twice (`provision.forge_steps`). A checklist that had
@@ -455,11 +515,73 @@ class WithoutAForgeCliTheStepsAreAChecklist(ProvisionCase):
         # `--into` the staging directory must not exist until the plan is
         # confirmed — so the paths travel as placeholders and are filled in for
         # both renderings from one mapping.
-        checklist = self.out.split("Do these yourself, in order")[1]
-        self.assertNotIn("<intent checkout>", checklist)
-        self.assertNotIn("<product checkout>", checklist)
-        self.assertIn(str(self.staging / "acme-intent"), checklist)
-        self.assertIn(str(self.staging / "acme"), checklist)
+        #
+        # Driven over ALL THREE shapes, because the greenfield checklist is the
+        # only one that was: the brownfield shapes carry three more placeholders
+        # (`<product clone>`, `<adopt PR body>`, `<adopt base>`) and one of them
+        # — the PR body — reached an operator as the literal text
+        # `<adopt PR body>`, because `places` knew only the two checkout keys.
+        for shape, product, extra in (
+            ("greenfield", "acme", []),
+            ("brownfield", "legacy", []),
+            ("brownfield-with-docs", "legacy", ["--docs", "docs/api.md"]),
+        ):
+            with self.subTest(shape=shape):
+                out, staging = self._checklist_run(shape, product, extra)
+                checklist = out.split("Do these yourself, in order")[1]
+                for placeholder in ("<intent checkout>", "<product checkout>",
+                                    "<product clone>", "<adopt PR body>",
+                                    "<adopt base>", STAGING_PLACEHOLDER):
+                    self.assertNotIn(placeholder, checklist)
+                # And nothing else that looks like one either. `<job>` is prose:
+                # branch protection names checks that do not exist until the
+                # stubs have run once, and no value here could fill it in.
+                left = [found for found in re.findall(r"<[^>\n]{2,60}>", checklist)
+                        if found != "<job>"]
+                self.assertEqual(left, [], f"{shape}: unfilled {left}")
+                self.assertIn(str(staging / f"{product}-intent"), checklist)
+                self.assertIn(str(staging / product), checklist)
+
+    def _checklist_run(self, shape, product, extra):
+        """One no-transport run of *shape*, returning (output, staging dir)."""
+        docs = self.cwd / "docs"
+        docs.mkdir(exist_ok=True)
+        (docs / "api.md").write_text("# api\n", encoding="utf-8")
+        code, out, err = run_cli_streams([
+            "init", "--shape", shape, "--product", product, "--org", "waviisoft",
+            "--area", "billing", "--yes", *extra,
+        ])
+        self.assertEqual(code, 0, out + err)
+        staging = Path(out.split("Staging the local half in ")[1].splitlines()[0])
+        self.addCleanup(shutil.rmtree, staging, True)
+        return out, staging
+
+    def test_the_brownfield_clone_step_names_a_path_it_could_clone_into(self):
+        # It named `<product checkout>` — the stand-in this run had just built
+        # and filled with two files and a root commit — so the very first line
+        # of the checklist was `gh repo clone … -- <a non-empty directory>`,
+        # which fails. The clone goes to a sibling, and the push and the pull
+        # request name that sibling, so the three lines are one story.
+        out, staging = self._checklist_run("brownfield", "legacy", [])
+        checklist = out.split("Do these yourself, in order")[1]
+        clone = f"{staging / 'legacy'}-clone"
+        self.assertIn(f"gh repo clone waviisoft/legacy -- {clone}", checklist)
+        self.assertIn(f"git -C {clone} push -u origin vellum/adopt", checklist)
+        self.assertTrue((staging / "legacy").is_dir())
+        self.assertFalse(Path(clone).exists(), "the checklist's clone target exists")
+
+    def test_the_adoption_pr_body_is_a_file_the_checklist_can_point_at(self):
+        # `--body-file <adopt PR body>` was never substituted on this rung: the
+        # operator was told to pass a filename that was four words of English.
+        # The body is written into the product checkout, uncommitted.
+        out, staging = self._checklist_run("brownfield", "legacy", [])
+        body = staging / "legacy" / ".vellum" / "ADOPT_PR.md"
+        self.assertIn(f"--body-file {body}", out)
+        self.assertTrue(body.is_file())
+        self.assertIn("Adopt Vellum", body.read_text(encoding="utf-8"))
+        # Uncommitted: the branch carries the two seeded files and nothing else.
+        tracked = self.git(staging / "legacy", "ls-tree", "-r", "--name-only", "HEAD")
+        self.assertNotIn(".vellum/ADOPT_PR.md", tracked.splitlines())
 
     def test_nothing_is_created_on_a_forge(self):
         self.assertIsNone(shutil.which("gh"))
@@ -746,15 +868,31 @@ class TheTransportIsTheForgeCli(ProvisionCase):
                 ["repo", "create", "waviisoft/acme", "--private",
                  "--source", str(staging / "acme"), "--remote", "origin",
                  "--push", "--description", "acme — product repo (vellum init)"],
-                ["secret", "set", "VELLUM_TOKEN", "--repo", "waviisoft/acme-intent",
-                 "--body", "-"],
-                ["secret", "set", "SPEC_TOKEN", "--repo", "waviisoft/acme",
-                 "--body", "-"],
-                ["api", "-X", "PUT",
-                 "repos/waviisoft/acme/actions/permissions/access",
-                 "-f", "access_level=organization"],
+                # No `--body`, and that absence is the whole mechanism: `gh`
+                # reads the value from stdin only when the flag is not given.
+                ["secret", "set", "VELLUM_TOKEN", "--repo", "waviisoft/acme-intent"],
+                ["secret", "set", "SPEC_TOKEN", "--repo", "waviisoft/acme"],
             ],
         )
+
+    def test_no_step_carries_a_body_flag(self):
+        # Stated on its own, because `--body -` looked exactly like "read
+        # stdin" and passed review: `gh` takes `--body`'s value whenever it is
+        # non-empty, so that argv set both secrets to the one-character string
+        # `-` and every workflow in the new installation would have failed
+        # authenticating with it.
+        for call in self.calls:
+            self.assertNotIn("--body", call["argv"], call["argv"])
+
+    def test_no_step_touches_the_product_repos_actions_access(self):
+        # Removed deliberately. `actions/permissions/access` governs whether a
+        # repository's OWN workflows may be reused by others, and the workflows
+        # these stubs resolve against live in the host repo — which no
+        # installation owns. On a user-owned account the call fails outright.
+        for call in self.calls:
+            self.assertNotEqual(call["argv"][:1], ["api"], call["argv"])
+            for argument in call["argv"]:
+                self.assertNotIn("permissions/access", argument)
 
     def test_the_secret_value_arrived_on_stdin_and_never_in_argv(self):
         secrets = {call["argv"][2]: call for call in self.calls
@@ -778,7 +916,10 @@ class TheTransportIsTheForgeCli(ProvisionCase):
         created = self.out.index("Forge steps taken")
         self.assertLess(checked, created)
 
-    def test_a_public_product_repo_needs_no_access_change(self):
+    def test_visibility_changes_nothing_about_which_steps_are_taken(self):
+        # It used to: a private product repo got an extra `gh api` call. That
+        # step is gone, so the two visibilities now take the same four steps —
+        # which is the assertion that would fail if it ever came back.
         self.trace.unlink()
         code, out, err = run_cli_streams([
             "init", "--shape", "greenfield", "--product", "other", "--org", "waviisoft",
@@ -788,10 +929,17 @@ class TheTransportIsTheForgeCli(ProvisionCase):
         self.addCleanup(shutil.rmtree,
                         out.split("Staging the local half in ")[1].splitlines()[0],
                         True)
-        self.assertNotIn(
-            ["api"], [call["argv"][:1] for call in self.recorded()]
+        public = [call["argv"][:2] for call in self.recorded()]
+        self.assertEqual(
+            public,
+            [["auth", "status"], ["repo", "view"], ["repo", "view"],
+             ["repo", "create"], ["repo", "create"],
+             ["secret", "set"], ["secret", "set"]],
         )
-        self.assertIn("is public, so its workflows are already reusable", out)
+        self.assertEqual(
+            public, [call["argv"][:2] for call in self.calls],
+            "a public run and a private run take different forge steps",
+        )
 
 
 class TheForgeRefusesANameItAlreadyHas(ProvisionCase):
@@ -891,6 +1039,518 @@ class TheBrownfieldRungAdoptsTheExistingRepo(ProvisionCase):
     def test_the_merge_of_that_pull_request_stays_on_the_checklist(self):
         checklist = self.out.split("Do these yourself, in order")[1]
         self.assertIn("review and merge the adoption pull request", checklist)
+
+
+class TheAdoptionIsAGuestInTheCheckout(ProvisionCase):
+    """Adoption over a checkout the operator already has.
+
+    `spec/features/installation.md`: the product repo's `.vellum/` "arrives on a
+    branch as a pull request, never as a push to its default branch". A guest
+    that swept the host's working tree into that pull request, or moved a branch
+    it found there, would be keeping the letter of that and none of it — so all
+    three are refused, and the commit it does make carries two files.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.without_gh()
+        self.into = self.root / "out"
+        self.product = self.into / "legacy"
+        self.product.mkdir(parents=True)
+        self.host("init", "-q", "-b", "main", ".")
+        (self.product / "README.md").write_text("before Vellum\n", encoding="utf-8")
+        self.host("add", "-A")
+        self.host("commit", "-qm", "existing product")
+        self.first = self.host("rev-parse", "HEAD")
+
+    def host(self, *args: str) -> str:
+        """One git command in the operator's own product checkout."""
+        return subprocess.run(
+            ["git", "-C", str(self.product), "-c", "user.name=operator",
+             "-c", "user.email=operator@localhost", *args],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+    def adopt(self, *extra: str):
+        return run_cli([
+            "init", "--shape", "brownfield", "--product", "legacy",
+            "--org", "waviisoft", "--area", "billing",
+            "--into", str(self.into), "--yes", *extra,
+        ])
+
+    def assertNothingHappened(self):
+        """No intent checkout, and the product repo exactly as it was."""
+        self.assertFalse((self.into / "legacy-intent").exists())
+        self.assertEqual(self.host("log", "--format=%s").splitlines(),
+                         ["existing product"])
+        self.assertEqual(
+            self.host("for-each-ref", "--format=%(refname)", "refs/heads"),
+            "refs/heads/main",
+        )
+
+    def test_a_dirty_tree_is_refused_naming_what_is_in_it(self):
+        # `git add -A` swept everything in the checkout into the adoption
+        # commit — an untracked `.env` included — and then a pull request
+        # carried it to the forge. The tree is the operator's; this command
+        # does not get to decide what of it is committed.
+        (self.product / ".env").write_text("SECRET=hunter2\n", encoding="utf-8")
+        (self.product / "README.md").write_text("work in progress\n", encoding="utf-8")
+        code, out = self.adopt()
+        self.assertEqual(code, 2, out)
+        self.assertIn(".env", out)
+        self.assertIn("README.md", out)
+        self.assertNothingHappened()
+        self.assertEqual((self.product / ".env").read_text(encoding="utf-8"),
+                         "SECRET=hunter2\n")
+
+    def test_a_checkout_that_is_already_an_installation_is_refused(self):
+        # The product-side twin of the refusal `run` opens with. Seeding over it
+        # replaces the pin this repository already answers to.
+        (self.product / ".vellum").mkdir()
+        (self.product / ".vellum" / "product.yaml").write_text(
+            "intent:\n  repo: waviisoft/other-intent\n", encoding="utf-8")
+        self.host("add", "-A")
+        self.host("commit", "-qm", "already adopted")
+        code, out = self.adopt()
+        self.assertEqual(code, 2, out)
+        self.assertIn("product.yaml", out)
+        self.assertFalse((self.into / "legacy-intent").exists())
+        # And the file it would have overwritten is untouched.
+        self.assertIn("waviisoft/other-intent",
+                      (self.product / ".vellum" / "product.yaml").read_text())
+
+    def test_an_existing_adopt_branch_is_refused_rather_than_reset(self):
+        # `checkout -B` resets a branch that is already there. Whatever is on it
+        # is somebody's — an adoption already in review, most likely.
+        self.host("branch", provision.ADOPT_BRANCH)
+        on_it = self.host("rev-parse", provision.ADOPT_BRANCH)
+        code, out = self.adopt()
+        self.assertEqual(code, 2, out)
+        self.assertIn(provision.ADOPT_BRANCH, out)
+        self.assertEqual(self.host("rev-parse", provision.ADOPT_BRANCH), on_it)
+        self.assertFalse((self.into / "legacy-intent").exists())
+
+    def test_a_default_branch_the_checkout_does_not_have_is_refused(self):
+        # `--branch` names the INTENT repo's default branch, and assuming the
+        # product repo agrees is how an adoption branches off nothing.
+        self.host("branch", "-m", "main", "trunk")
+        code, out = self.adopt()
+        self.assertEqual(code, 2, out)
+        self.assertIn("--branch", out)
+
+    def test_the_adoption_commit_carries_the_two_seeded_files_and_nothing_else(self):
+        code, out = self.adopt()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(
+            sorted(self.host("show", "--name-only", "--format=", "HEAD").split()),
+            [".vellum/memory/map.md", ".vellum/product.yaml"],
+        )
+
+    def test_the_adoption_commit_is_parented_on_the_default_branch(self):
+        # `checkout -B` branched off whatever HEAD was. A pull request opened
+        # from a branch parented on somebody's feature work carries that work.
+        self.host("checkout", "-q", "-b", "feature")
+        (self.product / "feature.txt").write_text("mid-flight\n", encoding="utf-8")
+        self.host("add", "-A")
+        self.host("commit", "-qm", "a feature in progress")
+        feature = self.host("rev-parse", "HEAD")
+
+        code, out = self.adopt()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(
+            self.host("rev-parse", f"{provision.ADOPT_BRANCH}^"), self.first)
+        self.assertNotIn(
+            feature,
+            self.host("rev-list", provision.ADOPT_BRANCH).splitlines(),
+        )
+        self.assertNotIn(
+            "feature.txt",
+            self.host("ls-tree", "-r", "--name-only", provision.ADOPT_BRANCH).split(),
+        )
+
+    def test_the_pr_body_is_the_only_thing_left_uncommitted(self):
+        code, out = self.adopt()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(
+            [line.split()[-1] for line in
+             self.host("status", "--porcelain").splitlines()],
+            [".vellum/ADOPT_PR.md"],
+        )
+
+
+class AForgeFailureMidRunStillReportsWhatItDid(ProvisionCase):
+    """A transport failure is not a rollback.
+
+    `gh` has already created whatever it created. A run that raised and printed
+    nothing left an operator to work out for themselves which of eight steps had
+    happened — and re-running would then refuse at the name the forge now has.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.with_fake_gh(VELLUM_TOKEN="t1", SPEC_TOKEN="t2")
+        os.environ["GH_FAIL_CREATE"] = "2"
+        code, self.out, self.err = run_cli_streams([
+            "init", "--shape", "greenfield", "--product", "acme", "--org", "waviisoft",
+            "--area", "billing", "--yes",
+        ])
+        self.code = code
+        staging = self.out.split("Staging the local half in ")[1].splitlines()[0]
+        self.staging = Path(staging)
+        self.addCleanup(shutil.rmtree, self.staging, True)
+
+    def test_it_exits_two(self):
+        self.assertEqual(self.code, 2, self.out + self.err)
+
+    def test_the_step_that_failed_is_named_on_stderr(self):
+        self.assertIn("repo create", self.err)
+
+    def test_the_report_names_what_was_taken(self):
+        taken = self.out.split("Forge steps taken before the failure")[1]
+        self.assertIn("create the intent repository waviisoft/acme-intent",
+                      taken.split("Left to you")[0])
+
+    def test_every_step_from_the_failure_onward_is_handed_back(self):
+        left = self.out.split("Left to you")[1]
+        for what in ("create the product repository waviisoft/acme",
+                     "set VELLUM_TOKEN", "set SPEC_TOKEN",
+                     "protect main on waviisoft/acme-intent"):
+            self.assertIn(what, left, what)
+        # With their commands, so the checklist is followable from here.
+        self.assertIn('printf %s "$SPEC_TOKEN" | gh secret set SPEC_TOKEN', left)
+
+    def test_no_secret_value_reaches_the_interrupted_report(self):
+        for token in ("t1", "t2"):
+            self.assertNotIn(f'"{token}"', self.out)
+
+    def test_the_checkouts_it_names_are_still_there(self):
+        # The report's commands name them, so deleting them would destroy the
+        # only thing the run has left to offer.
+        self.assertIn(str(self.staging / "acme-intent"), self.out)
+        self.assertTrue((self.staging / "acme-intent" / "spec" / "index.md").is_file())
+        self.assertTrue((self.staging / "acme" / ".vellum" / "product.yaml").is_file())
+
+
+class TheOutwardChecksComeBeforeTheConfirmation(ProvisionCase):
+    """A refusal an operator has already said yes to is a refusal too late.
+
+    And it used to cost a directory: the staging `mkdtemp` was made first, so a
+    name the forge already had left an empty `vellum-init-*` behind every time.
+    """
+
+    def staging_dirs(self) -> set:
+        return set(Path(tempfile.gettempdir()).glob("vellum-init-*"))
+
+    def test_a_taken_name_is_refused_before_any_prompt_and_leaves_no_directory(self):
+        self.with_fake_gh(no_repos=False)   # every non-`-intent` name is taken
+        before = self.staging_dirs()
+        asked = []
+        console = provision.Console(
+            tty=True,
+            ask=lambda question: asked.append(question) or "y",
+            ask_secret=lambda _: "",
+        )
+        with self.assertRaises(provision.ProvisionError) as raised:
+            provision.run(
+                str(self.cwd), shape="greenfield", product="acme", org="waviisoft",
+                intent_repo="acme-intent", product_repo="acme",
+                visibility="private", intent_visibility=None,
+                product_visibility=None, branch="main",
+                areas=["billing"], docs=(), into=None, plan_only=False, yes=False,
+                console=console, out=io.StringIO(),
+            )
+        self.assertIn("already exists on the forge", str(raised.exception))
+        self.assertEqual(asked, [], f"it asked before it checked: {asked}")
+        self.assertEqual(self.staging_dirs(), before, "a staging directory was left")
+
+    def test_declining_the_plan_is_two_and_creates_nothing(self):
+        # Exit 2, not 0: declining is "this command did not do what it was asked
+        # to do", and a script reading 0 as "the installation is there" would be
+        # wrong. Same number as the no-terminal case above it, for one reason.
+        self.without_gh()
+        before = self.staging_dirs()
+        into = self.root / "declined"
+        console = provision.Console(tty=True, ask=lambda _: "n",
+                                    ask_secret=lambda _: "")
+        with self.assertRaises(provision.ProvisionError) as raised:
+            provision.run(
+                str(self.cwd), shape="greenfield", product="acme", org="waviisoft",
+                intent_repo="acme-intent", product_repo="acme",
+                visibility="private", intent_visibility=None,
+                product_visibility=None, branch="main",
+                areas=["billing"], docs=(), into=str(into), plan_only=False,
+                yes=False, console=console, out=io.StringIO(),
+            )
+        self.assertIn("not confirmed", str(raised.exception))
+        self.assertFalse(into.exists())
+        self.assertEqual(self.staging_dirs(), before)
+
+    def test_a_local_build_that_fails_leaves_no_staging_directory(self):
+        # The other half of the same promise: the directory is this run's until
+        # the seed it holds has passed both guards.
+        self.without_gh()
+        before = self.staging_dirs()
+        broken = provision.build_intent
+
+        def fail(*args, **kwargs):
+            raise provision.ProvisionError("git said no, for this test")
+
+        provision.build_intent = fail
+        self.addCleanup(setattr, provision, "build_intent", broken)
+        code, out = run_cli([
+            "init", "--shape", "greenfield", "--product", "acme", "--org", "waviisoft",
+            "--area", "billing", "--yes",
+        ])
+        self.assertEqual(code, 2, out)
+        self.assertEqual(self.staging_dirs(), before)
+
+
+class PlanReachesNoForge(ProvisionCase):
+    """`--plan` "prints it and stops, creating nothing" (the spec).
+
+    `detect_gh()` runs `gh auth status`, which is a call to the forge — so the
+    one command whose whole promise is that it does nothing was contacting one
+    before it printed a word.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.with_fake_gh()
+
+    def test_plan_invokes_the_forge_cli_not_at_all(self):
+        code, out, err = run_cli_streams([
+            "init", "--shape", "greenfield", "--product", "acme", "--org", "waviisoft",
+            "--area", "billing", "--yes", "--plan",
+        ])
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.recorded(), [], "--plan reached the forge")
+
+    def test_it_says_what_it_found_without_claiming_it_is_authenticated(self):
+        # Whether that `gh` is logged in is exactly the question it declined to
+        # ask, so the label says so rather than promising a transport.
+        code, out, err = run_cli_streams([
+            "init", "--shape", "greenfield", "--product", "acme", "--org", "waviisoft",
+            "--area", "billing", "--yes", "--plan",
+        ])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("transport: gh (if authenticated)", out)
+        self.assertEqual(self.recorded(), [])
+
+
+class TheSurveySourcesAreProductRepoPaths(ProvisionCase):
+    """`--docs` becomes a line in `spec/index.md` that a surveyor opens.
+
+    Every refusal here is a promise the index would otherwise not keep.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.without_gh()
+        self.docs = self.cwd / "docs"
+        self.docs.mkdir()
+        (self.docs / "api.md").write_text("# api\n", encoding="utf-8")
+        self.into = self.root / "out"
+
+    def adopt(self, *docs: str, into=None):
+        return run_cli([
+            "init", "--shape", "brownfield-with-docs", "--product", "legacy",
+            "--org", "waviisoft", "--area", "billing",
+            "--into", str(into or self.into), "--yes",
+            *[argument for path in docs for argument in ("--docs", path)],
+        ])
+
+    def index(self) -> str:
+        return (self.into / "legacy-intent" / "spec" / "index.md").read_text(
+            encoding="utf-8")
+
+    def test_a_path_outside_the_product_checkout_is_two(self):
+        # An absolute path on this operator's laptop means nothing to the next
+        # person reading `spec/index.md`.
+        outside = self.root / "elsewhere.md"
+        outside.write_text("# elsewhere\n", encoding="utf-8")
+        code, out = self.adopt(str(outside))
+        self.assertEqual(code, 2, out)
+        self.assertIn("outside", out)
+        self.assertFalse(self.into.exists())
+
+    def test_a_path_climbing_out_with_dot_dot_is_two(self):
+        (self.root / "escape.md").write_text("# escape\n", encoding="utf-8")
+        code, out = self.adopt("../escape.md")
+        self.assertEqual(code, 2, out)
+        self.assertIn("outside", out)
+
+    def test_a_path_carrying_a_backtick_is_two(self):
+        # The index wraps each source in inline code, and lint's masking — what
+        # keeps these paths from being read as cross-references — depends on
+        # that quoting holding.
+        weird = self.docs / "we`ird.md"
+        weird.write_text("# weird\n", encoding="utf-8")
+        code, out = self.adopt("docs/we`ird.md")
+        self.assertEqual(code, 2, out)
+        self.assertIn("backtick", out)
+
+    def test_a_path_carrying_a_newline_is_two(self):
+        code, out = self.adopt("docs/api.md\nnot-a-source")
+        self.assertEqual(code, 2, out)
+        self.assertIn("control character", out)
+
+    def test_an_absolute_path_inside_the_checkout_lands_relative(self):
+        # What reaches the index is the repo-relative path, never this machine's.
+        code, out = self.adopt(str(self.docs / "api.md"))
+        self.assertEqual(code, 0, out)
+        sources = self.index().split("### Survey sources")[1]
+        self.assertIn("`docs/api.md`", sources)
+        self.assertNotIn(str(self.cwd), self.index())
+
+    def test_a_long_path_is_written_whole(self):
+        # `one_line` truncated at 120 characters with an ellipsis, which is a
+        # path the surveyor cannot open — a promise the index cannot keep, which
+        # is the exact wording of the refusal for a path that does not exist.
+        deep = self.docs / ("nested/" * 20)
+        deep.mkdir(parents=True)
+        (deep / "architecture.md").write_text("# deep\n", encoding="utf-8")
+        relative = f"docs/{'nested/' * 20}architecture.md"
+        self.assertGreater(len(relative), 120)
+        code, out = self.adopt(relative)
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"`{relative}`", self.index())
+        self.assertNotIn("…", self.index())
+
+    def test_the_seed_still_lints_with_a_long_path(self):
+        deep = self.docs / ("nested/" * 20)
+        deep.mkdir(parents=True)
+        (deep / "architecture.md").write_text("# deep\n", encoding="utf-8")
+        code, out = self.adopt(f"docs/{'nested/' * 20}architecture.md")
+        self.assertEqual(code, 0, out)
+        code, out = run_cli(["lint", str(self.into / "legacy-intent")])
+        self.assertEqual(code, 0, out)
+
+
+class TheSeedsOwnIdsAreNotAvailableAsAreas(ProvisionCase):
+    """`--area product` seeded a second file claiming `id: product`.
+
+    Lint would not say so — its duplicate-id check (`GH003`) is about SCENARIO
+    ids — so the seed went green and the collision surfaced later.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.without_gh()
+
+    def refuse(self, *areas: str) -> str:
+        code, out = run_cli([
+            "init", "--shape", "greenfield", "--product", "acme", "--org", "waviisoft",
+            "--into", str(self.root / "o"), "--yes",
+            *[argument for area in areas for argument in ("--area", area)],
+        ])
+        self.assertEqual(code, 2, out)
+        self.assertFalse((self.root / "o").exists())
+        # Before the plan, like every other value refusal.
+        self.assertNotIn("Nothing below has happened yet", out)
+        return out
+
+    def test_an_area_named_product_is_two(self):
+        self.assertIn("spec/product.md", self.refuse("product"))
+
+    def test_an_area_named_index_is_two(self):
+        self.assertIn("spec/index.md", self.refuse("index"))
+
+    def test_a_reserved_name_beside_a_good_one_is_still_two(self):
+        self.assertIn("--area", self.refuse("billing", "index"))
+
+    def test_a_name_yaml_reads_as_a_boolean_is_two(self):
+        # It becomes a spec file's `id:` and a workspace key, and the parser
+        # that reads the seed back would answer `False`.
+        for name in ("no", "yes", "on", "off", "null"):
+            with self.subTest(name=name):
+                self.assertIn("YAML", self.refuse(name))
+
+    def test_a_product_yaml_reads_as_a_boolean_is_two(self):
+        code, out = run_cli([
+            "init", "--shape", "greenfield", "--product", "off", "--org", "waviisoft",
+            "--area", "billing", "--into", str(self.root / "o"), "--yes",
+        ])
+        self.assertEqual(code, 2, out)
+        self.assertIn("--product", out)
+        self.assertIn("YAML", out)
+
+    def test_the_pin_is_a_string_even_when_it_is_all_digits(self):
+        # A sha is a string and only accidentally not a number. Quoted in the
+        # template, so a 40-digit sha does not come back as an int.
+        answers = provision.resolve(_flags(), provision.Console(tty=False))
+        seeded = provision.product_seed(answers, "1" * 40)[".vellum/product.yaml"]
+        self.assertEqual(yaml.safe_load(seeded)["pin"]["commit"], "1" * 40)
+
+
+class APromptWithNoAnswerIsAnAnswerNotATraceback(ProvisionCase):
+    """The prompts are the operator's only conversation with this command."""
+
+    def setUp(self):
+        super().setUp()
+        self.without_gh()
+
+    def _run(self, console, **overrides):
+        values = dict(
+            shape=None, product="acme", org="waviisoft", intent_repo=None,
+            product_repo=None, visibility=None, intent_visibility=None,
+            product_visibility=None, branch=None, areas=["billing"], docs=(),
+            into=str(self.root / "o"), plan_only=False, yes=True,
+        )
+        values.update(overrides)
+        return provision.run(str(self.cwd), console=console, out=io.StringIO(),
+                             **values)
+
+    def test_a_terminal_that_closes_mid_prompt_is_two_naming_the_flag(self):
+        # `input()` raises EOFError at end of input. It reached the operator as
+        # a traceback, which is the one thing a command that has just asked a
+        # question must not answer with.
+        def closed(_):
+            raise EOFError
+
+        console = provision.Console(tty=True, ask=closed, ask_secret=lambda _: "")
+        with self.assertRaises(provision.ProvisionError) as raised:
+            self._run(console)
+        self.assertIn("--shape", str(raised.exception))
+        self.assertIn("terminal closed", str(raised.exception))
+        self.assertFalse((self.root / "o").exists())
+
+    def test_an_answer_that_is_not_a_choice_re_asks_and_says_why(self):
+        answers = iter(["mystery", "greenfield"])
+        console = provision.Console(tty=True, ask=lambda _: next(answers),
+                                    ask_secret=lambda _: "")
+        errors = io.StringIO()
+        stderr, sys.stderr = sys.stderr, errors
+        try:
+            code = self._run(console)
+        finally:
+            sys.stderr = stderr
+        self.assertEqual(code, 0)
+        self.assertIn("'mystery' is not one of", errors.getvalue())
+        self.assertIn("greenfield", errors.getvalue())
+
+    def test_a_checkout_path_that_is_a_file_is_two_and_not_a_traceback(self):
+        # `iterdir()` on a file raises NotADirectoryError. A file where a
+        # checkout should go is exactly what this refusal is about.
+        into = self.root / "o"
+        into.mkdir()
+        (into / "acme-intent").write_text("not a directory\n", encoding="utf-8")
+        code, out = run_cli([
+            "init", "--shape", "greenfield", "--product", "acme", "--org", "waviisoft",
+            "--area", "billing", "--into", str(into), "--yes",
+        ])
+        self.assertEqual(code, 2, out)
+        self.assertIn("already exists", out)
+
+    def test_a_relative_into_is_resolved_before_anything_is_built(self):
+        # Every path the report and the checklist print has to be one an
+        # operator can paste from another directory.
+        code, out, err = run_cli_streams([
+            "init", "--shape", "greenfield", "--product", "acme", "--org", "waviisoft",
+            "--area", "billing", "--into", "relative-out", "--yes",
+        ])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(str(self.cwd.resolve() / "relative-out" / "acme-intent"), out)
+        self.assertNotIn("--source relative-out", out)
 
 
 class ASeedThatIsNotGreenIsNotPushed(ProvisionCase):

@@ -33,11 +33,18 @@ drifted from the plan would be wrong exactly where it is trusted most.
 
 **Nothing here mints a credential, and no secret is ever an argv element.**
 The cross-repo token pair is supplied by the operator — from the environment, or
-a hidden prompt — and reaches ``gh`` on **stdin** via ``--body -``. An argv
-element is world-readable on the machine (``/proc/<pid>/cmdline``, ``ps``) and
-lands in shell history; a value on stdin is neither. :class:`ForgeStep` cannot
-carry a value at all: its ``stdin`` field holds a *description* of what is piped
-in, which is what the plan and the checklist print.
+a hidden prompt — and reaches ``gh secret set`` on **stdin**, which is what that
+command reads when ``--body`` is *absent*. It has to be absent: ``gh`` takes
+``--body``'s value whenever it is non-empty and only falls back to stdin when the
+flag was not given, so ``--body -`` does not mean "read stdin" — it sets the
+secret to the literal string ``-``. The pipe is enough on its own:
+``subprocess.run(input=…)`` hands ``gh`` a pipe rather than a terminal, and so
+does ``printf … |`` in the checklist. An argv element is world-readable on the
+machine (``/proc/<pid>/cmdline``, ``ps``) and lands in shell history; a value on
+stdin is neither. :class:`ForgeStep` cannot carry a value at all: its ``stdin``
+field holds a *description* of what is piped in and its ``secret`` field the
+*name* of the variable holding it, which is what the plan and the checklist
+print.
 
 **The seed is checked before it is pushed.** ``spec/features/installation.md``:
 "The seed lints clean and doctors green before it is pushed." Both run against
@@ -57,7 +64,9 @@ Exit codes, matching the guards' contract (``vellum.cli``'s docstring):
   reports its verdict rather than inventing a second one.
 * ``2`` — it could not answer: a value that will not validate, a prompt with no
   TTY to ask on, a checkout that is already an installation, a repository name
-  the forge already has.
+  the forge already has, a product checkout this adoption would not be a guest
+  in, a plan the operator declined, or a forge step that failed mid-run (the
+  report says what was taken before it did).
 """
 
 from __future__ import annotations
@@ -93,6 +102,13 @@ ADOPTING = (BROWNFIELD, BROWNFIELD_WITH_DOCS)
 
 VISIBILITIES = ("public", "private")
 
+#: Where the adoption pull request's body is written, inside the product
+#: checkout and deliberately **not** committed: the transport passes it to
+#: ``gh pr create --body-file`` and the manual rung's checklist names the same
+#: path, so an operator following the checklist has the body the transport would
+#: have used rather than a placeholder it never filled in.
+ADOPT_PR_RELPATH = ".vellum/ADOPT_PR.md"
+
 #: The branch a brownfield installation's ``.vellum/`` arrives on.
 #: ``spec/features/installation.md``: "its ``.vellum/`` arrives on a branch as a
 #: pull request, never as a push to its default branch". Vellum is a guest in a
@@ -125,6 +141,23 @@ PRODUCT_RE = ID_RE
 #: lowercase slug (``vellum.specfile.ID_RE``), so it is held to the same shape
 #: here — a value refused at seed time by lint is one to refuse before the plan.
 AREA_RE = ID_RE
+
+#: The two ids the seed claims for itself. ``spec/product.md`` is ``id: product``
+#: and ``spec/index.md`` is ``id: index``, so an area of either name seeds a
+#: SECOND file claiming an id that is already taken. Lint's ``GH003`` would not
+#: catch it — that check is about scenario ids — so the seed would go green and
+#: the collision would surface later as two files answering to one name.
+RESERVED_AREAS = ("product", "index")
+
+#: YAML 1.1 spells these as booleans and nulls, and a product or area name is
+#: written into a seeded file as a bare scalar — ``.vellum/workspace.yaml``'s
+#: product key, ``.vellum/product.yaml``'s ``product.name``, a spec file's
+#: ``id:``. A product called ``no`` would be read back as ``False`` by the same
+#: parser that wrote it. Refused here rather than quoted in five templates,
+#: because a template someone adds later would not know to quote.
+YAML_KEYWORDS = frozenset(
+    "y|yes|n|no|true|false|on|off|null|none|~".split("|")
+)
 
 
 class ProvisionError(Exception):
@@ -204,12 +237,30 @@ def _prompt(console: Console, flag: str, question: str, *,
     suffix = f" [{'/'.join(choices)}]" if choices else ""
     suffix += f" ({default})" if default else ""
     while True:
-        answer = console.ask(f"{question}{suffix}: ").strip()
+        try:
+            answer = console.ask(f"{question}{suffix}: ").strip()
+        except EOFError:
+            # A terminal that closed mid-conversation — a piped heredoc that ran
+            # out, a Ctrl-D. It is the same situation as having no terminal at
+            # all, so it gets the same answer and the same advice, rather than a
+            # traceback out of `input()`.
+            raise ProvisionError(
+                f"{question} — and the terminal closed before it was answered. "
+                f"Every prompt is answerable by a flag: pass {flag}"
+                + (f" ({'|'.join(choices)})" if choices else "")
+                + (f", or accept the default with --yes ({default})" if default else "")
+                + "."
+            ) from None
         if not answer and default is not None:
             return default
+        # A re-ask says why. A prompt that silently reprints itself looks like
+        # the terminal ate the answer, and the operator retypes the same thing.
         if not answer:
+            print(f"  {flag} has no default; an answer is needed.", file=sys.stderr)
             continue
         if choices and answer not in choices:
+            print(f"  {one_line(answer)!r} is not one of {', '.join(choices)}.",
+                  file=sys.stderr)
             continue
         return answer
 
@@ -258,6 +309,90 @@ def _check(value: str, pattern: re.Pattern, flag: str, what: str) -> str:
     return text
 
 
+def _refuse_yaml_keyword(value: str, flag: str) -> None:
+    """A name YAML 1.1 reads as a boolean or a null, refused before the plan.
+
+    :data:`YAML_KEYWORDS` has the argument: this value is written into seeded
+    files as a bare scalar and read back by the same parser that wrote it, so a
+    product called ``no`` would come back as ``False``.
+    """
+    if value.lower() in YAML_KEYWORDS:
+        raise ProvisionError(
+            f"{flag} {value!r} is a YAML 1.1 keyword. It is written into the seed "
+            f"as a bare scalar — a workspace key, a `product.name`, a spec file's "
+            f"`id:` — and the parser that reads the seed back would answer with a "
+            f"boolean or a null rather than this name. Choose another."
+        )
+
+
+#: Characters a survey source path may not carry. The backtick because the
+#: seeded index wraps each path in inline code and lint's masking depends on
+#: that quoting holding (`links.find_references`); the control characters
+#: because the index is prose a human reads and a newline inside one entry
+#: makes a second entry nobody wrote.
+_DOCS_FORBIDDEN = re.compile(r"[`\x00-\x1f\x7f]")
+
+
+def _docs_base(into, product_repo: str) -> Path:
+    """The checkout ``--docs`` paths are relative to.
+
+    Survey sources are documentation that lives in the PRODUCT repository, and
+    the seeded index names them for a surveyor who will be reading that
+    repository — so they are recorded repo-relative. The base is the product
+    checkout when ``--into`` already names one (adoption over a checkout the
+    operator has), and otherwise the directory the command was run from, which
+    is where an operator adopting their own product repo is standing.
+    """
+    if into:
+        candidate = Path(into).resolve() / product_repo
+        if candidate.is_dir():
+            return candidate
+    return Path.cwd().resolve()
+
+
+def _resolve_docs(args, shape: str, product_repo: str) -> tuple[str, ...]:
+    """``--docs`` as product-repo-relative paths, each one checked.
+
+    Three refusals, and each is a promise the seeded index would otherwise not
+    keep. A path that does not exist is a source the surveyor cannot open. A
+    path OUTSIDE the product checkout is a file that is not in the repository
+    the index describes — an absolute path on this operator's laptop, most
+    likely, which means nothing to anyone else reading `spec/index.md`. And a
+    path carrying a backtick or a control character would break the inline-code
+    quoting the seed's own lint depends on.
+    """
+    base = _docs_base(args.into, product_repo)
+    resolved: list[str] = []
+    for raw in (str(d) for d in (args.docs or ())):
+        if _DOCS_FORBIDDEN.search(raw):
+            raise ProvisionError(
+                f"--docs {one_line(raw)!r} carries a backtick or a control "
+                f"character. Each source is written into the seeded index as "
+                f"inline code, and lint's masking — which is what keeps these "
+                f"paths from being read as cross-references — depends on that "
+                f"quoting holding."
+            )
+        full = (base / raw).resolve()
+        try:
+            relative = full.relative_to(base)
+        except ValueError:
+            raise ProvisionError(
+                f"--docs {raw!r} resolves to {full}, which is outside "
+                f"{base}. Survey sources are documentation in the PRODUCT "
+                f"repository and are listed repo-relative, so a path outside it "
+                f"would put a location only this machine has into "
+                f"spec/index.md."
+            ) from None
+        if not full.exists():
+            raise ProvisionError(
+                f"--docs {raw!r} does not exist ({full}). The survey sources are "
+                f"listed in the seeded index for the surveyor to find, so a path "
+                f"that is not there would be a promise the index cannot keep."
+            )
+        resolved.append(relative.as_posix())
+    return tuple(resolved)
+
+
 def resolve(args, console: Console) -> Answers:
     """The conversation, in order: ask, default, validate. Nothing is created.
 
@@ -280,6 +415,7 @@ def resolve(args, console: Console) -> Answers:
         args.product or _prompt(console, "--product", "Product name (a slug)"),
         PRODUCT_RE, "--product", "a lowercase slug (letters, digits, single hyphens)",
     )
+    _refuse_yaml_keyword(product, "--product")
     org = _check(
         args.org or _prompt(console, "--org", "Forge organization or user"),
         ORG_RE, "--org", "a forge organization or user name",
@@ -339,8 +475,19 @@ def resolve(args, console: Console) -> Answers:
             f"is one spec file and one `id:`, and lint refuses two files claiming "
             f"one id."
         )
+    for area in areas:
+        if area in RESERVED_AREAS:
+            raise ProvisionError(
+                f"--area {area!r} is the id the seed's own spec/{area}.md claims, "
+                f"so an area of that name would seed a second file answering to "
+                f"one id. Lint would not say so — its duplicate-id check is about "
+                f"SCENARIO ids — so the seed would go green and the collision "
+                f"would surface later. Name it something else "
+                f"({', '.join(RESERVED_AREAS)} are the seed's)."
+            )
+        _refuse_yaml_keyword(area, "--area")
 
-    docs = tuple(str(d) for d in (args.docs or ()))
+    docs = _resolve_docs(args, shape, product_repo)
     if docs and shape != BROWNFIELD_WITH_DOCS:
         raise ProvisionError(
             f"--docs is for --shape {BROWNFIELD_WITH_DOCS}; this run is "
@@ -354,14 +501,6 @@ def resolve(args, console: Console) -> Answers:
             f"survey's sources, and none was named. Pass --docs <path> (repeatable), "
             f"or use --shape {BROWNFIELD}."
         )
-    for path in docs:
-        if not Path(path).exists():
-            raise ProvisionError(
-                f"--docs {one_line(path)!r} does not exist. The survey sources are "
-                f"listed in the seeded index for the surveyor to find, so a path "
-                f"that is not there would be a promise the index cannot keep."
-            )
-
     return Answers(
         shape=shape, product=product, org=org,
         intent_repo=intent_repo, product_repo=product_repo,
@@ -693,12 +832,16 @@ intent:
 # subtree is mounted; an installation may keep one as a developer convenience,
 # but nothing treats a gitlink as authoritative.
 #
+# `commit` is quoted because a sha is a string and only accidentally not a
+# number: a 40-character sha that happened to be all digits would be read back
+# as an integer, and nothing downstream would match it against a ref.
+#
 # Seeded by `vellum init` at the first commit touching spec/ in
 # {intent_slug} — the commit that made this installation's spec exist.
 # `name` is decoration: nothing reads it to decide anything, so it may be
 # absent, late or wrong without changing behavior.
 pin:
-  commit: {commit}
+  commit: "{commit}"
   name: null
 
 # This repo's entry in the intent repo's .vellum/workspace.yaml.
@@ -779,7 +922,13 @@ def intent_seed(answers: Answers) -> dict[str, str]:
             # name files in the PRODUCT repo, which this tree cannot resolve.
             # Inline code is masked before references are found, so a quoted
             # path is data. It also renders as a path, which is what it is.
-            sources="\n".join(f"- `{one_line(d)}`" for d in answers.docs) or "- (none named)",
+            # Rendered raw, NOT through `one_line`: these are paths a surveyor
+            # opens, and a path truncated at 120 characters is a promise the
+            # index cannot keep. What `one_line` would have guarded against —
+            # a newline, a backtick — is refused outright in `_resolve_docs`
+            # instead, which is the only place that can refuse rather than
+            # mangle.
+            sources="\n".join(f"- `{d}`" for d in answers.docs) or "- (none named)",
         )
         for slug in answers.areas:
             files[f"spec/features/{slug}.md"] = AREA_BROWNFIELD.format(
@@ -849,13 +998,18 @@ class ForgeStep:
 
     ``stdin`` is a *description* of what is piped in, never a value: this object
     reaches the plan, the checklist and the report, and a secret that can be
-    held cannot be printed by accident. The value travels beside the step, in a
-    local variable, to :meth:`Gh.run`.
+    held cannot be printed by accident. ``secret`` is the *name* of the
+    environment variable the value comes from, which is printable for the same
+    reason and is what the checklist's ``printf`` line has to name. The value
+    itself travels beside the step, in a local dict, to :meth:`Gh.run`.
     """
 
     what: str
     argv: tuple[str, ...] = ()
     stdin: str | None = None
+    #: The secret this step's value is looked up under — an environment variable
+    #: name, never a value. Set exactly on the steps that pipe something in.
+    secret: str | None = None
     #: True when nothing automates this: branch protection, a review, a setting
     #: on a repository this installation does not own.
     manual: bool = False
@@ -872,14 +1026,21 @@ class ForgeStep:
         The checklist has to carry "the exact values"
         (``spec/features/installation.md``), and two of them — where each
         checkout is — are not known when :func:`forge_steps` builds the list.
-        They travel as ``<intent checkout>`` / ``<product checkout>`` and are
-        substituted here and in :func:`_take`, from one mapping, so what an
+        They travel as placeholders (:attr:`Plan.places` names all of them) and
+        are substituted here and in :func:`_take`, from one mapping, so what an
         operator is told to run is what the transport would have run.
         """
         if not self.argv:
             return ""
         rendered = " ".join(_quote((places or {}).get(a, a)) for a in self.argv)
-        return f"printf %s \"$TOKEN\" | {rendered}" if self.stdin else rendered
+        if not self.secret:
+            return rendered
+        # The variable this step's own value comes from, not a stand-in: an
+        # operator pastes this line, and `$TOKEN` is a variable nothing in the
+        # plan ever told them to set. `printf %s` and no `--body`, because
+        # `gh secret set` reads stdin only when the flag is absent — see the
+        # module docstring.
+        return f'printf %s "${self.secret}" | {rendered}'
 
 
 _SAFE = re.compile(r"^[A-Za-z0-9@%_+=:,./-]+$")
@@ -908,7 +1069,7 @@ def forge_steps(answers: Answers, *, host: str) -> list[ForgeStep]:
             f"branch sits on its real history. Without a forge CLI: clone it "
             f"yourself, copy the two files from the local product checkout onto "
             f"a {ADOPT_BRANCH} branch of it, and commit",
-            ("gh", "repo", "clone", product, "--", "<product checkout>"),
+            ("gh", "repo", "clone", product, "--", "<product clone>"),
             before=True,
         ))
     # The intent repo first, in both shapes. It is the command surface
@@ -933,12 +1094,12 @@ def forge_steps(answers: Answers, *, host: str) -> list[ForgeStep]:
     if answers.adopting:
         steps.append(ForgeStep(
             f"push {ADOPT_BRANCH} to {product} — Vellum's `.vellum/` arrives on a "
-            f"branch, never as a push to {answers.branch}",
-            ("git", "-C", "<product checkout>", "push", "-u", "origin", ADOPT_BRANCH),
+            f"branch, never as a push to its default branch",
+            ("git", "-C", "<product clone>", "push", "-u", "origin", ADOPT_BRANCH),
         ))
         steps.append(ForgeStep(
             f"open the adoption pull request on {product}",
-            ("gh", "pr", "create", "--repo", product, "--base", answers.branch,
+            ("gh", "pr", "create", "--repo", product, "--base", "<adopt base>",
              "--head", ADOPT_BRANCH, "--title", "Adopt Vellum: the pin and the memory map",
              "--body-file", "<adopt PR body>"),
         ))
@@ -946,25 +1107,26 @@ def forge_steps(answers: Answers, *, host: str) -> list[ForgeStep]:
     steps.append(ForgeStep(
         f"set {INTENT_SECRET} on {intent} — the credential its caller stubs pass "
         f"to the reusable workflows, which read {product}",
-        ("gh", "secret", "set", INTENT_SECRET, "--repo", intent, "--body", "-"),
+        ("gh", "secret", "set", INTENT_SECRET, "--repo", intent),
         stdin=f"the {INTENT_SECRET} value, on stdin",
+        secret=INTENT_SECRET,
     ))
     steps.append(ForgeStep(
         f"set {PRODUCT_SECRET} on {product} — the credential its conformance job "
         f"reads {intent} with, to fetch the spec tree at the pin",
-        ("gh", "secret", "set", PRODUCT_SECRET, "--repo", product, "--body", "-"),
+        ("gh", "secret", "set", PRODUCT_SECRET, "--repo", product),
         stdin=f"the {PRODUCT_SECRET} value, on stdin",
+        secret=PRODUCT_SECRET,
     ))
-    if answers.product_visibility == "private":
-        steps.append(ForgeStep(
-            f"open {product}'s workflows to reuse from the organization; a private "
-            f"repository's workflows resolve nowhere else, and a caller stub that "
-            f"cannot resolve fails at `uses:` on every run",
-            ("gh", "api", "-X", "PUT",
-             f"repos/{product}/actions/permissions/access",
-             "-f", "access_level=organization"),
-        ))
-
+    # Nothing here sets `actions/permissions/access` on the PRODUCT repo, and
+    # the omission is the point. That setting governs whether a repository's own
+    # workflows may be REUSED by others; the workflows this installation's caller
+    # stubs resolve against live in the host repo (`--from`), which no
+    # installation owns. Setting it on the product repo would ask the forge for a
+    # permission nothing needs — and on a user-owned account, where organization
+    # access does not exist, the call fails outright and takes a successful
+    # provisioning down with it. The setting that DOES matter is the host's, and
+    # it is named below as a step no transport takes.
     # ------------------------------------------------------------------
     # What no transport takes. `spec/features/installation.md` requires the
     # plan to name "every step the transport cannot take", and the honest list
@@ -1022,13 +1184,35 @@ class Plan:
     #: Where the local half is built: ``--into``, or a staging directory.
     intent_dir: Path
     product_dir: Path
+    #: True when a transport will clone the existing product repository, which
+    #: decides where the adoption's clone lives — see :attr:`places`.
+    cloned: bool = False
+    #: The branch the adoption pull request is opened against. ``--branch`` until
+    #: a clone says otherwise; the clone's own ``origin/HEAD`` after one, because
+    #: the repository being adopted already has a default branch and it is not
+    #: this installation's business to assume it is the one ``--branch`` named.
+    adopt_base: str | None = None
 
     @property
     def places(self) -> dict[str, str]:
-        """The two checkout placeholders, filled in from this plan's paths."""
+        """Every placeholder a step's argv can carry, from this plan's paths.
+
+        ``<product clone>`` is the one that is not simply a path. With a
+        transport, ``gh repo clone`` clones the existing product repository
+        straight into the product checkout and everything afterwards runs there.
+        Without one, that checkout is the STAND-IN this run built — it already
+        holds the two seeded files and a root commit — so telling an operator to
+        clone into it is telling them to run a command that fails. The checklist
+        therefore names a sibling, and the push and the pull request name it too,
+        so the three steps are one story an operator can follow top to bottom.
+        """
+        product = str(self.product_dir)
         return {
             "<intent checkout>": str(self.intent_dir),
-            "<product checkout>": str(self.product_dir),
+            "<product checkout>": product,
+            "<product clone>": product if self.cloned else f"{product}-clone",
+            "<adopt PR body>": str(self.product_dir / ADOPT_PR_RELPATH),
+            "<adopt base>": self.adopt_base or self.answers.branch,
         }
 
     def at(self, intent_dir: Path, product_dir: Path) -> None:
@@ -1080,32 +1264,42 @@ class Plan:
             f"environment, or a hidden prompt",
             "",
             "Actions access",
-        ]
-        if a.product_visibility == "private":
-            lines.append(
-                f"  {a.product_slug}: access_level=organization, so this "
-                f"repository's workflows can be reused inside {a.org}"
-            )
-        else:
-            lines.append(
-                f"  {a.product_slug} is public, so its workflows are already "
-                f"reusable; no access change is needed"
-            )
-        lines += ["", f"Steps (transport: {self.transport})"]
-        for number, step in enumerate(self.steps, start=1):
-            lines.append(f"  {number:>2}. {step.what}")
-            if step.argv:
-                lines.append(f"      {step.command(self.places)}")
-            if step.stdin:
-                lines.append(f"      stdin: {step.stdin}")
-            if step.manual:
-                lines.append("      (no transport takes this one; it is yours)")
+            f"  nothing is changed on {a.intent_slug} or {a.product_slug}. The "
+            f"workflows this installation's",
+            f"  caller stubs resolve against live in {self.host}, which this "
+            f"installation does not own,",
+            "  so the setting that has to be right is that repo's and no "
+            "transport here can set it.",
+            "  It is in the steps below.",
+            "",
+            f"Steps (transport: {self.transport})"]
+        lines += _step_lines(self.steps, self.places)
         lines += ["", *install.CANNOT_KNOW]
         return "\n".join(lines)
 
 
+def _step_lines(steps: Sequence[ForgeStep], places: dict[str, str]) -> list[str]:
+    """One step list, rendered.
+
+    The plan, the checklist and the interrupted report all print the same shape,
+    and printing it in one place is the same argument :func:`forge_steps` makes
+    one level up: three renderings of one list cannot disagree about what the
+    installer would have done.
+    """
+    lines: list[str] = []
+    for number, step in enumerate(steps, start=1):
+        lines.append(f"  {number:>2}. {step.what}")
+        if step.argv:
+            lines.append(f"      {step.command(places)}")
+        if step.stdin:
+            lines.append(f"      stdin: {step.stdin}")
+        if step.manual:
+            lines.append("      (no transport takes this one; it is yours)")
+    return lines
+
+
 def build_plan(answers: Answers, *, host: str, ref: str, transport: str,
-               intent_dir: Path, product_dir: Path) -> Plan:
+               intent_dir: Path, product_dir: Path, cloned: bool = False) -> Plan:
     workflows = install.WORKFLOWS_DIR["github"]
     return Plan(
         answers=answers,
@@ -1118,6 +1312,7 @@ def build_plan(answers: Answers, *, host: str, ref: str, transport: str,
         steps=tuple(forge_steps(answers, host=host)),
         intent_dir=intent_dir,
         product_dir=product_dir,
+        cloned=cloned,
     )
 
 
@@ -1216,14 +1411,91 @@ def build_intent(directory: Path, answers: Answers, *, host: str, ref: str) -> t
     return pin, [str(stamp.path) for stamp in stamped.stamps]
 
 
-def build_product(directory: Path, answers: Answers, pin: str) -> None:
-    """Build and commit the product checkout.
+def _default_branch(repo: Path, fallback: str) -> str:
+    """The branch an adoption is a guest of: ``origin/HEAD``, or *fallback*.
+
+    A cloned repository already has a default branch and it is the repository's
+    fact, not this installation's — ``--branch`` is the branch the INTENT repo
+    is created with, and assuming the two agree is how an adoption of a
+    ``master``-based repo opens a pull request against a ``main`` that is not
+    there. Read from the clone when there is one; ``--branch`` is the answer
+    only when nothing else can say.
+    """
+    found = _git(repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD",
+                 check=False)
+    ref = found.stdout.strip()
+    if found.returncode == 0 and ref.startswith("origin/"):
+        return ref[len("origin/"):]
+    return fallback
+
+
+def _check_adoption(directory: Path, answers: Answers) -> str:
+    """Refuse an adoption that would not be a guest. Returns the base branch.
+
+    Vellum "claims one namespaced directory in a repo it did not create and
+    never writes outside it" — and an adoption running over a checkout the
+    operator is *working in* breaks that promise in three ways, none of them
+    visible until the commit is already made:
+
+    * a checkout that already carries ``.vellum/product.yaml`` is an
+      installation, and seeding over it replaces its pin. It is the product-side
+      twin of the refusal :func:`run` opens with, and it gets the same answer.
+    * a dirty tree gets swept into the adoption commit. That is somebody's
+      work-in-progress, and — since the sweep is indiscriminate — an untracked
+      ``.env`` beside it, pushed to a branch and opened as a pull request.
+    * a ``vellum/adopt`` branch that already exists is somebody's, and this run
+      would move it.
+
+    All three are exit 2: the command cannot answer, because answering means
+    destroying something it did not make.
+    """
+    product_file = directory / ".vellum" / "product.yaml"
+    if product_file.is_file():
+        raise ProvisionError(
+            f"{product_file} already exists: {directory} is already a Vellum "
+            f"product repo, and adoption does not run over one. Seeding it again "
+            f"would replace the pin this repository already answers to. If the "
+            f"installation it belongs to is the one you meant, this is not the "
+            f"command — `vellum init <intent-checkout>` stamps its stubs and is "
+            f"idempotent."
+        )
+    dirty = _git(directory, "status", "--porcelain").stdout.strip().splitlines()
+    if dirty:
+        listed = ", ".join(one_line(line.strip()) for line in dirty[:10])
+        more = f" (and {len(dirty) - 10} more)" if len(dirty) > 10 else ""
+        raise ProvisionError(
+            f"{directory} has uncommitted changes and adoption commits into it: "
+            f"{listed}{more}. Everything above would land in the adoption commit "
+            f"and then in a pull request — an untracked file included. Commit or "
+            f"stash it first, or point --into at a clean checkout."
+        )
+    if _git(directory, "rev-parse", "--verify", "--quiet",
+            f"refs/heads/{ADOPT_BRANCH}", check=False).returncode == 0:
+        raise ProvisionError(
+            f"{directory} already has a {ADOPT_BRANCH} branch. This run would "
+            f"move it, and whatever is on it is somebody's — an adoption already "
+            f"in review, most likely. Delete it, or rename it, and re-run."
+        )
+    base = _default_branch(directory, answers.branch)
+    if _git(directory, "rev-parse", "--verify", "--quiet",
+            f"refs/heads/{base}", check=False).returncode != 0:
+        raise ProvisionError(
+            f"{directory} has no {base!r} branch to open the adoption against, "
+            f"and nothing in it names a default. Pass --branch <name> with the "
+            f"branch this repository actually uses."
+        )
+    return base
+
+
+def build_product(directory: Path, answers: Answers, pin: str) -> str | None:
+    """Build and commit the product checkout. Returns the adoption's base.
 
     Greenfield creates it. The brownfield shapes put ``.vellum/`` on
     :data:`ADOPT_BRANCH` over whatever history the repository already has —
     ``spec/features/installation.md``: "its ``.vellum/`` arrives on a branch as a
     pull request, never as a push to its default branch". Vellum is a guest in a
-    repository it did not create.
+    repository it did not create, and the three things a guest does not do are
+    :func:`_check_adoption`'s.
     """
     directory.mkdir(parents=True, exist_ok=True)
     if not (directory / ".git").is_dir():
@@ -1237,15 +1509,29 @@ def build_product(directory: Path, answers: Answers, pin: str) -> None:
         if answers.adopting:
             _git(directory, "commit", "-q", "--allow-empty", "-m",
                  "the existing product repo, before Vellum")
+    base = None
     if answers.adopting:
-        _git(directory, "checkout", "-q", "-B", ADOPT_BRANCH)
-    write_files(directory, product_seed(answers, pin))
-    _git(directory, "add", "-A", "--", ".")
+        base = _check_adoption(directory, answers)
+        # `-b` off the named base, never `-B` off HEAD. `-B` resets a branch
+        # that already exists, and HEAD is whatever the operator last checked
+        # out — so the pair would silently adopt onto somebody else's feature
+        # branch and open a pull request carrying its commits.
+        _git(directory, "checkout", "-q", "-b", ADOPT_BRANCH, base)
+    seed = product_seed(answers, pin)
+    write_files(directory, seed)
+    # Exactly the seeded paths, never `add -A`. This directory may be the
+    # operator's own checkout, and `-A` sweeps whatever is in it — which is the
+    # difference between "Vellum added two files" and "Vellum committed your
+    # working tree". `_check_adoption` has already refused a dirty tree; this is
+    # the second half of the same promise, and it holds even if that check is
+    # ever loosened.
+    _git(directory, "add", "--", *sorted(seed))
     _git(directory, "commit", "-q", "-m", (
         f"adopt Vellum: pin {answers.product} at {pin[:12]} and seed the memory map"
         if answers.adopting else
         f"pin {answers.product} at {pin[:12]} and seed the memory map"
     ))
+    return base
 
 
 # =====================================================================
@@ -1382,6 +1668,67 @@ surveyed areas, so normal work continues while the survey proceeds.
 """
 
 
+def _write_adopt_body(directory: Path, answers: Answers, base: str) -> Path:
+    """The adoption pull request's body, in the product checkout, uncommitted.
+
+    In the checkout rather than in a temporary directory that is deleted on the
+    way out, because the manual rung's checklist names this path: an operator
+    reaching the ``gh pr create`` line needs the file to still be there. It is
+    written after the adoption commit and never added, so the branch carries the
+    two seeded files and nothing else.
+    """
+    path = directory / ADOPT_PR_RELPATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        ADOPT_PR_BODY.format(shape=answers.shape, intent_slug=answers.intent_slug,
+                             branch=base),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _interrupted(plan: Plan, taken: list[ForgeStep]) -> str:
+    """The report a forge failure leaves behind: what is real, and what is left.
+
+    A transport failure is not a rollback. ``gh`` has already created whatever it
+    created, and an operator who sees only the exception has to work out for
+    themselves which of eight steps happened — so this says it, and hands the
+    rest back in the same shape the checklist uses, because from here they ARE
+    the checklist.
+    """
+    remaining = [step for step in plan.steps if step not in taken]
+    lines = [
+        f"vellum init — interrupted ({plan.answers.shape})",
+        "",
+        "A forge step failed and the run stopped there. Nothing below is rolled "
+        "back:",
+        "what was taken is real, and re-running this command over it would "
+        "refuse at",
+        "the name the forge now has.",
+        "",
+    ]
+    if taken:
+        lines.append(f"Forge steps taken before the failure ({plan.transport}):")
+        lines += [f"  {number:>2}. {step.what}"
+                  for number, step in enumerate(taken, start=1)]
+    else:
+        lines.append("Forge steps taken: none. Nothing was created on a forge.")
+    lines.append("")
+    lines.append(
+        f"Left to you — {len(remaining)} step(s), starting with the one that "
+        f"failed:"
+    )
+    lines += _step_lines(remaining, plan.places)
+    lines += [
+        "",
+        f"  The local checkouts are at {plan.intent_dir} and {plan.product_dir}; "
+        f"the commands",
+        f"  above name them. `vellum doctor {plan.intent_dir}` verifies what a "
+        f"checkout can see.",
+    ]
+    return "\n".join(lines)
+
+
 def run(
     checkout: str,
     *,
@@ -1434,7 +1781,7 @@ def run(
 
     args = _Resolved(shape, product, org, intent_repo, product_repo, visibility,
                      intent_visibility, product_visibility, branch, list(areas),
-                     list(docs), yes)
+                     list(docs), yes, into)
     answers = resolve(args, console)
 
     # ------------------------------------------------------------------
@@ -1444,75 +1791,133 @@ def run(
     # has been told not to use would make the run's behavior depend on the
     # machine it is on, which is the one thing a suite fixture must not do.
     # ------------------------------------------------------------------
-    gh = None if into else detect_gh()
+    # `--plan` reaches no forge either, and that is stricter than it looks:
+    # `detect_gh` runs `gh auth status`, which is a call to the forge — so the
+    # one command whose whole promise is "creating nothing" would have contacted
+    # one before printing a word. It asks PATH and nothing else, and labels what
+    # it found hedged, because whether that `gh` is authenticated is exactly the
+    # question it declined to ask.
     if into:
+        gh, has_gh = None, False
         transport = "none (--into: local directories, no forge)"
-    elif gh is not None:
-        transport = f"gh ({gh.path})"
+    elif plan_only:
+        gh, has_gh = None, shutil.which("gh") is not None
+        transport = ("gh (if authenticated)" if has_gh else
+                     "none (no `gh` on PATH) — the forge steps are a checklist")
     else:
-        transport = "none (no authenticated `gh`) — the forge steps are a checklist"
+        gh = detect_gh()
+        has_gh = gh is not None
+        transport = (f"gh ({gh.path})" if gh is not None else
+                     "none (no authenticated `gh`) — the forge steps are a checklist")
 
     # The staging directory is not created until the plan is confirmed, because
     # "--plan prints it and stops, creating nothing" has to mean *nothing* — a
     # command that leaves an empty directory behind has created something, and a
     # plan whose paths were a fresh mkdtemp each run would not be deterministic
     # either. Until then the plan names where the checkouts will be.
-    root = Path(into) if into else None
+    # Resolved, so every path this run prints and every path it hands `git -C`
+    # is the same absolute one. A relative `--into` printed in a checklist an
+    # operator reads in another directory is a checklist that does not work.
+    root = Path(into).resolve() if into else None
     base = root if root is not None else Path(STAGING)
     intent_dir = base / answers.intent_repo
     product_dir = base / answers.product_repo
 
     plan = build_plan(answers, host=host, ref=pinned, transport=transport,
-                      intent_dir=intent_dir, product_dir=product_dir)
+                      intent_dir=intent_dir, product_dir=product_dir, cloned=has_gh)
     print(plan.render(), file=stream)
     if plan_only:
         print("\n--plan: nothing was created.", file=stream)
         return 0
 
+    # ------------------------------------------------------------------
+    # Refusals that need to look outward, and they come BEFORE the confirmation
+    # and before any directory is made. A name the forge already has is not a
+    # value this command can validate on its own, so it is not in `resolve` —
+    # but asking it after the operator has said yes means the run refuses
+    # something they already agreed to, having made a staging directory it then
+    # leaves behind. The spec's boundary is about the PLAN ("exits 2 for any
+    # value it cannot validate before the plan"), and the plan has been printed.
+    #
+    # The directory check runs only when `--into` named where to build. Without
+    # it the checkouts go inside a `mkdtemp` that does not exist yet and cannot
+    # collide with anything — and it must not exist yet, or `--plan` further up
+    # would have created something.
+    # ------------------------------------------------------------------
+    if gh is not None:
+        _check_forge_names(gh, answers)
+    if root is not None:
+        _check_directories(answers, intent_dir, product_dir)
+
     _confirm(console, yes)
 
+    #: The staging directory, while this run is still the only thing that would
+    #: miss it. Set to None the moment the checkouts become something the
+    #: operator is told to go and use — a seed that failed its checks, or a
+    #: green one whose forge steps have started — because from then on deleting
+    #: them would destroy the run's own report.
+    staged: Path | None = None
     if root is None:
         root = Path(tempfile.mkdtemp(prefix="vellum-init-"))
+        staged = root
         intent_dir = root / answers.intent_repo
         product_dir = root / answers.product_repo
         plan.at(intent_dir, product_dir)
         print(f"\nStaging the local half in {root}", file=stream)
 
-    # ------------------------------------------------------------------
-    # Refusals that need to look outward. A name the forge already has is not a
-    # value this command can validate on its own, so it is checked here rather
-    # than in `resolve` — after the plan, which is where the spec puts the
-    # boundary ("exits 2 for any value it cannot validate BEFORE the plan").
-    # ------------------------------------------------------------------
-    if gh is not None:
-        _check_forge_names(gh, answers)
-    _check_directories(answers, intent_dir, product_dir)
+    taken: list[ForgeStep] = []
+    try:
+        places = plan.places
+        pin, stubs = build_intent(intent_dir, answers, host=host, ref=pinned)
+        try:
+            # The one forge step the local half depends on: the clone a
+            # brownfield adoption branches from. Without a transport it stays on
+            # the checklist and `build_product` makes a standalone repository
+            # instead, which is the half a checkout can hold — the checklist step
+            # says what to do with it.
+            if gh is not None:
+                _take(gh, [s for s in plan.steps if s.before], places, taken=taken)
+            adopt_base = build_product(product_dir, answers, pin)
+            if adopt_base is not None:
+                # Now that the clone is here, the pull request's base is the
+                # repository's own default branch rather than `--branch`, and
+                # the body it is opened with is a file in the checkout.
+                plan.adopt_base = adopt_base
+                _write_adopt_body(product_dir, answers, adopt_base)
+                places = plan.places
 
-    places = plan.places
-    pin, stubs = build_intent(intent_dir, answers, host=host, ref=pinned)
-    # The one forge step the local half depends on: the clone a brownfield
-    # adoption branches from. Without a transport it stays on the checklist and
-    # `build_product` makes a standalone repository instead, which is the half a
-    # checkout can hold — the checklist step says what to do with it.
-    early = [step for step in plan.steps if step.before]
-    taken = _take(gh, early, places) if gh is not None else []
-    build_product(product_dir, answers, pin)
+            check = check_seed(intent_dir, host=host)
+            print("", file=stream)
+            print(check.report(), file=stream)
+            if not check.green:
+                staged = None
+                print(
+                    f"\nvellum: the seed this run built is not green, so nothing "
+                    f"was pushed. The checkouts are at {intent_dir} and "
+                    f"{product_dir}; fix them there, or delete them and re-run.",
+                    file=sys.stderr,
+                )
+                return 1
 
-    check = check_seed(intent_dir, host=host)
-    print("", file=stream)
-    print(check.report(), file=stream)
-    if not check.green:
-        print(
-            f"\nvellum: the seed this run built is not green, so nothing was "
-            f"pushed. The checkouts are at {intent_dir} and {product_dir}; fix "
-            f"them there, or delete them and re-run.",
-            file=sys.stderr,
-        )
-        return 1
+            # The seed passed both guards, so these checkouts are the operator's
+            # now: every command below names them, and so does the report on the
+            # way out of a failure.
+            staged = None
+            _perform(gh, plan, console, places=places, taken=taken)
+        except ProvisionError:
+            # A transport failure part way through. What was taken is real and
+            # nothing rolls it back, so the report is the whole value left: it
+            # says what exists on the forge and hands back every step from the
+            # failure onward as the operator's to finish.
+            if gh is not None:
+                print("", file=stream)
+                print(_interrupted(plan, taken), file=stream)
+            raise
+    finally:
+        if staged is not None:
+            shutil.rmtree(staged, ignore_errors=True)
 
-    later, remaining = _perform(gh, plan, answers, console, places=places)
-    taken += later
-    remaining = [step for step in remaining if step not in taken]
+    remaining = [step for step in plan.steps if step not in taken]
     print("", file=stream)
     print(_report(plan, answers, pin, stubs, taken, remaining,
                   intent_dir=intent_dir, product_dir=product_dir), file=stream)
@@ -1539,6 +1944,11 @@ class _Resolved:
     areas: list
     docs: list
     yes: bool
+    #: ``--into``. Read only by :func:`_docs_base`, which needs to know whether
+    #: the product checkout the survey sources belong to is one this run was
+    #: pointed at. Last and defaulted so the positional construction in
+    #: :func:`run` stays the conversation's own order.
+    into: str | None = None
 
 
 def _confirm(console: Console, yes: bool) -> None:
@@ -1551,7 +1961,14 @@ def _confirm(console: Console, yes: bool) -> None:
             "confirmed, and there is no terminal to confirm on. Pass --yes to "
             "accept it, or --plan to print it and stop."
         )
-    if console.ask("Proceed? [y/N]: ").strip().lower() not in ("y", "yes"):
+    try:
+        answer = console.ask("Proceed? [y/N]: ").strip().lower()
+    except EOFError:
+        answer = ""
+    if answer not in ("y", "yes"):
+        # Exit 2, not 0. Declining is "this command did not do the thing it was
+        # asked to do", and a script that reads 0 as "the installation is there"
+        # would be wrong — which is the same reason the no-TTY case above is a 2.
         raise ProvisionError("not confirmed; nothing was created.")
 
 
@@ -1581,79 +1998,93 @@ def _check_forge_names(gh: Gh, answers: Answers) -> None:
         )
 
 
+def _occupied(path: Path) -> bool:
+    """True when *path* is already something: a file, or a non-empty directory.
+
+    ``iterdir()`` on a path that is a *file* raises ``NotADirectoryError``, which
+    reaches the operator as a traceback rather than as the refusal this question
+    exists to make — and a file where a checkout should go is exactly the
+    situation the refusal is about.
+    """
+    if not path.exists():
+        return False
+    return not path.is_dir() or any(path.iterdir())
+
+
 def _check_directories(answers: Answers, intent_dir: Path, product_dir: Path) -> None:
     """The same refusal, one layer down: a directory that is already something.
 
     The local half has the same hazard as the forge half and the same one
     exception, so it makes the same call — otherwise ``--into`` over a populated
     directory would seed a spec tree on top of somebody's repository, which is
-    the failure the forge check exists to prevent.
+    the failure the forge check exists to prevent. The one exception, an
+    adoption pointed at a checkout that is already there, is not waved through:
+    it goes to :func:`_check_adoption`, which asks what a guest has to ask.
     """
-    if intent_dir.exists() and any(intent_dir.iterdir()):
+    if _occupied(intent_dir):
         raise ProvisionError(
             f"{intent_dir} already exists and is not empty. The intent checkout "
             f"is created here; provisioning does not write into a directory it "
             f"did not make."
         )
-    if product_dir.exists() and any(product_dir.iterdir()) and not answers.adopting:
+    if _occupied(product_dir) and not answers.adopting:
         raise ProvisionError(
             f"{product_dir} already exists and is not empty, and --shape "
             f"{answers.shape} creates the product repository. Use --shape "
             f"{BROWNFIELD} to adopt what is there."
         )
+    if answers.adopting and (product_dir / ".git").is_dir():
+        # Asked here as well as in `build_product`, and deliberately: this is
+        # the `--into`-over-a-real-checkout case, and asking now means an
+        # operator whose tree is dirty is told so BEFORE the plan is confirmed
+        # and before anything is built, rather than after an intent checkout
+        # already exists.
+        _check_adoption(product_dir, answers)
 
 
 def _take(gh: Gh, steps: Sequence[ForgeStep], places: dict[str, str], *,
-          values: dict[str, str | None] | None = None,
-          body: str | None = None) -> list[ForgeStep]:
-    """Run *steps* through the transport. Returns the ones it took.
+          taken: list[ForgeStep],
+          values: dict[str, str | None] | None = None) -> None:
+    """Run *steps* through the transport, appending each one taken to *taken*.
 
     A step is left untaken — and so lands on the checklist — when nothing
     automates it, or when the secret it carries was not supplied. Neither is
     silently skipped: both come back in the report as something to do.
+
+    *taken* is a list the caller owns rather than a return value, and that is
+    the whole point: a step that raises takes the run down with it, and a
+    caller that learned what had been done from a ``return`` would learn
+    nothing. What was created on the forge before the failure is real and
+    cannot be rolled back, so the caller has to be able to say so.
     """
     values = values or {}
-    taken: list[ForgeStep] = []
-    written: Path | None = None
-    try:
-        for step in steps:
-            if step.manual or not step.argv:
-                continue
-            secret = next((n for n in values if step.stdin and n in step.argv), None)
-            if secret is not None and not values[secret]:
-                continue
-            argv = [places.get(arg, arg) for arg in step.argv]
-            if "<adopt PR body>" in argv:
-                written = Path(tempfile.mkdtemp(prefix="vellum-init-pr-")) / "body.md"
-                written.write_text(body or "", encoding="utf-8")
-                argv = [str(written) if arg == "<adopt PR body>" else arg for arg in argv]
-            gh.run(argv, stdin=values[secret] if secret else None)
-            taken.append(step)
-    finally:
-        if written is not None:
-            shutil.rmtree(written.parent, ignore_errors=True)
-    return taken
+    for step in steps:
+        if step.manual or not step.argv:
+            continue
+        if step.secret and not values.get(step.secret):
+            continue
+        argv = [places.get(arg, arg) for arg in step.argv]
+        gh.run(argv, stdin=values.get(step.secret) if step.secret else None)
+        taken.append(step)
 
 
-def _perform(gh: Gh | None, plan: Plan, answers: Answers, console: Console, *,
-             places: dict[str, str]) -> tuple[list[ForgeStep], list[ForgeStep]]:
-    """Take the forge steps, or take none and hand every one of them back.
+def _perform(gh: Gh | None, plan: Plan, console: Console, *,
+             places: dict[str, str], taken: list[ForgeStep]) -> None:
+    """Take the forge steps, or take none and leave every one of them.
 
-    Returns ``(taken, remaining)``. The manual rung is not a different code
-    path: it is this function with ``gh`` None, so the checklist an operator
-    follows is the list :func:`forge_steps` built and the plan printed.
+    The manual rung is not a different code path: it is this function with
+    ``gh`` None, so the checklist an operator follows is the list
+    :func:`forge_steps` built and the plan printed. What is left over is always
+    ``plan.steps`` minus *taken*, computed by the caller from one rule.
     """
     if gh is None:
-        return [], list(plan.steps)
+        return
     values = {
         INTENT_SECRET: secret_for(INTENT_SECRET, console),
         PRODUCT_SECRET: secret_for(PRODUCT_SECRET, console),
     }
-    steps = [step for step in plan.steps if not step.before]
-    taken = _take(gh, steps, places, values=values, body=ADOPT_PR_BODY.format(
-        shape=answers.shape, intent_slug=answers.intent_slug, branch=answers.branch,
-    ))
-    return taken, [step for step in plan.steps if step not in taken]
+    _take(gh, [step for step in plan.steps if not step.before], places,
+          values=values, taken=taken)
 
 
 def _report(plan: Plan, answers: Answers, pin: str, stubs: list[str],
@@ -1689,14 +2120,7 @@ def _report(plan: Plan, answers: Answers, pin: str, stubs: list[str],
             f"Do these yourself, in order — {len(remaining)} step(s) this run did "
             f"not take:"
         )
-        for number, step in enumerate(remaining, start=1):
-            lines.append(f"  {number:>2}. {step.what}")
-            if step.argv:
-                lines.append(f"      {step.command(plan.places)}")
-            if step.stdin:
-                lines.append(f"      stdin: {step.stdin}")
-            if step.manual:
-                lines.append("      (no transport takes this one; it is yours)")
+        lines += _step_lines(remaining, plan.places)
         lines.append("")
         lines.append(
             f"  Then `vellum doctor {intent_dir}` verifies the whole: what a "
@@ -1741,7 +2165,8 @@ def run_provision(args, out=None) -> int:
 
 
 __all__ = [
-    "ADOPT_BRANCH", "Answers", "Console", "ForgeStep", "Gh", "Plan",
+    "ADOPT_BRANCH", "ADOPT_PR_RELPATH", "RESERVED_AREAS",
+    "Answers", "Console", "ForgeStep", "Gh", "Plan",
     "PRODUCT_SECRET", "INTENT_SECRET", "ProvisionError", "SHAPES",
     "VISIBILITIES", "build_plan", "check_seed", "detect_gh", "first_spec_commit",
     "forge_steps", "intent_seed", "product_seed", "requested", "resolve", "run",

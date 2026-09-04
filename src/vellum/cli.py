@@ -111,6 +111,7 @@ from vellum.lint import run as lint_run
 from vellum.mint import MintError, mint as mint_run
 from vellum.pin import PinError, advance as pin_advance
 from vellum.provision import SHAPES, VISIBILITIES, ProvisionError
+from vellum.seeds import SeedsMissing
 from vellum.provision import requested as provision_requested
 from vellum.provision import run_provision as provision_run
 from vellum.reconcile import DEFAULT_CORPUS_MATCH, DEFAULT_LEASE_MINUTES, TickError
@@ -961,8 +962,13 @@ def main(argv: list[str] | None = None) -> int:
     # broken chain link and a parked queue are all 1, and 1 is what a workflow
     # blocks a merge on; a mistyped `--role` reaching a caller as "this PR wrote
     # outside its trees" would be a red nobody can find the cause of.
+    # `SeedsMissing` belongs in this set for the same reason: an install whose
+    # wheel carries no harness skeleton cannot seed one, which is a command that
+    # could not answer rather than a finding about anybody's spec — and reaching
+    # a caller as a traceback would make it look like a crash in the seed.
     except (BoundaryError, ChainError, BudgetError, DependencyError, ExitDutyError,
-            InstallError, ProvisionError, TickError, ReleaseError) as exc:
+            InstallError, ProvisionError, SeedsMissing, TickError,
+            ReleaseError) as exc:
         print(f"vellum: {exc}", file=sys.stderr)
         return 2
     # A cut that cannot be made, a pointer that would move backwards, a shallow
