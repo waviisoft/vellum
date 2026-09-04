@@ -340,7 +340,16 @@ class DoctorOverAnInstalledCheckout(InstallCase):
         self.assertEqual(code, 1, out)
         self.assertIn("secrets-inherit", out)
 
-    def test_a_stub_passing_no_secret_is_a_finding(self):
+    def test_a_stub_passing_no_secret_is_not_a_finding(self):
+        """It was `no-secret` while the shipped workflows required the token.
+
+        They declare it `required: false` now and check the CLI out with the
+        caller's own `github.token` when nothing is passed, so a stub that omits
+        the key describes an installation that needs no token — not one whose
+        every run dies in its first step. Reporting it would be doctor calling a
+        correct configuration drift, which is the failure mode `on.push.branches`
+        already taught this command.
+        """
         checkout = self.install()
         stub = checkout / WORKFLOWS / "on-spec-merge.yml"
         text = stub.read_text(encoding="utf-8")
@@ -348,8 +357,64 @@ class DoctorOverAnInstalledCheckout(InstallCase):
         text = text.replace("    secrets:\n", "")
         stub.write_text(text, encoding="utf-8")
         code, out = run_cli(["doctor", str(checkout)])
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("no-secret", out)
+
+    def test_an_empty_secrets_block_is_not_a_finding_either(self):
+        """`secrets:` with nothing under it reads back as None, not as a dict.
+
+        The same installation as the test above, written the other way an
+        operator writes it. The remap loop runs over a mapping; a key that is
+        there and empty must not fall through it into some other finding.
+        """
+        checkout = self.install()
+        stub = checkout / WORKFLOWS / "harness-ci.yml"
+        stub.write_text(
+            stub.read_text(encoding="utf-8").replace(
+                "      VELLUM_TOKEN: ${{ secrets.VELLUM_TOKEN }}\n", ""
+            ),
+            encoding="utf-8",
+        )
+        code, out = run_cli(["doctor", str(checkout)])
+        self.assertEqual(code, 0, out)
+
+    def test_a_malformed_secrets_value_is_a_finding(self):
+        """`secrets:` that is neither `inherit` nor a mapping is reported.
+
+        `secrets: [VELLUM_TOKEN]` is how a stub looks when someone remembers
+        the name and forgets the shape. The forge refuses it at parse time, so
+        nothing leaks — but doctor's job is installed-matches-shipped, and a
+        stub the forge will not run is not that. Before this branch existed the
+        value fell through both arms and doctor said `ok`.
+        """
+        checkout = self.install()
+        stub = checkout / WORKFLOWS / "harness-ci.yml"
+        text = stub.read_text(encoding="utf-8")
+        text = text.replace("      VELLUM_TOKEN: ${{ secrets.VELLUM_TOKEN }}\n", "")
+        text = text.replace("    secrets:\n", "    secrets: [VELLUM_TOKEN]\n")
+        stub.write_text(text, encoding="utf-8")
+        code, out = run_cli(["doctor", str(checkout)])
         self.assertEqual(code, 1, out)
-        self.assertIn("no-secret", out)
+        self.assertIn("secrets-malformed", out)
+        self.assertIn("harness-ci.yml", out)
+
+    def test_a_stub_that_passes_no_secret_still_has_its_other_halves_checked(self):
+        """Dropping the secret must not drop the rest of the audit with it.
+
+        The `no-secret` branch is gone; the `uses:`, the ref and the caller half
+        are not, and a stub with no secret and a broken delegation is still a
+        finding.
+        """
+        checkout = self.install()
+        stub = checkout / WORKFLOWS / "spec-ci.yml"
+        text = stub.read_text(encoding="utf-8")
+        text = text.replace("      VELLUM_TOKEN: ${{ secrets.VELLUM_TOKEN }}\n", "")
+        text = text.replace("    secrets:\n", "")
+        text = text.replace('vellum-ref: "', 'vellum-ref: "not-the-')
+        stub.write_text(text, encoding="utf-8")
+        code, out = run_cli(["doctor", str(checkout)])
+        self.assertEqual(code, 1, out)
+        self.assertIn("ref-mismatch", out)
 
     def test_the_two_refs_coming_apart_is_a_finding(self):
         checkout = self.install(ref="v0.1.0")
@@ -705,6 +770,10 @@ class TheSecretIsPassedByNameAndByValue(InstallCase):
     audits — very possibly a wider one. "Passes each secret by name" is a claim
     about the value as much as the key, so doctor reads the referenced secret
     back out of the expression and compares it to the key it is passed as.
+
+    This survives the secret becoming optional, and the distinction is the whole
+    point of that change being a narrowing rather than a deletion: a stub is
+    free to pass NO token, and not free to pass the wrong one under this name.
     """
 
     def install(self) -> Path:
