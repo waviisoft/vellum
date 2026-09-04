@@ -32,7 +32,10 @@ under `.github/workflows/`.
 logic of each adapter workflow — `spec-ci`, `on-spec-merge`, `harness-ci` — as
 a `workflow_call` workflow under `.github/workflows/`, and an intent repo
 carries one caller stub per workflow naming it at a pinned ref. `vellum init`
-stamps the stubs; `vellum doctor` checks that what is installed is what ships.
+stamps the stubs; `vellum doctor` checks that what is installed is what ships;
+and `vellum upgrade` brings an installation's Vellum-owned files to a newer
+release as a reviewable pull request, rewriting only what
+`.vellum/install.yaml` names as Vellum's.
 Installing them **renames the required status checks** — a job calling a
 reusable workflow reports as `<calling job>/<called job name>` — so branch
 protection has to be updated with them. See
@@ -350,6 +353,18 @@ one that does.** Nothing in an intent checkout can see the product repo's tags;
 pass `--releases-from <a vellum checkout>` to have it read them. **This repo has
 cut no `v*` tag yet**, so install with `--ref main` until it does.
 
+**Every stamp writes `.vellum/install.yaml`**, the installation manifest: the
+release this installation was last brought to, and the repo-relative paths
+Vellum may rewrite on upgrade. Over an installation that has none, a stamp
+writes one whose owned set is **the caller stubs and nothing else** and says so
+— it ran in a checkout whose repos already existed and cannot know whether the
+rest of that tree came from a Vellum seed or from your own hand, and guessing
+would be inferring ownership from a directory. Add the seeded files you want
+upgrades to rewrite; leave it as it is and they stay yours. A stamp that *left a
+stub alone* refreshes nothing: the release line is a claim that the installation
+was brought to that ref, and a run that declined to rewrite a stub did not bring
+it anywhere.
+
 ### `vellum init --shape …` — provisioning a new installation
 
 Run where no installation exists, `init` creates the repo pair, seeds the tree
@@ -508,6 +523,66 @@ repository name the forge already has, unless it is the product repo of a
 brownfield shape; a local directory that already exists and is not empty, on the
 same rule; and any value that will not validate.
 
+### `vellum upgrade --to <release>`
+
+Rewrites the files this installation says Vellum owns, from a release's
+templates, and lands the whole change on a branch as a pull request — never as a
+push to the default branch. Run it in either side of the pair.
+
+```sh
+# what it would do, and none of it
+vellum upgrade . --to v0.3.0 --from ../vellum --plan
+
+# do it: rewrite, re-stamp, record, branch, commit
+vellum upgrade . --to v0.3.0 --from ../vellum
+
+# and open the pull request with `gh`, rather than printing the two commands
+vellum upgrade . --to v0.3.0 --from ../vellum --yes
+```
+
+**Ownership is data.** The set of files it rewrites is `.vellum/install.yaml`'s
+`owned:` list and nothing else. A file that is not on it is yours and no upgrade
+touches it; a path on it that the release ships no template for is reported and
+left exactly as it is, because Vellum deletes nothing on upgrade. Nothing here
+infers ownership from a file's contents or its history — a product that edited a
+seeded file once and reverted it would silently flip ownership under any such
+rule (`spec/decisions/2026-09-04-vellum-owned-files-and-upgrades.md`).
+
+**An owned file you have edited is a refusal, not a merge.** Every owned file is
+compared, before anything is written, against the template of the release the
+manifest *currently* names. One that differs exits 1 naming it, with no branch
+created and no file touched. Two ways out, and they are yours to choose between:
+put the file back as that release shipped it, and Vellum goes on owning it; or
+take its line out of `owned:`, and it is yours for good.
+
+**`--from` names a checkout of `waviisoft/vellum`, and nothing reaches a
+network.** Two refs are read out of it with `git show <ref>:<path>` — the one
+the manifest names and `--to` — so a CLI that carries only its own release's
+templates cannot answer both questions and says so (exit 2) rather than skipping
+the check it cannot make.
+
+**A missing owned file is skipped with a note, not recreated.** An installation
+that removed a stub removed it on purpose; `--restore` is how you ask for it
+back.
+
+`--plan` prints every owned file it would rewrite, which are unchanged between
+the two releases, and the **installation-shape changes** of the range crossed —
+configuration keys added (always with a default), files added, files retired,
+and changes to what the caller stubs pass. Those come from
+`src/vellum/seeds/CHANGES.yaml`, one entry per release, read out of the release
+being adopted so a release describes itself.
+
+Exit codes: 0 done or planned, 1 an owned file this installation has edited, 2
+it could not answer (no manifest, no reachable templates, a dirty tree, an
+upgrade branch that already exists).
+
+**One limitation, stated plainly.** The stubs are re-stamped by *this* CLI's
+renderer at the new ref, not copied out of the new release — a stub interpolates
+the host, the ref and the branch, none of which is a release's to choose. A
+release that changed what a stub *contains* delivers that when a CLI at that
+release stamps it (`vellum init --ref <new> --force`), which `doctor` asks for by
+comparing the caller half against what ships.
+
 ### `vellum doctor [<intent-checkout>]`
 
 Verifies installed-matches-shipped from the checkout alone: every shipped
@@ -554,9 +629,18 @@ vellum doctor .                                     # 1 on a finding, 0 when eve
 vellum doctor . --releases-from ../vellum           # + compare the pinned ref to the newest release
 ```
 
+A **missing or malformed `.vellum/install.yaml` is a finding.** Currency is a
+fact about the world that an installation can be behind without being broken; a
+missing manifest is a fact about the checkout — nothing in it says which files
+Vellum may rewrite, so `vellum upgrade` cannot run at all.
+
 **Ref currency is reported, never failed on**, mirroring the divergence posture
 (`spec/features/repo-topology.md`): an installation behind the newest release is
-divergence to summarise, not a broken install.
+divergence to summarise, not a broken install. Beside it, and on the same terms,
+doctor reports **the local CLI against the CLI the stubs install in CI**: the two
+drift apart by design — a stub's `vellum-ref` moves when somebody restamps, a
+local `pip install` moves when somebody installs — and what costs an afternoon is
+not knowing they had.
 
 **What a checkout cannot know, doctor says it cannot check** rather than passing
 over — whether the `VELLUM_TOKEN` secret is set, and whether the forge allows
