@@ -237,6 +237,34 @@ def make_tree(root: Path, blocks: dict[str, str]) -> Path:
     return tree
 
 
+def make_raw_tree(root: Path, bodies: dict[str, str]) -> Path:
+    """Like ``make_tree``, but each value is the file's whole body verbatim.
+
+    ``make_tree`` drops its blocks inside a ``gherkin`` fence the helper
+    writes, which is right when the subject is the Gherkin. It cannot express
+    a test whose subject is the *markdown* — how many fences a file has, what
+    their info strings say, which lines they cover. Frontmatter is still
+    supplied, so a tree built here is schema-clean and link-clean and a test
+    can assert its findings exactly.
+    """
+    tree = root / "spec"
+    (tree / "features").mkdir(parents=True)
+    (tree / "index.md").write_text(
+        INDEX.replace(
+            "features/auth.md",
+            "\n".join(f"- features/{name}.md" for name in bodies),
+        ),
+        encoding="utf-8",
+    )
+    for name, body in bodies.items():
+        (tree / "features" / f"{name}.md").write_text(
+            f"---\nid: {name}\ntitle: {name}\nsince: spec-v1\n---\n\n"
+            f"# {name}\n\n{body}\n",
+            encoding="utf-8",
+        )
+    return tree
+
+
 def git(repo: Path, *args: str) -> str:
     proc = subprocess.run(
         [

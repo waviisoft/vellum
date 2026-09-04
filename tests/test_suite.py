@@ -13,6 +13,7 @@ from support import (
     intent_checkout,
     intent_spec_tree,
     make_spec_repo,
+    make_raw_tree,
     make_tree,
     pinned_commit,
     pinned_gherkin_file_count,
@@ -206,7 +207,7 @@ class TestUnparseableBlocksAreRefused(unittest.TestCase):
         return next(
             f
             for f in find_fences(text.split("\n"))
-            if f.info == "gherkin" and "Unreadable" in f.body
+            if f.language == "gherkin" and "Unreadable" in f.body
         )
 
     def test_extract_raises_naming_the_file_and_the_block(self):
@@ -362,7 +363,7 @@ class TestRuleNestedScenariosAreRefused(unittest.TestCase):
         block = next(
             f.body
             for f in find_fences(source.read_text(encoding="utf-8").split("\n"))
-            if f.info == "gherkin"
+            if f.language == "gherkin"
         )
         with tempfile.TemporaryDirectory() as tmp:
             ids = {e.id for e in extract(make_tree(Path(tmp), {"prose": block})).entries}
@@ -477,6 +478,97 @@ class TestHistoryStillToleratesABrokenBlock(unittest.TestCase):
             self.assertEqual([e.id for e in suite.entries], ["login-good-password"])
             self.assertEqual(suite.entries[0].version, good)
             self.assertFalse(suite.entries[0].pending)
+
+
+class TestFenceInfoStrings(unittest.TestCase):
+    """A fence's language is its info string's first word (waviisoft/vellum#10).
+
+    The last "exit 0 while omitting a scenario" hole, and it was reached from
+    the markdown side rather than the Gherkin side: a two-word info string was
+    not recognised as opening a fence, so the block's own closing line opened a
+    phantom one that ran to the *next* block's opener. Two gherkin blocks
+    became one language-less fence, extraction found nothing to collect, and
+    exited 0 — with lint silent for the same reason, since both read the one
+    ``SpecFile.fences``.
+    """
+
+    REPRO = (
+        "```gherkin title=demo\n"
+        "Feature: First\n"
+        "  @id:attributed-fence-first\n"
+        "  Scenario: The first one\n"
+        "    Given a thing\n"
+        "    Then it worked\n"
+        "```\n"
+        "\n"
+        "Prose between the blocks.\n"
+        "\n"
+        "```gherkin\n"
+        "Feature: Second\n"
+        "  @id:attributed-fence-second\n"
+        "  Scenario: The second one\n"
+        "    Given another thing\n"
+        "    Then it worked\n"
+        "```"
+    )
+
+    def ids_from(self, bodies):
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = make_raw_tree(Path(tmp), bodies)
+            return [sc["id"] for sc in to_dict(extract(tree))["scenarios"]]
+
+    def test_the_repro_extracts_both_scenarios(self):
+        self.assertEqual(
+            self.ids_from({"demo": self.REPRO}),
+            ["attributed-fence-first", "attributed-fence-second"],
+        )
+
+    def test_a_non_gherkin_fence_with_attributes_is_skipped_without_desync(self):
+        # `python foo=bar` contributes nothing and must cost nothing: the
+        # gherkin block below it used to be swallowed by the phantom fence its
+        # closing line opened.
+        body = (
+            "```python foo=bar\n"
+            "print('not gherkin')\n"
+            "```\n"
+            "\n"
+            "```gherkin\n"
+            "Feature: Still visible\n"
+            "  @id:after-an-attributed-python-fence\n"
+            "  Scenario: Still extracted\n"
+            "    Given a thing\n"
+            "    Then it worked\n"
+            "```"
+        )
+        self.assertEqual(
+            self.ids_from({"demo": body}), ["after-an-attributed-python-fence"]
+        )
+
+    def test_a_dropping_construct_in_an_attributed_fence_still_refuses(self):
+        # The reason the desync mattered, stated as the invariant it broke:
+        # extraction refuses any scenario-dropping construct. A fence nobody
+        # parsed could not be refused, so the strictest rule in the CLI had a
+        # markdown-shaped way around it — write `title=` on the fence and a
+        # `Rule:` inside it, and the suite comes back short at exit 0.
+        body = (
+            "```gherkin title=demo\n"
+            "Feature: Smuggled\n"
+            "  Rule: A rule holding scenarios\n"
+            "    @id:nested-under-a-rule\n"
+            "    Scenario: Nobody sees me\n"
+            "      Given a thing\n"
+            "      Then it worked\n"
+            "```"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = make_raw_tree(Path(tmp), {"demo": body})
+            with self.assertRaises(DroppedScenarios) as caught:
+                extract(tree)
+            self.assertEqual([e.code for e in caught.exception.errors], ["GH010"])
+            code, out, err = run_cli_streams(["suite", "extract", str(tree), "-o", "-"])
+            self.assertEqual(code, 1)
+            self.assertEqual(out, "")
+            self.assertIn("GH010", err)
 
 
 class TestFingerprint(unittest.TestCase):

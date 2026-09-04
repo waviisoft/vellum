@@ -58,12 +58,15 @@ from vellum.ledger import (
     LedgerError,
     certification_authorizes,
     certify as certify_item,
+    clean_run_reference,
+    credential_free_run,
     find_item,
     find_record,
     load,
     parse_certified_sha,
     parse_version,
 )
+from vellum.text import one_line
 
 
 def _ledger(checkout: str | Path, ledger_dir: str | Path | None) -> Path:
@@ -100,11 +103,18 @@ class Authorization:
             f"  record  {self.record.name}",
         ]
         if isinstance(self.certification, dict):
+            # Every field here was read off disk and is echoed to a job log and,
+            # piped onward, a step summary. `one_line` keeps a value carrying a
+            # newline from starting a line of its own, and `credential_free_run`
+            # strips a run reference on the way *out* as well as on the way in:
+            # a record written before that rule, or edited by hand, still holds
+            # whatever it holds, and printing it is the second publication.
+            recorded = self.certification
             lines.append(
-                f"  recorded  sha {str(self.certification.get('sha') or '-')[:12]}"
-                f"  result {self.certification.get('result') or '-'}"
-                f"  at {self.certification.get('at') or '-'}"
-                f"  run {self.certification.get('run') or '-'}"
+                f"  recorded  sha {one_line(recorded.get('sha') or '-')[:12]}"
+                f"  result {one_line(recorded.get('result') or '-')}"
+                f"  at {one_line(recorded.get('at') or '-')}"
+                f"  run {one_line(credential_free_run(recorded.get('run')) or '-')}"
             )
         else:
             lines.append("  recorded  (none)")
@@ -186,8 +196,32 @@ def run_record(
     """
     stream = out if out is not None else sys.stdout
     ledger = _ledger(checkout, ledger_dir)
+    # Normalised once, here, and echoed as stored. Echoing the caller's own
+    # casing back reads as confirmation that what they typed is what the record
+    # now holds, and the two are not the same string.
+    certified = parse_certified_sha(sha)
     path = certify_item(
-        ledger, parse_version(version), issue, sha, result, run=run, at=at
+        ledger, parse_version(version), issue, certified, result, run=run, at=at
     )
-    print(f"{path}: work item {issue} certified {result} at {sha[:12]}", file=stream)
+    print(
+        f"{path}: work item {issue} certified {result} at {certified[:12]}",
+        file=stream,
+    )
+    stored, removed = clean_run_reference(run)
+    if removed:
+        # Said out loud rather than done quietly: the record now holds
+        # something other than what was typed, and a reader comparing the two
+        # deserves to be told why rather than left to suspect a typo.
+        note = (
+            f"vellum: --run dropped its {' and '.join(removed)}; it is stored "
+            f"and printed as {stored!r}. A run reference is committed to the "
+            f"intent repo and echoed by every `certify check`, so it carries "
+            f"no credential."
+        )
+        if "userinfo" in removed:
+            # The half that is not housekeeping. Dropping it here undoes
+            # nothing: the value has already been through a shell history and a
+            # process table by the time this command sees it.
+            note += " Rotate the credential you passed."
+        print(note, file=stream)
     return 0

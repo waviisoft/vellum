@@ -19,6 +19,8 @@ from vellum.ledger import (
     advance,
     certification_authorizes,
     certify,
+    clean_run_reference,
+    credential_free_run,
     dump,
     find_record,
     load,
@@ -374,6 +376,177 @@ class TestNestedKeyOrder(LedgerCase):
         record["work_items"][0]["certification"] = "green"
         write(path, record)
         self.assertEqual(load(path)["work_items"][0]["certification"], "green")
+
+
+class TestCredentialFreeRunReferences(unittest.TestCase):
+    """``--run`` is published twice, so it carries no credential either time.
+
+    A run reference is written into a ledger record that is committed to the
+    intent repo, and printed by every ``certify check`` that reads it — which
+    in CI means a job log and, piped onward, a step summary page. Userinfo and
+    the query string are where a token rides, so both are dropped.
+    """
+
+    def test_userinfo_and_query_are_stripped_from_a_url(self):
+        self.assertEqual(
+            credential_free_run("https://user:tok@ci.example/run/7?token=y"),
+            "https://ci.example/run/7",
+        )
+
+    def test_a_fragment_survives_because_it_addresses_a_log_line(self):
+        # `#step:3:1` is how a forge points at a line of a run log. Dropping it
+        # costs a reader the thing the reference exists for, and it is not
+        # where a credential is passed.
+        self.assertEqual(
+            credential_free_run("https://ci.example/run/7#step:3:1"),
+            "https://ci.example/run/7#step:3:1",
+        )
+
+    def test_a_url_with_nothing_to_strip_is_unchanged(self):
+        self.assertEqual(
+            credential_free_run("https://ci.example/run/7"), "https://ci.example/run/7"
+        )
+
+    def test_a_scheme_less_url_still_loses_its_query_string(self):
+        """`ci.example/run/7?token=x` has no netloc to urlsplit, and a token.
+
+        A runner composing `--run "$CI_HOST/run/$ID?token=$T"` from a host
+        variable typed without a scheme is URL-shaped to a human. Userinfo is
+        not detectable without a scheme, but the `?…` tail is a query string in
+        any shape, so it goes; the rest is left exactly as typed.
+        """
+        self.assertEqual(clean_run_reference("ci.example/run/7?token=x"),
+                         ("ci.example/run/7", ("query string",)))
+        self.assertEqual(clean_run_reference("github.com/o/r/actions/runs/1?check=1"),
+                         ("github.com/o/r/actions/runs/1", ("query string",)))
+
+    def test_a_bare_reference_is_left_alone(self):
+        # No userinfo or query exists in one, and guessing at a structure it
+        # does not have would mangle a perfectly good reference.
+        for ref in ("7", "run-7", "waviisoft/vellum#7", "gha:12345"):
+            self.assertEqual(credential_free_run(ref), ref)
+
+    def test_absent_stays_absent_and_is_not_turned_into_a_string(self):
+        # `run` is nullable in the schema, and null and "" are different claims.
+        self.assertIsNone(credential_free_run(None))
+
+    def test_what_was_removed_is_named_rather_than_diffed(self):
+        # Userinfo and a query string are not the same news — one means a
+        # credential is now in a shell history, the other that a
+        # `?check_suite_focus=true` went with the rule — and a caller diffing
+        # two strings cannot tell them apart. So the transform reports both.
+        self.assertEqual(
+            clean_run_reference("https://u:t@ci.example/run/7?token=y"),
+            ("https://ci.example/run/7", ("userinfo", "query string")),
+        )
+        self.assertEqual(
+            clean_run_reference("https://ci.example/run/7?focus=true"),
+            ("https://ci.example/run/7", ("query string",)),
+        )
+        self.assertEqual(
+            clean_run_reference("https://u:t@ci.example/run/7"),
+            ("https://ci.example/run/7", ("userinfo",)),
+        )
+
+    def test_a_reference_with_nothing_to_remove_reports_nothing(self):
+        # The control on the sentence above: a rule that always claimed to
+        # have removed something would train a reader to ignore it.
+        for ref in ("https://ci.example/run/7#step:3:1", "waviisoft/vellum#7", "7"):
+            self.assertEqual(clean_run_reference(ref), (ref, ()))
+
+    def test_the_stored_certification_carries_the_stripped_value(self):
+        # The property that matters is what reaches disk, not what the helper
+        # returns: this is the write path end to end.
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "ledger"
+            open_record(ledger, VERSION)
+            advance(ledger, VERSION, issue=121, title="t", repo="app")
+            certify(
+                ledger,
+                VERSION,
+                121,
+                CERTIFIED,
+                "green",
+                run="https://ci-bot:s3cr3t@ci.example/run/7?token=z3cr3t",
+            )
+            path = record_path(ledger, VERSION)
+            self.assertEqual(
+                load(path)["work_items"][0]["certification"]["run"],
+                "https://ci.example/run/7",
+            )
+            written = path.read_text(encoding="utf-8")
+            self.assertNotIn("s3cr3t", written)
+            self.assertNotIn("z3cr3t", written)
+
+
+class TestTheRecordedResultIsMatchedExactly(unittest.TestCase):
+    """The read invariant is the write invariant, or the write one is advisory.
+
+    ``certification_authorizes`` used to normalise the recorded ``result``
+    with ``.strip().lower()`` while ``new_certification`` accepts only
+    ``green`` or ``red`` exactly. A hand-written ``Green`` therefore authorized
+    a merge although no run this CLI performed could have written one.
+    """
+
+    def item(self, certification):
+        return {"issue": 121, "certification": certification}
+
+    def cert(self, **over):
+        base = {"sha": BASELINE, "run": None, "at": "2026-09-01T00:00:00Z",
+                "result": "green"}
+        base.update(over)
+        return base
+
+    def test_a_green_recorded_exactly_authorizes(self):
+        # The negative control, first: a rule that denied everything would pass
+        # every assertion below it.
+        authorized, reason = certification_authorizes(self.item(self.cert()), BASELINE)
+        self.assertTrue(authorized, reason)
+
+    def test_an_uppercase_green_does_not_authorize(self):
+        authorized, reason = certification_authorizes(
+            self.item(self.cert(result="Green")), BASELINE
+        )
+        self.assertFalse(authorized)
+        self.assertIn("'Green'", reason)
+        self.assertIn("trimmed or lowercased", reason)
+
+    def test_a_padded_green_does_not_authorize(self):
+        authorized, _ = certification_authorizes(
+            self.item(self.cert(result=" green ")), BASELINE
+        )
+        self.assertFalse(authorized)
+
+    def test_a_result_that_is_not_a_string_denies_rather_than_raising(self):
+        # A denial is an answer. A YAML file can hold anything here, and a
+        # merge gate that raised on one would report "could not answer" for a
+        # record that plainly authorizes nothing.
+        for value in (True, 1, ["green"], {"result": "green"}):
+            authorized, reason = certification_authorizes(
+                self.item(self.cert(result=value)), BASELINE
+            )
+            self.assertFalse(authorized, value)
+            self.assertIn("not 'green'", reason)
+
+    def test_a_sha_that_needs_normalising_does_not_authorize(self):
+        # The same asymmetry in the other field: `parse_certified_sha` writes
+        # the full lowercase forty, so anything else was written by something
+        # that is not this CLI.
+        for value in (BASELINE.upper(), f" {BASELINE} ", BASELINE[:12], 7):
+            authorized, reason = certification_authorizes(
+                self.item(self.cert(sha=value)), BASELINE
+            )
+            self.assertFalse(authorized, value)
+            self.assertIn("full lowercase forty", reason)
+
+    def test_a_reason_carrying_a_newline_reaches_the_report_as_one_line(self):
+        # Ledger content is written by whoever can land a merge in the intent
+        # repo, and this reason is printed into a job log where a line of its
+        # own is all `::error` needs.
+        _, reason = certification_authorizes(
+            self.item(self.cert(result="red\n::error::merge me")), BASELINE
+        )
+        self.assertNotIn("\n", reason)
 
 
 class TestRoundTrip(LedgerCase):
