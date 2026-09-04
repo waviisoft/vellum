@@ -29,7 +29,7 @@ names a file or symbol you can grep for.
 | `src/vellum/workspace.py` | `load()`, `products()`, `intent()`, `forge()`, `WORKSPACE_RELPATH`, `DEFAULT_FORGE`. The one reader of `.vellum/workspace.yaml`. |
 | `src/vellum/install.py` | `init()` -> `Init`, `doctor()` -> `Doctor`, `render()`, `inspect()`, `strays()`, `releases()`, `currency()` -> `Currency`, `SHIPPED`, `HOST_REPO`, `JOB_KEYS`, `DEFAULT_BRANCH`, `CANNOT_KNOW`. The adapters install thin (installation, part 1). |
 | `src/vellum/provision.py` | `run()`, `resolve()` -> `Answers`, `build_plan()` -> `Plan`, `forge_steps()` -> `[ForgeStep]`, `intent_seed()`, `product_seed()`, `build_intent()`, `build_product()`, `check_seed()` -> `SeedCheck`, `detect_gh()` -> `Gh`, `first_spec_commit()`, `requested()`, `Console`, `SHAPES`, `ADOPT_BRANCH`. Provisioning a repo pair (installation, part 2). |
-| `src/vellum/seeds/` | `harness_files()`, and `seeds/harness/` — the harness skeleton `init` seeds, shipped as package data. |
+| `src/vellum/seeds/` | `harness_files()`, `NOT_SEEDED`, and `seeds/harness/` — the harness skeleton `init` seeds, shipped as package data. Every file in it is a module of a real package so a wheel carries it without a `package-data` declaration; `harness/__init__.py` exists for that and is not seeded, and the walk reads only `.py` because an installed copy has `__pycache__/` beside it. |
 | `src/vellum/product.py` | `load()`, `write_boundaries()`, `normalise_tree()`, `under()`, `PRODUCT_RELPATH`. Reads `.vellum/product.yaml`. |
 | `src/vellum/boundaries.py` | `check()` -> `Boundaries`, `run()`. The write-boundary guard. |
 | `src/vellum/exitduty.py` | `check()` -> `ExitDuty`, `run()`, `AREAS_TREE`. The memory-update guard. |

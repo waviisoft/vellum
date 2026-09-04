@@ -18,12 +18,3 @@ vellum = "vellum.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-# The harness skeleton `vellum init` seeds into a new installation. Package
-# data, not repository paths: an installed CLI is a wheel, and a command that
-# read `harness/` off disk would work from a development checkout and fail from
-# a pip install — the same argument `vellum.install` makes about the caller
-# stubs. Explicit depths rather than `**` so the entry works on every setuptools
-# the floor in `requires-python` admits.
-[tool.setuptools.package-data]
-"vellum.seeds" = ["harness/*", "harness/*/*"]

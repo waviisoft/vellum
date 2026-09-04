@@ -19,8 +19,9 @@ Five scenarios: `@id:init-plan-creates-nothing`, `@id:greenfield-seed-is-green`,
 | `src/vellum/provision.py` | The whole of part 2: the conversation, the plan, the seed templates, the local half, the `gh` transport and the manual rung. |
 | `src/vellum/seeds/` | `harness_files()`, and `seeds/harness/` — the harness skeleton, shipped as package data. |
 | `src/vellum/cli.py` | Thirteen provisioning arguments on `init`, and the two-line fork in `main()`. |
-| `tests/test_init_provision.py` | 54 tests driving the real command against local directories and a fake `gh`. |
-| `pyproject.toml` | One `[tool.setuptools.package-data]` entry, so the seeds ship in a wheel. |
+| `tests/test_init_provision.py` | 56 tests driving the real command against local directories and a fake `gh`. |
+
+`pyproject.toml` was **not** touched: see judgment call 3.
 
 `src/vellum/install.py` was **not touched**. Part 1's behavior is byte for byte
 what it was, and `tests/test_install.py` is unchanged and green.
@@ -88,13 +89,19 @@ not be deterministic.
    shape. `executors` and `roles` are seeded **empty**, not populated: a seeded
    executor would be a claim about infrastructure a new installation does not
    have.
-3. **`pyproject.toml` is outside the implementer's declared trees** and one line
-   was added to it. Without `[tool.setuptools.package-data]` the wheel ships
-   every seed `.py` by setuptools heuristics and silently drops
-   `harness/README.md` — verified by building the wheel both ways. A declared
-   crossing rather than a design contortion; the alternative was to delete the
-   seeded README or make the skeleton importable packages inside `vellum`, and
-   both are worse.
+3. **How the seed ships, without touching `pyproject.toml`.** Package data is
+   carried by *declaration*, and the obvious declaration —
+   `[tool.setuptools.package-data]` — lives in `pyproject.toml`, which is
+   outside the implementer's write boundary. Built both ways and compared: with
+   no declaration, setuptools 79 shipped every seed `.py` by its own defaults
+   and **silently dropped `harness/README.md`**, which is a wheel that
+   provisions an installation missing a file with nothing to say so. The
+   resolution needs no crossing: `src/vellum/seeds/harness/__init__.py` makes
+   the skeleton an ordinary package, so every builder ships its modules because
+   it must, and `harness/README.md` became a template in `provision.py` — which
+   it wanted to be anyway, since it names the product. `harness/__init__.py` is
+   packaging, not seed, and `seeds.NOT_SEEDED` keeps it out of an
+   installation's `harness/`.
 4. **`--area` is repeatable in every shape.** The spec names "one feature area"
    for greenfield and "every area the operator names" for brownfield; one flag
    with one meaning is simpler than a flag that is singular in one shape.
@@ -125,6 +132,15 @@ its timestamp, so the prompt-vs-flag equivalence test blanks 40-hex shas before
 comparing trees. Without that it passes or fails on whether the two runs
 straddled a second boundary — which is how it was first written, and it was
 flaky one run in three.
+
+**An installed `seeds/harness/` holds `__pycache__/`.** Installing this package
+byte-compiles it, so the walk in `seeds.harness_files()` met a `.pyc`, read it
+as UTF-8 and took the whole command down — from a wheel, and never from the
+development checkout the tests run against. It now skips the directory *and*
+reads only `.py`, and `test_bytecode_beside_the_seed_is_not_seeded_as_a_file`
+compiles the package to prove it. The general shape: a defect that only exists
+in the installed artifact needs the installed artifact to find it, so this wave
+provisioned from a built wheel in a throwaway venv as well as from `-e .`.
 
 **A `PATH` cleanup must capture the value before the assignment.** The same
 test file registered its restore from the value it had just written, which put

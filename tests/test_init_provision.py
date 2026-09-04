@@ -290,6 +290,35 @@ class AGreenfieldSeedIsGreen(ProvisionCase):
         self.assertEqual([s["id"] for s in suite["scenarios"]], ["billing-placeholder"])
         self.assertFalse(suite["scenarios"][0]["pending"])
 
+    def test_bytecode_beside_the_seed_is_not_seeded_as_a_file(self):
+        # Installing this package byte-compiles it, so an INSTALLED
+        # `vellum/seeds/harness/` holds `__pycache__/` beside every module. The
+        # walk read a `.pyc` as UTF-8 and took the whole command down — from a
+        # wheel, and never from the development checkout the rest of these tests
+        # run against, which is exactly why it needs its own test.
+        import compileall
+
+        from vellum import seeds
+
+        package = Path(seeds.__file__).parent / seeds.HARNESS
+        caches = list(package.rglob(seeds.BYTECODE))
+        compileall.compile_dir(str(package), quiet=2)
+        self.addCleanup(lambda: [shutil.rmtree(c, ignore_errors=True)
+                                 for c in package.rglob(seeds.BYTECODE)
+                                 if c not in caches])
+        self.assertTrue(list(package.rglob("*.pyc")), "nothing was compiled")
+        self.assertTrue(
+            all(name.endswith(".py") for name in seeds.harness_files()),
+            sorted(seeds.harness_files()),
+        )
+
+    def test_the_seeded_harness_readme_names_the_product(self):
+        # Rendered from a template rather than copied, because it names the
+        # product — the same line `vellum.install` draws between a stub it
+        # generates and a file it copies.
+        readme = (self.intent / "harness" / "README.md").read_text(encoding="utf-8")
+        self.assertIn("Acme", readme)
+
     def test_the_harness_skeleton_is_importable_and_names_no_deployment(self):
         # Shipped as package data; a packaging change that dropped it would
         # leave a seed whose harness cannot start, and nothing else would say so.
@@ -307,16 +336,18 @@ class AGreenfieldSeedIsGreen(ProvisionCase):
         self.assertTrue((self.product / ".vellum" / "memory" / "map.md").is_file())
 
     def test_the_shipped_skeleton_is_exactly_this_set_of_files(self):
-        # The seed comes out of package data, and `pyproject.toml`'s
-        # `[tool.setuptools.package-data]` entry is what ships it. Without that
-        # entry setuptools ships the `.py` files by heuristic and silently drops
-        # `harness/README.md` — a wheel that provisions a seed missing a file,
-        # with nothing else to say so. Naming the set here is what turns that
-        # into a failing test rather than a surprise on somebody's first install.
+        # The seed comes out of package data, and a wheel carries it only
+        # because every file under `seeds/harness/` is a module of an ordinary
+        # package (`seeds/harness/__init__.py` has the argument). Naming the set
+        # here turns a packaging change that dropped one into a failing test
+        # rather than a surprise on somebody's first install — and pins the one
+        # file that is packaging rather than seed, `harness/__init__.py`, as
+        # NOT seeded.
         from vellum import seeds
 
+        self.assertNotIn("harness/__init__.py", seeds.harness_files())
+        self.assertFalse((self.intent / "harness" / "__init__.py").exists())
         self.assertEqual(sorted(seeds.harness_files()), [
-            "harness/README.md",
             "harness/run.py",
             "harness/steps/__init__.py",
             "harness/support/__init__.py",

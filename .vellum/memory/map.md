@@ -8,7 +8,7 @@ notes live in `.vellum/memory/areas/`; wave worklogs in `.vellum/memory/waves/`.
 | Path | What |
 |---|---|
 | `src/vellum/` | The CLI. One module per concern; see `.vellum/memory/areas/cli.md`. |
-| `src/vellum/seeds/` | The harness skeleton `vellum init --shape …` seeds into a new installation, shipped as **package data** (`pyproject.toml`, `[tool.setuptools.package-data]`). Package data rather than repository paths for the reason the caller stubs are generated rather than copied: an installed CLI is a wheel. |
+| `src/vellum/seeds/` | The harness skeleton `vellum init --shape …` seeds into a new installation. Package data rather than repository paths, for the reason the caller stubs are generated rather than copied: an installed CLI is a wheel. Every file in it is a module of a real package, which is what makes a wheel carry it with no `[tool.setuptools.package-data]` declaration — `seeds/harness/__init__.py` has the argument. |
 | `tests/` | `unittest` suite plus fixture spec trees under `tests/fixtures/`. |
 | `.github/workflows/` | `ci.yml` tests this repo; `spec-ci.yml`, `on-spec-merge.yml` and `harness-ci.yml` are **reusable** (`workflow_call`) workflows an installation's intent repo calls, and never run here. See `.vellum/memory/areas/adapters-github.md`. |
 | `adapters/github/` | The **caller stubs** an intent repo carries, rendered by `vellum init` from `vellum.install.SHIPPED`. See `.vellum/memory/areas/adapters-github.md`. |
