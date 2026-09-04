@@ -1700,23 +1700,23 @@ def _interrupted(plan: Plan, taken: list[ForgeStep]) -> str:
     lines = [
         f"vellum init — interrupted ({plan.answers.shape})",
         "",
-        "A forge step failed and the run stopped there. Nothing below is rolled "
-        "back:",
+        "The run stopped part way through the forge steps. Nothing below is "
+        "rolled back:",
         "what was taken is real, and re-running this command over it would "
         "refuse at",
         "the name the forge now has.",
         "",
     ]
     if taken:
-        lines.append(f"Forge steps taken before the failure ({plan.transport}):")
+        lines.append(f"Forge steps taken before it stopped ({plan.transport}):")
         lines += [f"  {number:>2}. {step.what}"
                   for number, step in enumerate(taken, start=1)]
     else:
         lines.append("Forge steps taken: none. Nothing was created on a forge.")
     lines.append("")
     lines.append(
-        f"Left to you — {len(remaining)} step(s), starting with the one that "
-        f"failed:"
+        f"Left to you — {len(remaining)} step(s), starting with the one that did "
+        f"not go through:"
     )
     lines += _step_lines(remaining, plan.places)
     lines += [
@@ -1815,9 +1815,10 @@ def run(
     # command that leaves an empty directory behind has created something, and a
     # plan whose paths were a fresh mkdtemp each run would not be deterministic
     # either. Until then the plan names where the checkouts will be.
-    # Resolved, so every path this run prints and every path it hands `git -C`
-    # is the same absolute one. A relative `--into` printed in a checklist an
-    # operator reads in another directory is a checklist that does not work.
+    #
+    # `--into` is resolved, so every path this run prints and every path it hands
+    # `git -C` is the same absolute one. A relative `--into` in a checklist an
+    # operator reads from another directory is a checklist that does not work.
     root = Path(into).resolve() if into else None
     base = root if root is not None else Path(STAGING)
     intent_dir = base / answers.intent_repo
@@ -1851,11 +1852,13 @@ def run(
 
     _confirm(console, yes)
 
-    #: The staging directory, while this run is still the only thing that would
-    #: miss it. Set to None the moment the checkouts become something the
-    #: operator is told to go and use — a seed that failed its checks, or a
-    #: green one whose forge steps have started — because from then on deleting
-    #: them would destroy the run's own report.
+    # The staging directory, for as long as this run is the only thing that
+    # would miss it: a failure before the seed is built leaves nothing anyone
+    # wants. `staged` goes to None the moment the checkouts become something the
+    # operator is told to go and use — a seed that failed its checks, or a green
+    # one whose forge steps have started — because from then on the paths in
+    # them are the paths the report tells an operator to run commands against,
+    # and deleting them would take the run's own answer with them.
     staged: Path | None = None
     if root is None:
         root = Path(tempfile.mkdtemp(prefix="vellum-init-"))

@@ -1206,7 +1206,7 @@ class AForgeFailureMidRunStillReportsWhatItDid(ProvisionCase):
         self.assertIn("repo create", self.err)
 
     def test_the_report_names_what_was_taken(self):
-        taken = self.out.split("Forge steps taken before the failure")[1]
+        taken = self.out.split("Forge steps taken before it stopped")[1]
         self.assertIn("create the intent repository waviisoft/acme-intent",
                       taken.split("Left to you")[0])
 
