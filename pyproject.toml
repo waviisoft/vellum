@@ -1,5 +1,11 @@
 [build-system]
-requires = ["setuptools>=61"]
+# `setuptools>=77` rather than `>=61`, because `project.license` below is the
+# PEP 639 SPDX expression (a plain string) rather than the old `{text = ...}`
+# table, and `project.license-files` is PEP 639 too. Both are errors to a
+# setuptools that predates 77, so the floor has to say what the metadata needs;
+# a build isolated on an older setuptools would otherwise fail at metadata
+# generation rather than at resolution, which is the harder failure to read.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,6 +13,14 @@ name = "vellum"
 version = "0.1.0"
 description = "Spec-driven product engineering tooling: lint, suite extraction, ledger."
 readme = "README.md"
+# SPDX, per PEP 639. No `License :: OSI Approved :: MIT License` classifier
+# accompanies it: setuptools>=77 REFUSES a licence classifier beside an SPDX
+# expression, and this table declares no classifiers at all.
+license = "MIT"
+# Named rather than left to the backend's default glob, so the file that has to
+# travel in the sdist and the wheel is a stated dependency of the build instead
+# of a filename that happens to match a pattern.
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
     "PyYAML>=6.0,<7",
