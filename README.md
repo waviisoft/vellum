@@ -256,6 +256,12 @@ non-version is the failure this command exists to prevent.
 
 ### `vellum init [<intent-checkout>]`
 
+Two commands behind one name, and **which one a run is, is decided by the
+command line alone**: with any of the provisioning arguments below it
+provisions a repo pair; with none of them it is the stub-stamping command
+described here. Nothing is ever inferred from the directory — the shape of an
+installation is the operator's to choose.
+
 Stamps the forge's caller stubs into an intent checkout whose repos already
 exist. Reads the intent slug, the products and the forge from
 `.vellum/workspace.yaml`, and writes one stub per shipped workflow into
@@ -284,6 +290,122 @@ file, a forge it has no stubs for).
 one that does.** Nothing in an intent checkout can see the product repo's tags;
 pass `--releases-from <a vellum checkout>` to have it read them. **This repo has
 cut no `v*` tag yet**, so install with `--ref main` until it does.
+
+### `vellum init --shape …` — provisioning a new installation
+
+Run where no installation exists, `init` creates the repo pair, seeds the tree
+spec CI needs to run once, installs the stubs and wires the cross-repo secrets.
+Three shapes, each a path `docs/design.md` already names:
+
+| `--shape` | What it is |
+|---|---|
+| `greenfield` | Both repos are new. The intent repo is seeded with a skeletal spec — `product.md`, an index, one feature area per `--area` with a placeholder scenario — and the product repo is created and pinned at that seed. |
+| `brownfield` | The product repo **already exists**. The intent repo is created beside it, every `--area` is seeded `unsurveyed`, and the product's `.vellum/` arrives on a `vellum/adopt` branch as a pull request — never as a push to its default branch. |
+| `brownfield-with-docs` | As `brownfield`, and the existing documentation `--docs` points at is listed in the seeded index under **Survey sources**, so the surveyor finds it. |
+
+**A conversation with a plan.** `init` prompts for what it needs, and every
+prompt is answerable by a flag — so an unattended run is the same command with
+no prompts left:
+
+| Flag | Prompt | Default |
+|---|---|---|
+| `--shape` | which shape | *(none — always answered)* |
+| `--product` | the product's name, a lowercase slug | *(none)* |
+| `--org` | the forge organization or user | *(none)* |
+| `--intent-repo` | the intent repository's name | `<product>-intent` |
+| `--product-repo` | the product repository's name (for a brownfield shape, the existing one) | `<product>` |
+| `--visibility` | `public` or `private`, for both repos | `private` |
+| `--intent-visibility`, `--product-visibility` | per repo, overriding `--visibility` | |
+| `--branch` | the default branch | `main` |
+| `--area` | a feature area's name, a lowercase slug; **repeatable** | *(none)* |
+| `--docs` | an existing documentation path; repeatable, `brownfield-with-docs` only | *(none)* |
+
+`--yes` accepts the defaults **and** the plan. `--plan` prints the plan and
+stops, having created nothing, exit 0. Prompts are asked only on a TTY; without
+one, an unanswered prompt exits 2 **naming the flag** that answers it. Every
+value is validated *before* the plan, so a run either has a complete plan or has
+not started.
+
+```sh
+# the whole conversation as flags — no prompts left
+vellum init --shape greenfield --product acme --org waviisoft --area billing --yes
+
+# see what it would do, and do none of it
+vellum init --shape greenfield --product acme --org waviisoft --area billing --plan
+
+# adopt an existing repo, staging its docs for the surveyor
+vellum init --shape brownfield-with-docs --product legacy --org waviisoft \
+    --area billing --area accounts \
+    --docs docs/architecture.md --docs docs/api.md --yes
+```
+
+**The plan** names both repositories and their visibility, every file to be
+seeded, every stub, the secret pair and which repo each is set on, the product
+repo's Actions access change, and **every step the transport cannot take**. It
+is shown before anything is created and confirmed; `--yes` skips the
+confirmation, not the plan.
+
+**The transport is your forge CLI.** With `gh` on PATH and `gh auth status`
+succeeding, `init` creates the repositories, pushes the seeds, sets the secret
+pair, and opens the product repo's workflows to reuse from the organization.
+The secret values come from `$VELLUM_TOKEN` and `$SPEC_TOKEN`, or a hidden
+prompt, and reach `gh` **on stdin** — never as an argv element, which is
+world-readable on the machine and lands in shell history. `init` never mints a
+credential.
+
+**Without an authenticated `gh` there is no second tool to install.** `init`
+does everything a checkout can hold — both seeds, both commits, the stubs, and
+both checks — in a staging directory it names, then prints the forge steps as an
+ordered checklist with the exact commands, and exits 0 for the half it did.
+That checklist is the same list the plan carried, so it cannot have drifted from
+what `init` would have done. `vellum doctor` afterwards verifies the whole.
+
+**The secret pair, and which way each reads:**
+
+| Secret | Set on | Reads |
+|---|---|---|
+| `VELLUM_TOKEN` | the intent repo | the product repo — it is what the caller stubs pass to the reusable workflows |
+| `SPEC_TOKEN` | the product repo | the intent repo — its conformance job fetches the spec tree at the pin |
+
+**`--into <dir>` provisions into local directories** — `<dir>/<intent-repo>` and
+`<dir>/<product-repo>`, each `git init`ed — and reaches **no forge at all**, not
+even to look for one. It is the half a checkout can hold, and it is how the
+acceptance suite drives provisioning without a forge.
+
+**The seed is checked before it is pushed.** `vellum lint` runs over the seeded
+spec tree and `vellum doctor` over the whole intent checkout once the stubs are
+stamped; a red seed is reported and **nothing is pushed**, exit 1. That is the
+one finding `init` can report, and it is still doctor's sentence to pass.
+
+**The pin** is the intent repo's *first* commit touching `spec/` — the commit
+that made this installation's spec exist. The stubs land in a second commit, so
+they do not date it.
+
+**What is seeded, greenfield:**
+
+```
+<intent repo>/  spec/product.md, spec/index.md, spec/features/<area>.md
+                .vellum/config.yaml      every key the CLI reads, with the command that reads it named
+                .vellum/workspace.yaml   the intent slug, the forge, the product map
+                ledger/releases.yaml     one channel, spec_conformed: null, cuts: []
+                harness/                 the generic runner; steps/ empty, adapter names no deployment
+                .github/workflows/       the three caller stubs
+<product repo>/ .vellum/product.yaml     the backref and the pin
+                .vellum/memory/map.md
+```
+
+The seeded harness is honest about being a skeleton: `harness/steps/` is empty,
+so `python3 harness/run.py` reports every scenario UNDEFINED and exits 1 until
+step definitions exist, and `harness/support/adapter.py` names no deployment, so
+a scenario whose steps exist reports CANNOT RUN YET rather than a fake pass.
+Both are the first two jobs of a new installation, and `harness/README.md` in
+the seed says so.
+
+**Refusals**, all exit 2: a checkout that already carries
+`.vellum/workspace.yaml` (that is the stamping case, not a provisioning); a
+repository name the forge already has, unless it is the product repo of a
+brownfield shape; a local directory that already exists and is not empty, on the
+same rule; and any value that will not validate.
 
 ### `vellum doctor [<intent-checkout>]`
 

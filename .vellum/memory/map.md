@@ -8,6 +8,7 @@ notes live in `.vellum/memory/areas/`; wave worklogs in `.vellum/memory/waves/`.
 | Path | What |
 |---|---|
 | `src/vellum/` | The CLI. One module per concern; see `.vellum/memory/areas/cli.md`. |
+| `src/vellum/seeds/` | The harness skeleton `vellum init --shape …` seeds into a new installation, shipped as **package data** (`pyproject.toml`, `[tool.setuptools.package-data]`). Package data rather than repository paths for the reason the caller stubs are generated rather than copied: an installed CLI is a wheel. |
 | `tests/` | `unittest` suite plus fixture spec trees under `tests/fixtures/`. |
 | `.github/workflows/` | `ci.yml` tests this repo; `spec-ci.yml`, `on-spec-merge.yml` and `harness-ci.yml` are **reusable** (`workflow_call`) workflows an installation's intent repo calls, and never run here. See `.vellum/memory/areas/adapters-github.md`. |
 | `adapters/github/` | The **caller stubs** an intent repo carries, rendered by `vellum init` from `vellum.install.SHIPPED`. See `.vellum/memory/areas/adapters-github.md`. |
@@ -27,6 +28,7 @@ notes live in `.vellum/memory/areas/`; wave worklogs in `.vellum/memory/waves/`.
 - [`.vellum/memory/waves/versions-are-commits.md`](waves/versions-are-commits.md) — versions became commits, the pin became a file, minting shrank, `Rule:` banned.
 - [`.vellum/memory/waves/cli-absorbs-workflows.md`](waves/cli-absorbs-workflows.md) — the workflow bodies became `vellum mint`, `vellum backpressure`, `vellum pin advance`.
 - [`.vellum/memory/waves/adapters-install-thin.md`](waves/adapters-install-thin.md) — the adapters became reusable workflows plus caller stubs; `vellum init` and `vellum doctor`.
+- [`.vellum/memory/waves/installer-provisions-the-pair.md`](waves/installer-provisions-the-pair.md) — `vellum init` grew a provisioning mode: three shapes, a plan, `gh` as the transport, and the seed.
 
 Worklogs up to `spec-v6.md` are named for the version they landed at. This one
 is named for what it did, because a version's name is decoration now

@@ -14,6 +14,11 @@ pass the one secret it needs. The logic lives in
 
 ## Installing
 
+Into an intent repo that **already exists**. To create the repo pair from
+nothing — repos, seed, stubs and the cross-repo secrets in one command — see
+`vellum init --shape …` in the [root README](../../README.md); it ends by
+stamping exactly the stubs below.
+
 ```sh
 cd ../vellum-intent
 vellum init .                    # pins this CLI's own version

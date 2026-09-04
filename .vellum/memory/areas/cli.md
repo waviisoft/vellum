@@ -5,8 +5,9 @@
 three pipeline commands `mint`, `backpressure`, `pin advance`, the five
 mechanical guards `verify boundaries|deps|exit-duty`, `ledger verify` and
 `budget`, and the two installer commands `init` and `doctor` — dispatched from
-`build_parser()` in `src/vellum/cli.py`. Every claim below names a file or
-symbol you can grep for.
+`build_parser()` in `src/vellum/cli.py`. `init` is really two commands behind
+one name (stamping, and provisioning a repo pair); see below. Every claim below
+names a file or symbol you can grep for.
 
 ## Module map
 
@@ -26,7 +27,9 @@ symbol you can grep for.
 | `src/vellum/pin.py` | `advance()` -> `Advance`, `verify_version()`, `_rewrite()`. The pin close. |
 | `src/vellum/config.py` | `load()`, `divergence_cap()`, `INTENT_ENV`. Reads `.vellum/config.yaml`. |
 | `src/vellum/workspace.py` | `load()`, `products()`, `intent()`, `forge()`, `WORKSPACE_RELPATH`, `DEFAULT_FORGE`. The one reader of `.vellum/workspace.yaml`. |
-| `src/vellum/install.py` | `init()` -> `Init`, `doctor()` -> `Doctor`, `render()`, `inspect()`, `strays()`, `releases()`, `currency()` -> `Currency`, `SHIPPED`, `HOST_REPO`, `JOB_KEYS`, `DEFAULT_BRANCH`, `CANNOT_KNOW`. The adapters install thin. |
+| `src/vellum/install.py` | `init()` -> `Init`, `doctor()` -> `Doctor`, `render()`, `inspect()`, `strays()`, `releases()`, `currency()` -> `Currency`, `SHIPPED`, `HOST_REPO`, `JOB_KEYS`, `DEFAULT_BRANCH`, `CANNOT_KNOW`. The adapters install thin (installation, part 1). |
+| `src/vellum/provision.py` | `run()`, `resolve()` -> `Answers`, `build_plan()` -> `Plan`, `forge_steps()` -> `[ForgeStep]`, `intent_seed()`, `product_seed()`, `build_intent()`, `build_product()`, `check_seed()` -> `SeedCheck`, `detect_gh()` -> `Gh`, `first_spec_commit()`, `requested()`, `Console`, `SHAPES`, `ADOPT_BRANCH`. Provisioning a repo pair (installation, part 2). |
+| `src/vellum/seeds/` | `harness_files()`, and `seeds/harness/` — the harness skeleton `init` seeds, shipped as package data. |
 | `src/vellum/product.py` | `load()`, `write_boundaries()`, `normalise_tree()`, `under()`, `PRODUCT_RELPATH`. Reads `.vellum/product.yaml`. |
 | `src/vellum/boundaries.py` | `check()` -> `Boundaries`, `run()`. The write-boundary guard. |
 | `src/vellum/exitduty.py` | `check()` -> `ExitDuty`, `run()`, `AREAS_TREE`. The memory-update guard. |
@@ -36,6 +39,82 @@ symbol you can grep for.
 | `src/vellum/reconcile.py` | `reconcile()` -> `Tick`, `run()`, `Action`, `Observed`, `read_observed()`, `corpus_answer()`, `question_terms()`, `_Reconciler`, `ACTION_KINDS`. The stateless reconciler. |
 | `src/vellum/release.py` | `cut()` -> `Cut`, `partition()` -> `Partition`, `run_cut()`, `run_partition()`, `load_releases()`, `conformed_pointer()`, `products()` (delegating to `workspace.products`), `parse_versions()`, `ReleaseError`, `ReleaseRefused`. Cuts and the armed/enforced split. |
 | `src/vellum/text.py` | `one_line()`. Flattening an untrusted string before it reaches a report. |
+
+## `vellum init` is two commands, and the fork is the command line
+
+`init` stamps caller stubs (part 1, `install.py`) or provisions a repo pair
+(part 2, `provision.py`). Which one a run is, is decided by
+`provision.requested(args)` — true when **any** of `PROVISIONING_ARGS` is set —
+and by nothing else. Three things follow, and each of them is a rule somebody
+will be tempted to break:
+
+- **Never from the directory.** `spec/features/installation.md` says the shape
+  "is chosen by the operator, never inferred from a directory". Inferring the
+  *mode* from one — "no `.vellum/workspace.yaml`, so this must be a
+  provisioning" — is the same mistake one step earlier, and it would make a
+  typo'd path provision a repo pair.
+- **Part 1's arguments are not in `PROVISIONING_ARGS`.** `--ref`, `--force`,
+  `--from`, `--forge`, `--releases-from` and `--branch` are all meaningful to
+  stamping, so any of them switching modes would change part 1's behavior.
+  `--branch` is shared: it lost its argparse default so `resolve` can tell "the
+  operator said `main`" from "the operator said nothing", and `main()`
+  substitutes `DEFAULT_BRANCH` on the stamping path.
+- **The refusal comes before the conversation.** A checkout carrying
+  `.vellum/workspace.yaml` given a provisioning argument exits 2 naming the
+  installation, asked before any prompt — an operator who made that mistake is
+  told so rather than interviewed first. `--into` does not lift it: where the
+  new pair is *built* is a different question from where the command was *run*.
+
+## The plan and the checklist are one list
+
+`provision.forge_steps()` builds `ForgeStep` values once. `Plan.render()` prints
+them because the plan must name "every step the transport cannot take";
+`_report()` prints the ones `_perform()` did not take, as the checklist an
+operator follows. **There is no second list**, and there must not be: the manual
+rung is the rung people actually follow, so a checklist that had drifted from
+the plan would be wrong exactly where it is trusted most.
+`test_the_checklist_is_the_list_the_plan_carried` pins it.
+
+The manual rung is not a second code path either — it is `_perform()` with
+`gh=None`, which takes nothing and hands every step back.
+
+## No secret is ever an argv element
+
+`ForgeStep.stdin` holds a *description* of what is piped in, never a value: the
+object reaches the plan, the report and the checklist, so a step that could hold
+a secret is a step that could print one. Values live in a local dict in
+`_perform()` and reach `Gh.run(..., stdin=...)`, which passes them to
+`subprocess.run(input=...)` — `gh secret set --body -` reads stdin. An argv
+element is world-readable (`/proc/<pid>/cmdline`, `ps`) and lands in shell
+history; a pipe is neither. `init` never mints a credential either (decision
+`2026-09-03-installer-transport-is-the-forge-cli.md`): values come from
+`$VELLUM_TOKEN`/`$SPEC_TOKEN` or a hidden prompt, and a value that is not
+supplied moves the step to the checklist rather than being silently skipped.
+
+## Why the stubs are stamped before the push
+
+`spec/features/installation.md`: "The seed lints clean and doctors green before
+it is pushed." Doctor cannot be green before the stubs exist, and a push that
+had already happened could not be un-pushed — so the whole local half (seed
+commit, stubs, second commit, `lint`, `doctor`) completes before the transport
+is asked to do anything. The greenfield gh rung then needs exactly one push per
+repo, which is why it is `gh repo create --source … --push` rather than a create
+followed by a `git push`: every network act on that path goes through `gh`, and
+that is what makes the argv trace assertable end to end.
+
+The pin is `first_spec_commit()` — `git log --reverse --format=%H -- spec`, the
+**first** commit touching `spec/`, not the head. The stubs land in a second
+commit precisely so they do not date the spec.
+
+## The seeded index quotes its doc paths, and that is load-bearing
+
+`links.find_references()` treats a bare `.md` path in prose as a
+cross-reference, and lint resolves it. `--docs` paths name files in the
+**product** repo, which the intent tree cannot resolve, so they are written as
+inline code — which `_masked_lines()` blanks before references are found. Write
+one unquoted and every brownfield-with-docs seed fails its own lint check.
+`BrownfieldWithDocsStagesTheSurveySources.test_the_seed_still_lints` is the
+guard on that.
 
 ## Scenario identity
 
