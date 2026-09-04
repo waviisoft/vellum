@@ -407,6 +407,19 @@ class TestCredentialFreeRunReferences(unittest.TestCase):
             credential_free_run("https://ci.example/run/7"), "https://ci.example/run/7"
         )
 
+    def test_a_scheme_less_url_still_loses_its_query_string(self):
+        """`ci.example/run/7?token=x` has no netloc to urlsplit, and a token.
+
+        A runner composing `--run "$CI_HOST/run/$ID?token=$T"` from a host
+        variable typed without a scheme is URL-shaped to a human. Userinfo is
+        not detectable without a scheme, but the `?…` tail is a query string in
+        any shape, so it goes; the rest is left exactly as typed.
+        """
+        self.assertEqual(clean_run_reference("ci.example/run/7?token=x"),
+                         ("ci.example/run/7", ("query string",)))
+        self.assertEqual(clean_run_reference("github.com/o/r/actions/runs/1?check=1"),
+                         ("github.com/o/r/actions/runs/1", ("query string",)))
+
     def test_a_bare_reference_is_left_alone(self):
         # No userinfo or query exists in one, and guessing at a structure it
         # does not have would mangle a perfectly good reference.

@@ -38,7 +38,10 @@ ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 #: two-word info string made the opening line invisible, so its *closing* line
 #: opened a phantom fence that swallowed the next block. Meaning is read from
 #: the first word alone -- see ``Fence.language``.
-_FENCE_RE = re.compile(r"^(\s*)(`{3,}|~{3,})[ \t]*(.*?)[ \t]*$")
+# The trailing `\s*$` (not `[ \t]*$`) matters: a CRLF line ends in `\r`, and a
+# closer whose captured info string is "\r" is not a closer, so a CRLF file
+# would collapse into one fence — the phantom-fence class this rule exists to end.
+_FENCE_RE = re.compile(r"^(\s*)(`{3,}|~{3,})[ \t]*(.*?)\s*$")
 
 
 class SpecTreeError(Exception):

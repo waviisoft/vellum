@@ -213,8 +213,8 @@ walk through by hand.
 
 **`--run` must be credential-free.** It is published twice — committed to the
 intent repo, and printed by every `certify check` that reads it — so userinfo
-and the query string are stripped from a URL-shaped value on store *and* on
-print: `https://user:tok@host/run/7?token=y` is stored and shown as
+is stripped from a URL with a scheme, and a `?…` query string from any value
+that carries one, on store *and* on print: `https://user:tok@host/run/7?token=y` is stored and shown as
 `https://host/run/7`. `record` names what it dropped rather than editing
 quietly, and says "rotate" only for the half that is a credential. Treat it as
 a backstop: by the time a value reaches the command it has been through a

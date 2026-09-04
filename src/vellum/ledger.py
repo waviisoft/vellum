@@ -540,10 +540,14 @@ def clean_run_reference(run) -> tuple[str | None, tuple[str, ...]]:
     text = str(run).strip()
     parts = urllib.parse.urlsplit(text)
     if not parts.netloc:
-        # Not URL-shaped — a bare run id, or a forge's own `owner/repo#7`.
-        # There is no userinfo or query to find in one, and guessing at a
-        # structure it does not have would mangle a perfectly good reference.
-        return text, ()
+        # Not URL-shaped to urlsplit — a bare run id, a forge's own
+        # `owner/repo#7`, or a URL typed without its scheme. There is no
+        # userinfo to find without a scheme (a `:` or `@` in a bare id is
+        # ordinary), but a `?…` tail is a query string whatever the shape, and
+        # `ci.example/run/7?token=x` is URL-shaped to the human who typed it.
+        # Drop the tail; leave the rest exactly as typed.
+        head, sep, _ = text.partition("?")
+        return head, (("query string",) if sep else ())
     host = parts.netloc.rpartition("@")[2]
     removed = tuple(
         what

@@ -117,6 +117,19 @@ class TestMarkerPairing(unittest.TestCase):
         self.assertEqual((fence.language, fence.start_line, fence.end_line), ("gherkin", 1, 5))
         self.assertEqual(fence.body, "a\n```\nb")
 
+    def test_crlf_line_endings_pair_exactly_as_lf_does(self):
+        """A `\\r`-terminated closer closes.
+
+        `find_fences` is the public parsing API and the callers that read
+        files translate newlines before it sees them, but a caller that does
+        not (tests do) must not get one fence where a CRLF file holds two —
+        that is the phantom-fence shape the info-string fix removed.
+        """
+        crlf = ["```gherkin\r", "a\r", "```\r", "\r", "```gherkin\r", "b\r", "```\r"]
+        fences = find_fences(crlf)
+        self.assertEqual([(f.language, f.start_line, f.end_line) for f in fences],
+                         [("gherkin", 1, 3), ("gherkin", 5, 7)])
+
     def test_a_longer_fence_is_closed_only_by_one_at_least_as_long(self):
         fence = find_fences(["````gherkin", "a", "```", "b", "````"])[0]
         self.assertEqual((fence.start_line, fence.end_line), (1, 5))
