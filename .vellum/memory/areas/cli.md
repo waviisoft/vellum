@@ -85,16 +85,122 @@ exists; do not reach for it to reorder anything else.
 
 ## No secret is ever an argv element
 
-`ForgeStep.stdin` holds a *description* of what is piped in, never a value: the
+`ForgeStep.stdin` holds a *description* of what is piped in, never a value, and
+`ForgeStep.secret` holds the *name* of the variable the value comes from: the
 object reaches the plan, the report and the checklist, so a step that could hold
 a secret is a step that could print one. Values live in a local dict in
 `_perform()` and reach `Gh.run(..., stdin=...)`, which passes them to
-`subprocess.run(input=...)` — `gh secret set --body -` reads stdin. An argv
-element is world-readable (`/proc/<pid>/cmdline`, `ps`) and lands in shell
-history; a pipe is neither. `init` never mints a credential either (decision
+`subprocess.run(input=...)`. An argv element is world-readable
+(`/proc/<pid>/cmdline`, `ps`) and lands in shell history; a pipe is neither.
+`init` never mints a credential either (decision
 `2026-09-03-installer-transport-is-the-forge-cli.md`): values come from
 `$VELLUM_TOKEN`/`$SPEC_TOKEN` or a hidden prompt, and a value that is not
 supplied moves the step to the checklist rather than being silently skipped.
+
+**`gh secret set` carries no `--body`, and the absence is the mechanism.** `gh`
+reads the value from stdin only when the flag is *absent*: `getBody()` returns
+`--body`'s value whenever that value is non-empty and falls back to stdin
+otherwise. So `--body -` does not mean "read stdin" — it sets the secret to the
+one-character string `-`, and the value on the pipe is never read. This shipped
+in review and passed its own test, because the fake `gh` read stdin
+unconditionally; it now reads it only where the real one does, which is what
+turns the old argv into a failing test. Nothing else is needed to reach stdin:
+`subprocess.run(input=…)` hands `gh` a pipe rather than a terminal, and so does
+`printf %s "$VELLUM_TOKEN" |` in the checklist. The checklist renders the
+per-step variable name, not `$TOKEN` — a variable nothing ever told the operator
+to set, and the same one on both lines.
+
+## Adoption is a guest, and `_check_adoption()` is what that costs
+
+The brownfield shapes commit into a checkout Vellum did not create, so
+`build_product()` refuses three states before it writes anything: an existing
+`.vellum/product.yaml` (the product-side twin of the refusal `run()` opens
+with — seeding it again replaces the pin the repo already answers to), a dirty
+tree (`git status --porcelain` non-empty; it would have been swept into the
+adoption commit and then into a pull request), and an existing `vellum/adopt`
+branch. All three are exit 2 naming what was found.
+
+Then: `git checkout -q -b vellum/adopt <base>` — `-b`, never `-B`, which resets
+a branch that is already there; off the **named base**, never off HEAD, which is
+whatever the operator last checked out. And `git add -- <the two seeded paths>`,
+never `add -A`, which is the difference between "Vellum added two files" and
+"Vellum committed your working tree". The base is the clone's own
+`origin/HEAD` where there is a clone (`_default_branch()`): `--branch` names the
+INTENT repo's default branch, and assuming the product repo agrees is how an
+adoption of a `master` repo opens a pull request against a `main` that is not
+there.
+
+## Nothing is set on the product repo's Actions access
+
+`actions/permissions/access` governs whether a repository's OWN workflows may be
+reused by others. The workflows a caller stub resolves against are the **host's**
+(`--from`, `waviisoft/vellum`), which no installation owns — so setting it on the
+product repo asks the forge for a permission nothing needs, and on a user-owned
+account, where organization access does not exist, the call fails and takes an
+otherwise successful provisioning down with it. The host's setting is the one
+that matters, it is named as a step no transport takes, and it is in
+`install.CANNOT_KNOW` as well. Do not put the call back.
+
+## A forge failure mid-run is reported, never swallowed
+
+`_take()` appends to a list the caller owns rather than returning one, and that
+is the whole reason it is shaped that way: a step that raises takes the run down
+with it, and a caller that learned what had happened from a `return` would learn
+nothing. `run()` catches `ProvisionError` around the transport and prints
+`_interrupted()` — what was taken, and every step from the failure onward — then
+re-raises for the 2. Nothing rolls back a `gh repo create`, so re-running the
+same command refuses at the name the forge now has; the report is the only thing
+left that helps.
+
+The staging directory follows the same line. It is removed on any failure up to
+the point the seed goes green, because until then it holds nothing anyone wants;
+after that it is kept, because every command in the report and in the interrupted
+report names it. `staged` is set to None at exactly that point.
+
+## The outward checks come before the confirmation
+
+`_check_forge_names()` and `_check_directories()` run above `_confirm()` and
+above the `mkdtemp`. They cannot be in `resolve()` — they look outward, and the
+spec's boundary ("exits 2 for any value it cannot validate before the plan") is
+about the plan, which has been printed by then. But refusing something the
+operator has already agreed to is a refusal too late, and it used to leave an
+empty `vellum-init-*` behind every time. `_check_directories()` runs only under
+`--into`; a fresh `mkdtemp` cannot collide with anything, and it must not exist
+yet or `--plan` would have created something.
+
+## `--plan` reaches no forge
+
+`detect_gh()` runs `gh auth status`, which is a call to the forge — so the one
+command whose whole promise is "creating nothing" was contacting one before it
+printed a word. Under `--plan` the transport is `shutil.which("gh")` and nothing
+else, labelled `gh (if authenticated)`, because whether that `gh` is logged in is
+exactly the question it declined to ask.
+
+## `--docs` names paths in the product repo, and they are checked as such
+
+`_resolve_docs()` resolves each one against the product checkout (`--into`'s,
+when that names an existing one; the working directory otherwise) and records it
+**repo-relative**, because the seeded index is read by a surveyor working in that
+repository and an absolute path on one laptop means nothing to them. A path
+outside that base is refused, as is one carrying a backtick or a control
+character — the backtick because the index's inline-code quoting is load-bearing
+(below), the control characters because one entry with a newline in it becomes a
+second entry nobody wrote. The value is rendered raw, **not** through
+`one_line()`: a path truncated at 120 characters is a promise the index cannot
+keep, which is the exact wording of the refusal for a path that does not exist.
+
+## The seed's own ids are not available as areas
+
+`spec/product.md` is `id: product` and `spec/index.md` is `id: index`, so
+`--area product` seeded a SECOND file claiming an id the seed already had —
+and it went green, because lint's duplicate-id check (`GH003`) is about scenario
+ids. `RESERVED_AREAS` refuses both in `resolve()`, before the plan. `--product`
+and `--area` also refuse the YAML 1.1 keywords (`no`, `yes`, `on`, `off`,
+`null`, …): the value is written into the seed as a bare scalar — a workspace
+key, a `product.name`, a spec file's `id:` — and the parser that reads the seed
+back would answer with a boolean. `pin.commit` is quoted in the template for the
+sibling reason: a 40-character sha that happened to be all digits is an integer
+to YAML.
 
 ## Why the stubs are stamped before the push
 

@@ -324,7 +324,7 @@ no prompts left:
 | `--intent-visibility`, `--product-visibility` | per repo, overriding `--visibility` | |
 | `--branch` | the default branch | `main` |
 | `--area` | a feature area's name, a lowercase slug; **repeatable** | *(none)* |
-| `--docs` | an existing documentation path; repeatable, `brownfield-with-docs` only | *(none)* |
+| `--docs` | an existing documentation path, inside the product checkout; repeatable, `brownfield-with-docs` only | *(none)* |
 
 `--yes` accepts the defaults **and** the plan. `--plan` prints the plan and
 stops, having created nothing, exit 0. Prompts are asked only on a TTY; without
@@ -346,18 +346,48 @@ vellum init --shape brownfield-with-docs --product legacy --org waviisoft \
 ```
 
 **The plan** names both repositories and their visibility, every file to be
-seeded, every stub, the secret pair and which repo each is set on, the product
-repo's Actions access change, and **every step the transport cannot take**. It
-is shown before anything is created and confirmed; `--yes` skips the
-confirmation, not the plan.
+seeded, every stub, the secret pair and which repo each is set on, and **every
+step the transport cannot take**. It is shown before anything is created and
+confirmed; `--yes` skips the confirmation, not the plan, and declining it exits
+2 having created nothing. `--plan` reaches no forge at all — not even to ask
+whether your `gh` is logged in, because that question is a call to the forge and
+`--plan` creates nothing.
+
+Everything the plan cannot validate on its own — a repository name the forge
+already has, a directory that is already something — is checked **before** the
+confirmation, so a run either refuses before you agree to it or does what you
+agreed to.
 
 **The transport is your forge CLI.** With `gh` on PATH and `gh auth status`
-succeeding, `init` creates the repositories, pushes the seeds, sets the secret
-pair, and opens the product repo's workflows to reuse from the organization.
-The secret values come from `$VELLUM_TOKEN` and `$SPEC_TOKEN`, or a hidden
-prompt, and reach `gh` **on stdin** — never as an argv element, which is
+succeeding, `init` creates the repositories, pushes the seeds and sets the
+secret pair. The secret values come from `$VELLUM_TOKEN` and `$SPEC_TOKEN`, or a
+hidden prompt, and reach `gh` **on stdin** — never as an argv element, which is
 world-readable on the machine and lands in shell history. `init` never mints a
 credential.
+
+Note the shape of the secret steps, in the plan and in the checklist:
+
+```sh
+printf %s "$VELLUM_TOKEN" | gh secret set VELLUM_TOKEN --repo waviisoft/acme-intent
+```
+
+**No `--body`, deliberately.** `gh secret set` reads the value from stdin only
+when `--body` is *absent*; given the flag it uses the flag's value, so
+`--body -` sets the secret to the literal string `-` rather than to what is on
+the pipe. Both the transport and the checklist leave it off.
+
+**Nothing is changed on either repo's Actions settings.**
+`actions/permissions/access` governs whether a repository's *own* workflows may
+be reused by others, and the workflows your caller stubs resolve against live in
+the Vellum repo (`--from`), which your installation does not own. That setting
+is the one that has to be right, it is the host repo's, and the plan names it as
+a step no transport takes.
+
+**If a forge step fails part way through**, `init` prints what it took before
+the failure and hands back every step from there onward as a checklist, then
+exits 2. Nothing rolls back a repository that has already been created, so the
+report is what is left: the local checkouts are still where it said, and the
+commands name them.
 
 **Without an authenticated `gh` there is no second tool to install.** `init`
 does everything a checkout can hold — both seeds, both commits, the stubs, and
@@ -372,6 +402,18 @@ what `init` would have done. `vellum doctor` afterwards verifies the whole.
 |---|---|---|
 | `VELLUM_TOKEN` | the intent repo | the product repo — it is what the caller stubs pass to the reusable workflows |
 | `SPEC_TOKEN` | the product repo | the intent repo — its conformance job fetches the spec tree at the pin |
+
+**Adoption is a guest in a repo it did not create.** The brownfield shapes
+commit into a checkout somebody else owns, so `init` refuses rather than write
+over it: a checkout with **uncommitted changes** (they would land in the
+adoption commit and then in the pull request — an untracked `.env` included), a
+checkout that already carries **`.vellum/product.yaml`** (it is already an
+installation, and seeding it again replaces its pin), and a checkout that
+already has a **`vellum/adopt` branch** (it is somebody's, most likely an
+adoption in review). Each is exit 2 naming what it found. The commit it does
+make adds exactly `.vellum/product.yaml` and `.vellum/memory/map.md`, and is cut
+from the repository's own default branch — `origin/HEAD` where there is a clone
+— never from whatever happened to be checked out.
 
 **`--into <dir>` provisions into local directories** — `<dir>/<intent-repo>` and
 `<dir>/<product-repo>`, each `git init`ed — and reaches **no forge at all**, not
