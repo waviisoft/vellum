@@ -52,7 +52,8 @@ WORKFLOWS = WORKFLOWS_DIR["github"]
 #: succeeds. Stdin is read ONLY for `secret set`, because a fake that read it
 #: unconditionally would block on an inherited terminal.
 FAKE_GH = """#!{python}
-import json, os, sys
+import json, os, subprocess, sys
+from pathlib import Path
 
 argv = sys.argv[1:]
 entry = {{"argv": argv}}
@@ -60,7 +61,32 @@ if argv[:2] == ["secret", "set"]:
     entry["stdin"] = sys.stdin.read()
 with open(os.environ["GH_TRACE"], "a", encoding="utf-8") as trace:
     trace.write(json.dumps(entry) + "\\n")
-sys.exit(1 if argv[:2] == ["repo", "view"] else 0)
+
+
+def git(*args):
+    subprocess.run(["git", "-c", "user.name=fake", "-c", "user.email=f@f", *args],
+                   check=True, capture_output=True)
+
+
+# `repo clone` is the one command a fake cannot merely record: the brownfield
+# rung branches the adoption off the clone's history and pushes back to it, so
+# a clone of nothing would fail two steps later for a reason that has nothing to
+# do with what is under test. This serves a real local repository with one
+# commit, standing in for the operator's existing product repo.
+if argv[:2] == ["repo", "clone"]:
+    bare = Path(os.environ["GH_REMOTES"]) / (argv[2].replace("/", "_") + ".git")
+    git("init", "-q", "--bare", "-b", "main", str(bare))
+    seed = Path(os.environ["GH_REMOTES"]) / "seed"
+    git("init", "-q", "-b", "main", str(seed))
+    (seed / "README.md").write_text("the product, before Vellum\\n")
+    git("-C", str(seed), "add", "-A")
+    git("-C", str(seed), "commit", "-qm", "existing product")
+    git("-C", str(seed), "push", "-q", str(bare), "main")
+    git("clone", "-q", str(bare), argv[4])
+    sys.exit(0)
+
+sys.exit(1 if argv[:2] == ["repo", "view"] and argv[2].endswith("-intent") else
+         (1 if argv[:2] == ["repo", "view"] and os.environ.get("GH_NO_REPOS") else 0))
 """
 
 
@@ -112,11 +138,22 @@ class ProvisionCase(unittest.TestCase):
         self.addCleanup(os.environ.__setitem__, "PATH", os.environ["PATH"])
         os.environ["PATH"] = self._bin("bin-plain", with_gh=False)
 
-    def with_fake_gh(self, **secrets: str) -> None:
+    def with_fake_gh(self, *, no_repos: bool = True, **secrets: str) -> None:
+        """A fake `gh` on PATH. *no_repos*: every `repo view` says "not found".
+
+        Greenfield needs both names free; the brownfield rung needs the product
+        name to EXIST, which is the one difference between the two fixtures.
+        """
         self.addCleanup(os.environ.__setitem__, "PATH", os.environ["PATH"])
-        self.addCleanup(self._restore, ["GH_TRACE", *secrets])
+        self.addCleanup(self._restore, ["GH_TRACE", "GH_REMOTES", "GH_NO_REPOS", *secrets])
         os.environ["PATH"] = self._bin("bin-gh", with_gh=True)
         os.environ["GH_TRACE"] = str(self.trace)
+        remotes = self.root / "forge"
+        remotes.mkdir(exist_ok=True)
+        os.environ["GH_REMOTES"] = str(remotes)
+        os.environ.pop("GH_NO_REPOS", None)
+        if no_repos:
+            os.environ["GH_NO_REPOS"] = "1"
         for name, value in secrets.items():
             os.environ[name] = value
 
@@ -749,43 +786,99 @@ class TheForgeRefusesANameItAlreadyHas(ProvisionCase):
     """`init` "refuses a repository name the forge already has unless the
     operator names it as the existing product repo of a brownfield shape"."""
 
-    #: A fake `gh` whose `repo view` SUCCEEDS: every name already exists.
-    EXISTS = """#!{python}
-import json, os, sys
-with open(os.environ["GH_TRACE"], "a", encoding="utf-8") as trace:
-    trace.write(json.dumps({{"argv": sys.argv[1:]}}) + "\\n")
-sys.exit(0)
-"""
-
-    def setUp(self):
-        super().setUp()
-        self.with_fake_gh()
-        (Path(os.environ["PATH"]) / "gh").write_text(
-            self.EXISTS.format(python=sys.executable), encoding="utf-8"
-        )
-
-    def test_an_existing_intent_repo_is_two(self):
-        code, out = run_cli(["init", "--shape", "greenfield", "--product", "acme",
-                             "--org", "waviisoft", "--area", "billing", "--yes"])
-        self.assertEqual(code, 2, out)
-        self.assertIn("waviisoft/acme-intent already exists", out)
-
     def test_an_existing_product_repo_is_two_for_greenfield(self):
-        # The intent repo has to be free for this to be the refusal under test,
-        # so the fake answers "exists" for one name only.
-        (Path(os.environ["PATH"]) / "gh").write_text(
-            FAKE_GH.format(python=sys.executable).replace(
-                'sys.exit(1 if argv[:2] == ["repo", "view"] else 0)',
-                'sys.exit(1 if argv[:3] == ["repo", "view", "waviisoft/acme-intent"] '
-                'else 0)',
-            ),
-            encoding="utf-8",
-        )
+        # The fake answers "exists" for every name that is not `*-intent`, so
+        # the intent name is free and the product name is taken: exactly the
+        # refusal under test, with nothing else in the way.
+        self.with_fake_gh(no_repos=False)
         code, out = run_cli(["init", "--shape", "greenfield", "--product", "acme",
                              "--org", "waviisoft", "--area", "billing", "--yes"])
         self.assertEqual(code, 2, out)
         self.assertIn("waviisoft/acme already exists", out)
         self.assertIn("brownfield", out)
+
+    def test_a_product_repo_the_forge_does_not_have_is_two_for_brownfield(self):
+        # And the mirror image: a brownfield shape ADOPTS an existing product
+        # repository, so a name the forge does not have is a 2 rather than a
+        # silent create.
+        self.with_fake_gh(no_repos=True)
+        code, out = run_cli(["init", "--shape", "brownfield", "--product", "acme",
+                             "--org", "waviisoft", "--area", "billing", "--yes"])
+        self.assertEqual(code, 2, out)
+        self.assertIn("does not exist on the forge", out)
+
+
+class TheBrownfieldRungAdoptsTheExistingRepo(ProvisionCase):
+    """The product repo is a guest's host: `.vellum/` arrives on a branch.
+
+    `spec/features/installation.md`: "its `.vellum/` arrives on a branch as a
+    pull request, never as a push to its default branch".
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.with_fake_gh(no_repos=False, VELLUM_TOKEN="t1", SPEC_TOKEN="t2")
+        code, self.out, err = run_cli_streams([
+            "init", "--shape", "brownfield", "--product", "legacy",
+            "--org", "waviisoft", "--area", "billing", "--yes",
+        ])
+        self.assertEqual(code, 0, self.out + err)
+        self.staging = Path(
+            self.out.split("Staging the local half in ")[1].splitlines()[0]
+        )
+        self.addCleanup(shutil.rmtree, self.staging, True)
+        self.calls = [call["argv"] for call in self.recorded()]
+
+    def test_the_clone_comes_before_the_branch_it_is_branched_from(self):
+        # The one forge step the local half depends on. Without it the adoption
+        # branch would sit on no history and push to nothing.
+        self.assertEqual(
+            self.calls[3],
+            ["repo", "clone", "waviisoft/legacy", "--", str(self.staging / "legacy")],
+        )
+
+    def test_the_adoption_branches_off_the_existing_history(self):
+        product = self.staging / "legacy"
+        self.assertEqual(
+            self.git(product, "rev-parse", "--abbrev-ref", "HEAD"),
+            provision.ADOPT_BRANCH,
+        )
+        log = self.git(product, "log", "--format=%s").splitlines()
+        self.assertEqual(len(log), 2, log)
+        self.assertEqual(log[-1], "existing product")
+        self.assertIn(".vellum/product.yaml",
+                      self.git(product, "ls-tree", "-r", "--name-only", "HEAD"))
+
+    def remote(self) -> Path:
+        """The bare repository the fake `gh` cloned from: the forge's copy."""
+        return Path(os.environ["GH_REMOTES"]) / "waviisoft_legacy.git"
+
+    def test_it_pushes_the_branch_and_opens_a_pull_request(self):
+        # The push is `git`, not `gh`, so it is not in the gh trace — and
+        # asserting the forge's own copy is the better question anyway.
+        branches = self.git(self.remote(), "for-each-ref", "--format=%(refname)",
+                            "refs/heads").splitlines()
+        self.assertIn(f"refs/heads/{provision.ADOPT_BRANCH}", branches)
+        pr = next(call for call in self.calls if call[:2] == ["pr", "create"])
+        self.assertEqual(pr[:8], ["pr", "create", "--repo", "waviisoft/legacy",
+                                  "--base", "main", "--head", provision.ADOPT_BRANCH])
+
+    def test_the_products_default_branch_was_never_written(self):
+        # Vellum is a guest in a repository it did not create. `main` on the
+        # forge's copy is exactly the commit that was there before.
+        remote = self.remote()
+        self.assertEqual(
+            self.git(remote, "log", "--format=%s", "main").splitlines(),
+            ["existing product"],
+        )
+        self.assertNotIn(
+            ".vellum/product.yaml",
+            self.git(remote, "ls-tree", "-r", "--name-only", "main").splitlines(),
+        )
+
+    def test_the_merge_of_that_pull_request_stays_on_the_checklist(self):
+        checklist = self.out.split("Do these yourself, in order")[1]
+        self.assertIn("review and merge the adoption pull request", checklist)
 
 
 class ASeedThatIsNotGreenIsNotPushed(ProvisionCase):

@@ -19,7 +19,7 @@ Five scenarios: `@id:init-plan-creates-nothing`, `@id:greenfield-seed-is-green`,
 | `src/vellum/provision.py` | The whole of part 2: the conversation, the plan, the seed templates, the local half, the `gh` transport and the manual rung. |
 | `src/vellum/seeds/` | `harness_files()`, and `seeds/harness/` — the harness skeleton, shipped as package data. |
 | `src/vellum/cli.py` | Thirteen provisioning arguments on `init`, and the two-line fork in `main()`. |
-| `tests/test_init_provision.py` | 56 tests driving the real command against local directories and a fake `gh`. |
+| `tests/test_init_provision.py` | 62 tests driving the real command against local directories and a fake `gh`. |
 
 `pyproject.toml` was **not** touched: see judgment call 3.
 
@@ -57,6 +57,15 @@ exactly one push per repository, which is why it is `gh repo create --source …
 --push` rather than a create followed by a `git push`: every network act on that
 path goes through `gh`, which is what makes the argv trace assertable end to
 end.
+
+**One forge step runs before the local half, and only one.** The brownfield
+shapes branch their adoption off the existing product repository's real
+history, so `gh repo clone` has to happen before `build_product` — that is what
+`ForgeStep.before` marks, and it is the only step it marks. It is still one
+entry in one list; `before` says where in the run it happens, not that there are
+two lists. Without a transport it stays on the checklist and `build_product`
+makes a standalone repository with an empty root commit instead, which is the
+half a checkout can hold; the checklist step says what to do with it.
 
 **No secret is ever an argv element.** `ForgeStep.stdin` holds a description,
 never a value; values live in a local dict and reach `gh secret set --body -` on
@@ -154,11 +163,13 @@ the stripped `PATH` back and left every later test in the process unable to find
   — the exact greenfield sequence, and the secret arriving on stdin rather than
   in argv. What is unverified is that the real `gh` accepts these flags and that
   the API path is right; the first real provisioning run is the check.
-- **The brownfield `gh` rung is not argv-asserted.** It needs `gh repo clone`, a
-  `git push` of `vellum/adopt` and `gh pr create`, so unlike greenfield it is not
-  all-`gh` and cannot be driven end to end by a recording fake. Its *local* half
-  — the adopt branch, the seeded index, the untouched default branch — is
-  asserted.
+- **The brownfield `gh` rung is driven, but not by argv alone.** It needs `gh
+  repo clone`, a `git push` of `vellum/adopt` and `gh pr create`, so unlike
+  greenfield it is not all-`gh`. The fake `gh` therefore *serves* a real local
+  bare repository on `repo clone`, and the assertions are about the forge's own
+  copy afterwards: `vellum/adopt` exists on it, and `main` is exactly the commit
+  that was there before. That is the property the spec states, asked of the
+  thing that would hold it.
 - **GitLab.** The core is forge-neutral and the first adapter is GitHub
   (`spec/features/installation.md`, out of scope). `forge_steps()` emits `gh`
   commands; a second forge is a second emitter beside it.

@@ -300,7 +300,7 @@ Three shapes, each a path `docs/design.md` already names:
 | `--shape` | What it is |
 |---|---|
 | `greenfield` | Both repos are new. The intent repo is seeded with a skeletal spec — `product.md`, an index, one feature area per `--area` with a placeholder scenario — and the product repo is created and pinned at that seed. |
-| `brownfield` | The product repo **already exists**. The intent repo is created beside it, every `--area` is seeded `unsurveyed`, and the product's `.vellum/` arrives on a `vellum/adopt` branch as a pull request — never as a push to its default branch. |
+| `brownfield` | The product repo **already exists**: `init` clones it, so the adoption branch sits on its real history. The intent repo is created beside it, every `--area` is seeded `unsurveyed`, and the product's `.vellum/` arrives on a `vellum/adopt` branch as a pull request — never as a push to its default branch. Without a forge CLI, the two files are built in a standalone checkout and the checklist says to move them onto a clone of the real one. |
 | `brownfield-with-docs` | As `brownfield`, and the existing documentation `--docs` points at is listed in the seeded index under **Survey sources**, so the surveyor finds it. |
 
 **A conversation with a plan.** `init` prompts for what it needs, and every

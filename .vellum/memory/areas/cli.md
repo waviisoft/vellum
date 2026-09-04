@@ -78,6 +78,11 @@ the plan would be wrong exactly where it is trusted most.
 The manual rung is not a second code path either — it is `_perform()` with
 `gh=None`, which takes nothing and hands every step back.
 
+One step carries `before=True`: `gh repo clone`, for the brownfield shapes,
+because `build_product()` branches the adoption off the clone's history. It runs
+between the two builds rather than after them. That is the only reason the flag
+exists; do not reach for it to reorder anything else.
+
 ## No secret is ever an argv element
 
 `ForgeStep.stdin` holds a *description* of what is piped in, never a value: the

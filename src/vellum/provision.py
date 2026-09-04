@@ -174,7 +174,6 @@ class Console:
     tty: bool = False
     ask: Callable[[str], str] = input
     ask_secret: Callable[[str], str] = getpass.getpass
-    out = None
 
     @classmethod
     def detect(cls) -> "Console":
@@ -860,6 +859,12 @@ class ForgeStep:
     #: True when nothing automates this: branch protection, a review, a setting
     #: on a repository this installation does not own.
     manual: bool = False
+    #: True when the LOCAL half depends on this step. Only one does — cloning
+    #: the existing product repository of a brownfield shape, without which the
+    #: adoption branch would sit on no history and push to nothing — so it runs
+    #: before the build rather than after it. It is still one entry in one list;
+    #: this only says where in the run it happens.
+    before: bool = False
 
     def command(self) -> str:
         if not self.argv:
@@ -890,8 +895,12 @@ def forge_steps(answers: Answers, *, host: str) -> list[ForgeStep]:
 
     if answers.adopting:
         steps.append(ForgeStep(
-            f"confirm the existing product repository {product} is reachable",
-            ("gh", "repo", "view", product, "--json", "name"),
+            f"clone the existing product repository {product}, so the adoption "
+            f"branch sits on its real history. Without a forge CLI: clone it "
+            f"yourself, copy the two files from the local product checkout onto "
+            f"a {ADOPT_BRANCH} branch of it, and commit",
+            ("gh", "repo", "clone", product, "--", "<product checkout>"),
+            before=True,
         ))
     # The intent repo first, in both shapes. It is the command surface
     # (spec/behaviors/security.md) and the repository the product's pin points
@@ -1191,12 +1200,14 @@ def build_product(directory: Path, answers: Answers, pin: str) -> None:
     """
     directory.mkdir(parents=True, exist_ok=True)
     if not (directory / ".git").is_dir():
+        # No clone happened: either this is greenfield, or it is an adoption
+        # with no transport to clone with (`--into`, or no `gh`). An adoption
+        # still needs a base commit to branch from — a branch with no base is
+        # not a pull request anyone could open — so it gets an empty one, and
+        # the checklist tells the operator to move these two files onto a clone
+        # of the real repository.
         _git(directory, "init", "-q", "-b", answers.branch, ".")
         if answers.adopting:
-            # An adoption needs a base commit to branch from. A real brownfield
-            # run clones the existing repository and has one; a local run
-            # (`--into`, the acceptance suite's rung) may not, and a branch with
-            # no base is not a pull request anyone could open.
             _git(directory, "commit", "-q", "--allow-empty", "-m",
                  "the existing product repo, before Vellum")
     if answers.adopting:
@@ -1447,9 +1458,16 @@ def run(
     # ------------------------------------------------------------------
     if gh is not None:
         _check_forge_names(gh, answers)
-    _check_directories(answers, intent_dir, product_dir, bool(into))
+    _check_directories(answers, intent_dir, product_dir)
 
+    places = {"<intent checkout>": str(intent_dir), "<product checkout>": str(product_dir)}
     pin, stubs = build_intent(intent_dir, answers, host=host, ref=pinned)
+    # The one forge step the local half depends on: the clone a brownfield
+    # adoption branches from. Without a transport it stays on the checklist and
+    # `build_product` makes a standalone repository instead, which is the half a
+    # checkout can hold — the checklist step says what to do with it.
+    early = [step for step in plan.steps if step.before]
+    taken = _take(gh, early, places) if gh is not None else []
     build_product(product_dir, answers, pin)
 
     check = check_seed(intent_dir, host=host)
@@ -1464,8 +1482,9 @@ def run(
         )
         return 1
 
-    taken, remaining = _perform(gh, plan, answers, console,
-                                intent_dir=intent_dir, product_dir=product_dir)
+    later, remaining = _perform(gh, plan, answers, console, places=places)
+    taken += later
+    remaining = [step for step in remaining if step not in taken]
     print("", file=stream)
     print(_report(plan, answers, pin, stubs, taken, remaining,
                   intent_dir=intent_dir, product_dir=product_dir), file=stream)
@@ -1534,8 +1553,7 @@ def _check_forge_names(gh: Gh, answers: Answers) -> None:
         )
 
 
-def _check_directories(answers: Answers, intent_dir: Path, product_dir: Path,
-                       local: bool) -> None:
+def _check_directories(answers: Answers, intent_dir: Path, product_dir: Path) -> None:
     """The same refusal, one layer down: a directory that is already something.
 
     The local half has the same hazard as the forge half and the same one
@@ -1555,12 +1573,42 @@ def _check_directories(answers: Answers, intent_dir: Path, product_dir: Path,
             f"{answers.shape} creates the product repository. Use --shape "
             f"{BROWNFIELD} to adopt what is there."
         )
-    if not local:
-        return
+
+
+def _take(gh: Gh, steps: Sequence[ForgeStep], places: dict[str, str], *,
+          values: dict[str, str | None] | None = None,
+          body: str | None = None) -> list[ForgeStep]:
+    """Run *steps* through the transport. Returns the ones it took.
+
+    A step is left untaken — and so lands on the checklist — when nothing
+    automates it, or when the secret it carries was not supplied. Neither is
+    silently skipped: both come back in the report as something to do.
+    """
+    values = values or {}
+    taken: list[ForgeStep] = []
+    written: Path | None = None
+    try:
+        for step in steps:
+            if step.manual or not step.argv:
+                continue
+            secret = next((n for n in values if step.stdin and n in step.argv), None)
+            if secret is not None and not values[secret]:
+                continue
+            argv = [places.get(arg, arg) for arg in step.argv]
+            if "<adopt PR body>" in argv:
+                written = Path(tempfile.mkdtemp(prefix="vellum-init-pr-")) / "body.md"
+                written.write_text(body or "", encoding="utf-8")
+                argv = [str(written) if arg == "<adopt PR body>" else arg for arg in argv]
+            gh.run(argv, stdin=values[secret] if secret else None)
+            taken.append(step)
+    finally:
+        if written is not None:
+            shutil.rmtree(written.parent, ignore_errors=True)
+    return taken
 
 
 def _perform(gh: Gh | None, plan: Plan, answers: Answers, console: Console, *,
-             intent_dir: Path, product_dir: Path) -> tuple[list[ForgeStep], list[ForgeStep]]:
+             places: dict[str, str]) -> tuple[list[ForgeStep], list[ForgeStep]]:
     """Take the forge steps, or take none and hand every one of them back.
 
     Returns ``(taken, remaining)``. The manual rung is not a different code
@@ -1569,40 +1617,15 @@ def _perform(gh: Gh | None, plan: Plan, answers: Answers, console: Console, *,
     """
     if gh is None:
         return [], list(plan.steps)
-
     values = {
         INTENT_SECRET: secret_for(INTENT_SECRET, console),
         PRODUCT_SECRET: secret_for(PRODUCT_SECRET, console),
     }
-    places = {
-        "<intent checkout>": str(intent_dir),
-        "<product checkout>": str(product_dir),
-    }
-
-    taken: list[ForgeStep] = []
-    remaining: list[ForgeStep] = []
-    body: Path | None = None
-    for step in plan.steps:
-        if step.manual or not step.argv:
-            remaining.append(step)
-            continue
-        secret = next((n for n in values if step.stdin and n in step.argv), None)
-        if secret is not None and not values[secret]:
-            remaining.append(step)
-            continue
-        argv = [places.get(arg, arg) for arg in step.argv]
-        if "--body-file" in argv:
-            body = Path(tempfile.mkdtemp(prefix="vellum-init-pr-")) / "body.md"
-            body.write_text(ADOPT_PR_BODY.format(
-                shape=answers.shape, intent_slug=answers.intent_slug,
-                branch=answers.branch,
-            ), encoding="utf-8")
-            argv = [str(body) if arg == "<adopt PR body>" else arg for arg in argv]
-        gh.run(argv, stdin=values[secret] if secret else None)
-        taken.append(step)
-    if body is not None:
-        shutil.rmtree(body.parent, ignore_errors=True)
-    return taken, remaining
+    steps = [step for step in plan.steps if not step.before]
+    taken = _take(gh, steps, places, values=values, body=ADOPT_PR_BODY.format(
+        shape=answers.shape, intent_slug=answers.intent_slug, branch=answers.branch,
+    ))
+    return taken, [step for step in plan.steps if step not in taken]
 
 
 def _report(plan: Plan, answers: Answers, pin: str, stubs: list[str],
