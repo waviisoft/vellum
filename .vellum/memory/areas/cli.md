@@ -13,7 +13,7 @@ symbol you can grep for.
 | Module | Holds |
 |---|---|
 | `src/vellum/cli.py` | `build_parser()`, `main()`. The only place argparse appears. |
-| `src/vellum/specfile.py` | `resolve_spec_root()`, `parse_spec_text()`, `find_fences()`, `iter_spec_files()`. |
+| `src/vellum/specfile.py` | `resolve_spec_root()`, `parse_spec_text()`, `find_fences()`, `_opens()`, `iter_spec_files()`, `Fence.language`. |
 | `src/vellum/gherkin_blocks.py` | `_documents()`, `split_documents()`, `parse_block()` -> `Block`, `_attach_id()`, `scenario_ref()`. |
 | `src/vellum/links.py` | `find_references()`, `resolve()`, `heading_anchor()`, `heading_anchors()`. |
 | `src/vellum/lint.py` | `lint_tree()`, `Finding`, the `_check_*` functions. |
@@ -191,6 +191,40 @@ violation of invariant 4". Do not delete it as dead code; deleting it discards
 a working implementation of a written decision.
 `test_background_steps_would_count_toward_the_fingerprint` pins it directly,
 since no fixture can carry a Background any more.
+
+**A fence's language is the first word of its info string, and the opening and
+closing rules are asymmetric on purpose.** CommonMark (§4.5) makes the info
+string free text: an *opening* fence may carry one, a *closing* fence carries
+nothing. `_FENCE_RE` in `src/vellum/specfile.py` used to match a single bare
+word, which rejected ```` ```gherkin title=demo ```` as an opening while still
+accepting that block's own bare closing line as one — so the closer opened a
+phantom fence that ran to the *next* block's opener and swallowed it whole
+(waviisoft/vellum#10). Two gherkin blocks became one language-less fence: lint
+was silent and `extract` exited 0 with both scenarios missing, which is the
+"exit 0 while omitting a scenario" class waviisoft/vellum#7 closed for the
+parse half. The blast radius was never limited to `gherkin` — *any* attributed
+info string, ```` ```python foo=bar ```` included, desynced everything below it
+in the file.
+
+Read the language through `Fence.language`, never off `Fence.info`: the two
+were the same string only while an info string could not hold a second word,
+and `info` now carries the attributes as written. **The attributes are ignored
+— decided, not deferred.** Nothing reads `title=`, and inventing a meaning for
+one would make a spec tree depend on a markdown convention no two renderers
+agree on. `_opens()` is the one thing that can still refuse an opening, and it
+refuses exactly one shape: a backtick fence whose info string holds a backtick,
+because otherwise an inline code span starting a line would open a block.
+
+Measured before and after rather than assumed: the old and new rules produce an
+identical fence set on all 81 distinct markdown blob revisions in the intent
+repo's spec ancestry (23 spec commits), and `suite.json` at the pin
+(`ce74822b`) is byte-identical across the change at 26 scenarios. The script is
+a walk of `spec_commits()` running both rules over each blob and diffing the
+`(language, start_line, end_line, body)` tuples. `tests/test_specfile.py` is
+where the markdown layer is pinned, and it exists as its own file for a reason
+worth keeping: lint and extraction read the same `SpecFile.fences`, so a fence
+the *markdown* parser missed was missing from both at once, and asserting it
+through either command alone would locate the defect in the wrong module.
 
 **Extraction refuses the tree it was handed; the walk behind it does not.**
 `extract()` scans every spec file through `scan_file()` and raises

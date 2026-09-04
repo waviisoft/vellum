@@ -1,5 +1,6 @@
 """``vellum lint``: frontmatter schema, cross-references, gherkin parsing."""
 
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -7,6 +8,7 @@ from support import (
     FIXTURES,
     intent_checkout,
     intent_spec_tree,
+    make_raw_tree,
     pinned_scenario_count,
     run_cli,
 )
@@ -434,6 +436,111 @@ class TestMultiFeatureFences(unittest.TestCase):
         self.assertEqual([f.name for f in block.features], ["Real"])
         self.assertEqual(len(block.scenarios), 1)
         self.assertEqual(len(block.scenarios[0].steps), 2)
+
+
+class TestFenceInfoStrings(unittest.TestCase):
+    """A fence's language is its info string's first word (waviisoft/vellum#10).
+
+    Lint's stake in this is the whole of the issue's severity. Lint and
+    extraction read the same ``SpecFile.fences``, so a fence the markdown
+    parser did not see was invisible to *both*: lint said nothing and the
+    suite came back short, which is the "exit 0 while omitting a scenario"
+    hole spec/features/spec-pipeline.md exists to close. These assert lint's
+    half; ``tests/test_suite.py`` asserts extraction's, against the same
+    shapes.
+    """
+
+    def lint_bodies(self, bodies):
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = make_raw_tree(Path(tmp), bodies)
+            return lint_tree(tree)
+
+    def test_an_attributed_gherkin_fence_is_linted_like_any_other(self):
+        # A block that does not parse, in a fence whose info string carries an
+        # attribute. Before the fix this drew no finding at all — the fence
+        # was not a fence, so GH001 never looked inside it.
+        findings = self.lint_bodies(
+            {
+                "demo": (
+                    "```gherkin title=demo\n"
+                    "Feature: X\n"
+                    "  Scenario: An unclosed docstring runs off the end\n"
+                    "    Given a payload\n"
+                    '      """\n'
+                    '      {"still": "open"\n'
+                    "    Then it is rejected\n"
+                    "```"
+                )
+            }
+        )
+        self.assertEqual([f.code for f in findings], ["GH001"])
+
+    def test_the_block_after_an_attributed_one_is_still_linted(self):
+        # The desync, as lint sees it: the first block's closing line used to
+        # open a phantom fence that ran past the second block's opener, so a
+        # defect in *either* block went unreported. One run finds both.
+        findings = self.lint_bodies(
+            {
+                "demo": (
+                    "```gherkin title=demo\n"
+                    "Feature: First\n"
+                    "  Scenario: No id here\n"
+                    "    Given a thing\n"
+                    "```\n"
+                    "\n"
+                    "Prose between the blocks.\n"
+                    "\n"
+                    "```gherkin\n"
+                    "Feature: Second\n"
+                    "  Scenario: Nor here\n"
+                    "    Given a thing\n"
+                    "```"
+                )
+            }
+        )
+        self.assertEqual([f.code for f in findings], ["GH005", "GH005"])
+        self.assertEqual([f.line for f in findings], [11, 19])
+
+    def test_a_non_gherkin_fence_with_attributes_is_skipped_and_desyncs_nothing(self):
+        # `python foo=bar` is not gherkin and draws nothing on its own account.
+        # What matters is that it no longer takes the gherkin block below it
+        # down with it.
+        findings = self.lint_bodies(
+            {
+                "demo": (
+                    "```python foo=bar\n"
+                    "print('not gherkin')\n"
+                    "```\n"
+                    "\n"
+                    "```gherkin\n"
+                    "Feature: Still visible\n"
+                    "  Scenario: No id here\n"
+                    "    Given a thing\n"
+                    "```"
+                )
+            }
+        )
+        self.assertEqual([f.code for f in findings], ["GH005"])
+
+    def test_a_clean_attributed_block_draws_nothing(self):
+        # The negative control: attributes are ignored, not faulted. A rule
+        # that fired on the attribute itself would pass every test above.
+        self.assertEqual(
+            self.lint_bodies(
+                {
+                    "demo": (
+                        "```gherkin title=demo hl_lines='2 3'\n"
+                        "Feature: Fine\n"
+                        "  @id:attributed-fence-is-fine\n"
+                        "  Scenario: Fine\n"
+                        "    Given a thing\n"
+                        "    Then it works\n"
+                        "```"
+                    )
+                }
+            ),
+            [],
+        )
 
 
 class TestPinnedSpecTree(unittest.TestCase):

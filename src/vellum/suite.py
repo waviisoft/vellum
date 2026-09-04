@@ -197,7 +197,7 @@ def scan_file(sf: SpecFile) -> tuple[list[Scenario], list[BlockError]]:
     found: list[Scenario] = []
     failed: list[BlockError] = []
     for fence in sf.fences:
-        if fence.info != "gherkin":
+        if fence.language != "gherkin":
             continue
         try:
             block = parse_block(fence.body, fence.body_line)

@@ -67,6 +67,13 @@ intent repo containing it — `vellum lint ../vellum-intent` works on a checkout
 and `vellum lint spec/` works from inside the intent repo, where `spec/` is the
 tree.
 
+**A fenced block's language is the first word of its info string, and anything
+after it is ignored.** CommonMark makes the info string free text, so
+```` ```gherkin title=demo ```` is a gherkin block and extracts like any other;
+`title=demo` is carried for a reader and interpreted by nothing. `lint` and
+`suite extract` read one parse of each file, so they always agree about which
+fences a tree has.
+
 ### `vellum lint <spec-dir>`
 
 Checks frontmatter against the schema (`decisions/` files carry a `date`,
