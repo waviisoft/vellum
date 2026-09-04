@@ -16,6 +16,10 @@ made once by hand at review time:
 * `set -o pipefail` precedes any `tee`, without which the step takes `tee`'s
   status and a gate can never close;
 * `persist-credentials: false` on every checkout but the one that pushes;
+* `VELLUM_TOKEN` is declared `required: false` and the CLI checkout falls back
+  to the caller's own `github.token`, so an installation with no token to pass
+  still runs — `actions/checkout` reads `token` as a required input, so an
+  empty one is a failed step rather than a default;
 * the caller stub grants at least the permissions the shipped workflow's jobs
   ask for — a called workflow's token can only be narrowed by the callee, so a
   stub that grants too little makes a job that is refused at the point of use,
@@ -94,6 +98,74 @@ class TheShippedWorkflowsAreReusable(unittest.TestCase):
             self.assertIn("vellum-ref", call["inputs"], shipped.filename)
             self.assertTrue(call["inputs"]["vellum-ref"]["required"], shipped.filename)
             self.assertIn("VELLUM_TOKEN", call["secrets"], shipped.filename)
+
+    def test_the_secret_is_declared_optional(self):
+        """`required: true` refuses the run of a caller that omits the key.
+
+        Which is what the shipped workflows wanted while `waviisoft/vellum` was
+        private and no run could install the CLI without a token. It is public
+        now, so a caller with no secret to pass has to be able to call these —
+        and `required: false` is the only thing that lets it. The declaration
+        still exists, so a caller that HAS a token still passes it by name.
+        """
+        for shipped in SHIPPED:
+            call = triggers(load(WORKFLOWS / shipped.filename))["workflow_call"]
+            self.assertIs(
+                call["secrets"]["VELLUM_TOKEN"]["required"], False,
+                f"{shipped.filename} declares VELLUM_TOKEN required; a caller "
+                f"that passes no token could not call it",
+            )
+
+    def test_the_cli_checkout_falls_back_to_the_callers_own_token(self):
+        """An empty `token:` is an ERROR to `actions/checkout`, not a default.
+
+        It reads the input as required, so `token: ${{ secrets.VELLUM_TOKEN }}`
+        with an unset secret fails the step outright rather than falling back to
+        `github.token` — which is what made the secret mandatory in the first
+        place. The `||` supplies the default explicitly, so the same line covers
+        an installation with a token and one without.
+
+        Written as one expression rather than as two checkout steps with
+        opposite `if:` conditions because the `secrets` context is not available
+        in an `if:` at all; that shape needs the secret laundered through a step
+        output first, and a mis-set output runs both checkouts or neither
+        without reddening.
+        """
+        want = "${{ secrets.VELLUM_TOKEN || github.token }}"
+        for shipped in SHIPPED:
+            checkouts = 0
+            for job, step in steps(load(WORKFLOWS / shipped.filename)):
+                with_ = step.get("with") or {}
+                if with_.get("repository") != HOST_REPO:
+                    continue
+                checkouts += 1
+                self.assertEqual(
+                    with_.get("token"), want,
+                    f"{shipped.filename}:{job} checks {HOST_REPO} out with "
+                    f"{with_.get('token')!r}; an installation that passes no "
+                    f"secret gets an empty token and a failed step",
+                )
+            self.assertGreater(checkouts, 0, shipped.filename)
+
+    def test_no_shipped_workflow_fails_a_run_for_a_missing_token(self):
+        """The `Require the VELLUM_TOKEN secret` steps are notices now.
+
+        A step that exits non-zero on an empty secret would make the secret
+        mandatory again from inside the body, whatever the `secrets:` block
+        says. Matched on what such a step would have to do — test the secret and
+        leave the run — rather than on the step's name, which is decoration.
+        """
+        for shipped in SHIPPED:
+            for job, name, body in run_bodies(WORKFLOWS / shipped.filename):
+                if "VELLUM_TOKEN" not in body:
+                    continue
+                self.assertNotIn(
+                    "exit 1", body,
+                    f"{shipped.filename}:{job}:{name} reads VELLUM_TOKEN and can "
+                    f"exit non-zero; the secret is optional and a missing one is "
+                    f"a `::notice`, not a failure",
+                )
+                self.assertIn("::notice", body, f"{shipped.filename}:{job}:{name}")
 
     def test_the_cli_is_checked_out_at_the_input_ref_and_nothing_else_names_a_repo(self):
         """The caller's checkout is implicit; this repo's is explicit.

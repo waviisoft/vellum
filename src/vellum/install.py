@@ -86,11 +86,14 @@ What a checkout cannot know
 ---------------------------
 Two things, said rather than passed over (``spec/features/installation.md``):
 whether the ``VELLUM_TOKEN`` secret is actually set, which is forge state; and
-whether the forge permits reuse of a private repository's workflows within the
-organization, which is an Actions setting on ``waviisoft/vellum``. ``doctor``
-prints both every time. Ref currency is the third thing a bare checkout cannot
-answer — it needs the *release* side — and it is reported, never failed on,
-mirroring the divergence posture (``spec/features/repo-topology.md``).
+whether the forge permits the workflows of ``waviisoft/vellum`` to be reused by
+another repository, which is an Actions setting on that repo for as long as it
+is private. ``doctor`` prints both every time. The first of the two is softer
+than it was — the secret is optional now, so an unset one is a fallback to the
+caller's own job token rather than a failed run — but it is still forge state
+and still unreadable from here. Ref currency is the third thing a bare checkout
+cannot answer — it needs the *release* side — and it is reported, never failed
+on, mirroring the divergence posture (``spec/features/repo-topology.md``).
 """
 
 from __future__ import annotations
@@ -606,13 +609,18 @@ class Init:
 CANNOT_KNOW = [
     "What a checkout cannot tell you, and this command therefore did not check:",
     f"  * whether the {SECRET} secret is set on the intent repo. That is forge",
-    "    state, not repository state. Each shipped workflow asserts it in its",
-    "    first step and fails with a named error when it is empty.",
+    "    state, not repository state. The secret is OPTIONAL: a shipped workflow",
+    "    that finds it empty raises a notice and checks the CLI out with the",
+    f"    caller's own job token instead, which reads {HOST_REPO} once that",
+    "    repo is public. While it is private, an installation that passes no",
+    "    token fails at that checkout.",
     f"  * whether {HOST_REPO} allows its workflows to be reused by other",
-    "    repositories in the organization. It is a private repo, so reuse needs",
-    "    Actions > General > 'Accessible from repositories in the organization'",
-    "    on it. Without that the caller's run fails at `uses:` with a resolution",
-    "    error, and nothing in either checkout can see the setting.",
+    "    repositories. While it is a private repo, reuse needs Actions >",
+    "    General > 'Accessible from repositories in the organization' on it,",
+    "    which also means only repositories in the SAME organization can call",
+    "    them; once it is public any repository can. Without that setting the",
+    "    caller's run fails at `uses:` with a resolution error, and nothing in",
+    "    either checkout can see the setting.",
 ]
 
 
@@ -937,6 +945,20 @@ def inspect(
             f"runs, and upgrading is bumping it (spec/features/installation.md)."
         )))
 
+    # A stub that passes NO secret is VALID, and that is a deliberate narrowing.
+    # The shipped workflows declare `VELLUM_TOKEN` as `required: false` and fall
+    # back to the caller's own `github.token`, which reads the host repo once
+    # it is public — so "passes no secret" is now an installation that needs
+    # none, not one that will fail in its first step. There was a `no-secret`
+    # finding here and it is gone with the requirement it enforced.
+    #
+    # What did NOT relax is where a secret IS passed. `secrets: inherit` is
+    # still a finding (a reusable workflow gets the caller's whole secret set,
+    # which is the least-authority rule in spec/features/installation.md, and
+    # that rule is about the secrets that ARE passed rather than about this one
+    # being mandatory). And a stub passing a DIFFERENT secret under this name is
+    # still `secret-remapped`: the loop below runs on whatever is there, so
+    # omitting the key is fine and misusing it is not.
     secrets = caller.get("secrets")
     if secrets == "inherit":
         found.append(Finding(relative, "secrets-inherit", (
@@ -944,13 +966,7 @@ def inspect(
             "reusable workflow holds exactly the credential its job names and "
             "nothing else in this installation (spec/features/installation.md)."
         )))
-    elif not isinstance(secrets, dict) or SECRET not in secrets:
-        found.append(Finding(relative, "no-secret", (
-            f"does not pass {SECRET} by name. The shipped workflow declares it and "
-            f"checks it out {host} with it; without it every run fails in its first "
-            f"step."
-        )))
-    else:
+    elif isinstance(secrets, dict):
         # "By name" has to mean the value too. `VELLUM_TOKEN:
         # ${{ secrets.ORG_ADMIN_PAT }}` passes any check made by key alone, and
         # what reaches the reusable workflow under the name it audits is a
