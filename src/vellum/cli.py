@@ -272,7 +272,15 @@ def _add_certify(sub) -> None:
         choices=list(CERTIFICATION_RESULTS),
         help="what the run found",
     )
-    rec.add_argument("--run", help="reference to the recorded run (a URL or id)")
+    rec.add_argument(
+        "--run",
+        help="reference to the recorded run (a URL or id). It must be "
+             "credential-free: this value is committed to the intent repo and "
+             "echoed by every `certify check`, so a token in one is published "
+             "twice. Userinfo and query string are stripped from a URL-shaped "
+             "value on the way in and on the way out, which is a backstop and "
+             "not a licence to pass a secret here",
+    )
     rec.add_argument("--at", help="when the run finished, ISO 8601 (default: now, UTC)")
 
     chk = certify_sub.add_parser(

@@ -31,7 +31,17 @@ SINCE_RE = re.compile(r"^spec-v(\d+)$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
-_FENCE_RE = re.compile(r"^(\s*)(`{3,}|~{3,})\s*([A-Za-z0-9_+-]*)\s*$")
+#: A fence line: indent, marker, then the info string as free text.
+#: CommonMark (§4.5) puts no constraint on what an info string may contain
+#: beyond "no backtick in a backtick fence's", and matching only a single bare
+#: word here is what desynced opening from closing (waviisoft/vellum#10): a
+#: two-word info string made the opening line invisible, so its *closing* line
+#: opened a phantom fence that swallowed the next block. Meaning is read from
+#: the first word alone -- see ``Fence.language``.
+# The trailing `\s*$` (not `[ \t]*$`) matters: a CRLF line ends in `\r`, and a
+# closer whose captured info string is "\r" is not a closer, so a CRLF file
+# would collapse into one fence — the phantom-fence class this rule exists to end.
+_FENCE_RE = re.compile(r"^(\s*)(`{3,}|~{3,})[ \t]*(.*?)\s*$")
 
 
 class SpecTreeError(Exception):
@@ -65,12 +75,32 @@ def schema_for(relpath: str) -> dict:
 class Fence:
     """A fenced code block. ``start_line``/``end_line`` are 1-based, inclusive."""
 
+    #: The info string exactly as written, stripped of surrounding whitespace.
+    #: Free text (CommonMark §4.5); ``language`` is the part with meaning.
     info: str
     start_line: int
     end_line: int
     body: str
     #: 1-based line of the first line of ``body``.
     body_line: int
+
+    @property
+    def language(self) -> str:
+        """The info string's first word, lowercased — the block's language.
+
+        Everything after that first word is an **attribute list, and this
+        project ignores it entirely**: ```` ```gherkin title=demo ```` is a
+        gherkin block, extracts like any other, and nothing anywhere reads
+        ``title``. Attributes are carried on ``info`` for a reader, never
+        interpreted — inventing a meaning for one here would make a spec tree
+        depend on a markdown convention no renderer agrees on.
+
+        Read the language through this property rather than off ``info``: the
+        two were the same string only while the info string could not hold a
+        second word, which is the condition waviisoft/vellum#10 removed.
+        """
+        words = self.info.split()
+        return words[0].lower() if words else ""
 
 
 @dataclass
@@ -91,13 +121,35 @@ class SpecFile:
         return spec_kind(self.relpath)
 
 
+def _opens(m: re.Match) -> bool:
+    """Whether a fence line can *open* a block.
+
+    Only one thing disqualifies one: a backtick fence's info string may not
+    contain a backtick (CommonMark §4.5), or an inline code span in a
+    paragraph would open a block. A tilde fence's info string may hold
+    anything at all.
+    """
+    return not (m.group(2)[0] == "`" and "`" in m.group(3))
+
+
 def find_fences(lines: list[str]) -> list[Fence]:
-    """Fenced code blocks, matched on fence length and character like CommonMark."""
+    """Fenced code blocks, matched on fence length and character like CommonMark.
+
+    Opening and closing are asymmetric, and that asymmetry is what keeps the
+    two in step: an opening fence may carry an info string, a closing fence
+    carries nothing (CommonMark §4.5). So a line that is *not* recognised as
+    an opening must not be recognised as a closing either — the bug this
+    replaced (waviisoft/vellum#10) came from a rule that rejected
+    ``gherkin title=demo`` as an opening while still accepting the block's own
+    bare closing line, which then opened a phantom fence over everything up to
+    the next block's opener and hid both blocks from lint and extraction at
+    once.
+    """
     fences: list[Fence] = []
     i = 0
     while i < len(lines):
         m = _FENCE_RE.match(lines[i])
-        if not m:
+        if not m or not _opens(m):
             i += 1
             continue
         indent, marker, info = m.group(1), m.group(2), m.group(3)
@@ -121,7 +173,7 @@ def find_fences(lines: list[str]) -> list[Fence]:
             ]
         fences.append(
             Fence(
-                info=info.lower(),
+                info=info,
                 start_line=start + 1,
                 end_line=end + 1,
                 body="\n".join(body_lines),

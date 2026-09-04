@@ -141,7 +141,7 @@ def _check_gherkin(sf: SpecFile) -> tuple[list[Finding], list[Scenario]]:
     findings: list[Finding] = []
     scenarios: list[Scenario] = []
     for fence in sf.fences:
-        if fence.info != "gherkin":
+        if fence.language != "gherkin":
             continue
         try:
             block = parse_block(fence.body, fence.body_line)
