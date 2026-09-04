@@ -103,8 +103,8 @@ class TheShippedWorkflowsAreReusable(unittest.TestCase):
         """`required: true` refuses the run of a caller that omits the key.
 
         Which is what the shipped workflows wanted while `waviisoft/vellum` was
-        private and no run could install the CLI without a token. It is public
-        now, so a caller with no secret to pass has to be able to call these —
+        private and no run could install the CLI without a token. Once it is
+        public, a caller with no secret to pass has to be able to call these —
         and `required: false` is the only thing that lets it. The declaration
         still exists, so a caller that HAS a token still passes it by name.
         """

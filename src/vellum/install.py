@@ -985,6 +985,17 @@ def inspect(
                 f"(spec/features/installation.md); a remapped value hands it a "
                 f"different one under an audited name."
             )))
+    elif secrets is not None:
+        # Neither `inherit` nor a mapping: a list, a bare string, `Inherit`.
+        # GitHub refuses such a stub at parse time, so it is not an exposure —
+        # but doctor's one job is to say whether what is installed is what
+        # ships, and a stub GitHub will not even run is not that.
+        found.append(Finding(relative, "secrets-malformed", (
+            f"carries `secrets:` as {one_line(str(secrets))!r}, which is neither "
+            f"`inherit` nor a mapping of secret names to `${{{{ secrets.<name> }}}}` "
+            f"references. The forge refuses the stub at parse time; stamp it "
+            f"again with `vellum init --force`."
+        )))
 
     inputs = caller.get("with")
     passed = inputs.get(REF_INPUT) if isinstance(inputs, dict) else None

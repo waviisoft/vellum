@@ -378,6 +378,26 @@ class DoctorOverAnInstalledCheckout(InstallCase):
         code, out = run_cli(["doctor", str(checkout)])
         self.assertEqual(code, 0, out)
 
+    def test_a_malformed_secrets_value_is_a_finding(self):
+        """`secrets:` that is neither `inherit` nor a mapping is reported.
+
+        `secrets: [VELLUM_TOKEN]` is how a stub looks when someone remembers
+        the name and forgets the shape. The forge refuses it at parse time, so
+        nothing leaks — but doctor's job is installed-matches-shipped, and a
+        stub the forge will not run is not that. Before this branch existed the
+        value fell through both arms and doctor said `ok`.
+        """
+        checkout = self.install()
+        stub = checkout / WORKFLOWS / "harness-ci.yml"
+        text = stub.read_text(encoding="utf-8")
+        text = text.replace("      VELLUM_TOKEN: ${{ secrets.VELLUM_TOKEN }}\n", "")
+        text = text.replace("    secrets:\n", "    secrets: [VELLUM_TOKEN]\n")
+        stub.write_text(text, encoding="utf-8")
+        code, out = run_cli(["doctor", str(checkout)])
+        self.assertEqual(code, 1, out)
+        self.assertIn("secrets-malformed", out)
+        self.assertIn("harness-ci.yml", out)
+
     def test_a_stub_that_passes_no_secret_still_has_its_other_halves_checked(self):
         """Dropping the secret must not drop the rest of the audit with it.
 
