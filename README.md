@@ -2,9 +2,15 @@
 
 The product repo for **Vellum**, a spec-driven product engineering system: the
 specification is the product and the code is a build artifact of it. This repo
-holds the `vellum` CLI and the forge adapters. Intent — the spec, its
-scenarios, the harness and the ledger — lives in
-[waviisoft/vellum-intent](https://github.com/waviisoft/vellum-intent).
+holds the `vellum` CLI and the forge adapters. It is MIT licensed — see
+[`LICENSE`](LICENSE).
+
+Vellum works on a **pair** of repositories: a product repo like this one, and an
+*intent* repo holding the spec, its scenarios, the harness and the ledger. This
+repo's own intent repo is
+[waviisoft/vellum-intent](https://github.com/waviisoft/vellum-intent), which is
+private — Vellum's own spec is not published. An installation of Vellum has its
+own pair, and none of the slugs below are shared with it.
 
 `.vellum/product.yaml` **is** the pin: `pin.commit` names the spec version this
 code implements, so conformance is a property of the checkout. Nothing is
@@ -289,10 +295,17 @@ cut no `v*` tag yet**, so install with `--ref main` until it does.
 
 Verifies installed-matches-shipped from the checkout alone: every shipped
 workflow has a stub, each stub parses, names the shipped workflow, pins a ref,
-and passes its secret by name **and by value** — `VELLUM_TOKEN: ${{
+and passes any secret it does pass by name **and by value** — `VELLUM_TOKEN: ${{
 secrets.ORG_ADMIN_PAT }}` satisfies any check made by key alone and hands the
 reusable workflow a different credential under the name it audits, so it is a
 `secret-remapped` finding.
+
+**A stub that passes no secret at all is not a finding.** `VELLUM_TOKEN` is
+declared `required: false` by every shipped workflow, which check the CLI out
+with the calling repository's own `github.token` when nothing is passed. The
+secret is for reading a `waviisoft/vellum` that is private, or a fork of it that
+is; an installation that needs neither passes nothing. `secrets: inherit` is
+still a finding — that rule is about the secrets a stub *does* hand over.
 
 **A stub edited in place to carry logic — a job of its own, or any `run:` — is a
 finding, named by file.** So is anything on the delegating job beyond `uses:`,
@@ -330,8 +343,10 @@ divergence to summarise, not a broken install.
 
 **What a checkout cannot know, doctor says it cannot check** rather than passing
 over — whether the `VELLUM_TOKEN` secret is set, and whether the forge allows
-reuse of this private repo's workflows within the organization. Both are forge
-state, and both are printed on a green run too.
+this repo's workflows to be reused by the repository calling them (an Actions
+setting on this repo for as long as it is private, and one that also limits
+callers to the same organization). Both are forge state, and both are printed on
+a green run too.
 
 ## The mechanical guards
 
@@ -465,19 +480,23 @@ item's cost from a caller that knows — the same shape as `backpressure
 | `.vellum/memory/` | Area notes, wave worklogs, and the map. Start at [`.vellum/memory/map.md`](.vellum/memory/map.md). |
 | `.vellum/product.yaml` | Backref to the intent repo, and **the pin of record**. |
 
-## CI and the private spec
+## CI, and this repo's private spec
 
 `.github/workflows/ci.yml` runs the tests on 3.10 and 3.12 without the spec
 tree — the suite builds its own fixtures, and the few checks that need the real
-spec skip themselves.
+spec skip themselves. Everything in this section is about **this** repo's own
+CI; an installation's product repo has an equivalent of its own, pointed at its
+own intent repo.
 
-The `conformance` job does need it, and the intent repo is private: a
-workflow's default `GITHUB_TOKEN` only reaches its own repository. Set a
-repository secret **`SPEC_TOKEN`** with read access to `waviisoft/vellum-intent`
-and the job fetches the intent repo, moves it to the pin, lints it, extracts
-the suite, re-runs the tests the other job skipped, and asserts the suite was
-extracted at the pin with nothing pending. Without the secret it reports
-`Conformance NOT VERIFIED` rather than passing quietly.
+The `conformance` job does need the spec tree, and `waviisoft/vellum-intent` is
+private and stays private: a workflow's default `GITHUB_TOKEN` only reaches its
+own repository. So this repo sets a repository secret **`SPEC_TOKEN`** with read
+access to it, and the job fetches the intent repo, moves it to the pin, lints
+it, extracts the suite, re-runs the tests the other job skipped, and asserts the
+suite was extracted at the pin with nothing pending. Without the secret it
+reports `Conformance NOT VERIFIED` rather than passing quietly. A fork sets its
+own `SPEC_TOKEN` for its own intent repo, or drops the job; this one grants
+nothing to anybody else.
 
 **A pin behind `spec-head` is reported, never failed on.** Conformance CI's job
 is the checkout against its pin; divergence is summarised with the versions
@@ -485,9 +504,16 @@ that have landed since, and the backpressure on divergence acts at spec
 approval instead (`spec/features/repo-topology.md`). A red that fires on every
 spec merge, on every branch including the base, trains people to ignore red.
 
-Jobs run on Blacksmith runners (`blacksmith-2vcpu-ubuntu-2204`). This
-organisation does not schedule GitHub-hosted runners: `ubuntu-latest` is never
-assigned one, and the job fails in seconds with no logs rather than saying so.
+Jobs run on Blacksmith runners (`blacksmith-2vcpu-ubuntu-2204`). That is a
+hosting choice by WAVIISoft, the organisation that publishes this repo, and not
+something Vellum requires: WAVIISoft schedules its Actions on Blacksmith rather
+than on GitHub-hosted runners, so in its setup `ubuntu-latest` is never assigned
+one and the job fails in seconds with no logs rather than saying so. A fork in
+an organisation without the Blacksmith app changes every `runs-on:` in these
+files to labels its own runners answer to. The same applies to the three
+reusable workflows, where it costs more, because an installation cannot override
+the label from its stub — see
+[`adapters/github/README.md`](adapters/github/README.md).
 
 ## Acceptance criteria in the ledger
 
