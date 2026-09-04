@@ -35,8 +35,16 @@ product:
 # `.github/workflows/` joined the implementer's trees with the installer wave
 # (spec/features/installation.md): the adapter logic ships from here as
 # reusable workflows, so they are product code an implementer maintains.
+#
+# `pyproject.toml` and `LICENSE` joined them with the go-live wave. Both are
+# packaging metadata for the code an implementer already owns — the licence
+# declaration, its file, and the build requirements that declaration needs —
+# and neither is anybody else's tree. They are named individually rather than
+# by widening the boundary to the repository root: a root entry would put
+# `.vellum/product.yaml` itself, and this very block, inside the implementer's
+# reach, which is the one edit this guard exists to make somebody argue for.
 write_boundaries:
-  implementer: [src, tests, .vellum/memory, adapters, README.md, .github/workflows]
+  implementer: [src, tests, .vellum/memory, adapters, README.md, .github/workflows, pyproject.toml, LICENSE]
 
 # The spec-first guard and the certification runner arrive in v0.2
 # (docs/design.md section 10); nothing in this repo enforces them yet.

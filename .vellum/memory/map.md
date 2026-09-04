@@ -12,7 +12,8 @@ notes live in `.vellum/memory/areas/`; wave worklogs in `.vellum/memory/waves/`.
 | `tests/` | `unittest` suite plus fixture spec trees under `tests/fixtures/`. |
 | `.github/workflows/` | `ci.yml` tests this repo; `spec-ci.yml`, `on-spec-merge.yml` and `harness-ci.yml` are **reusable** (`workflow_call`) workflows an installation's intent repo calls, and never run here. See `.vellum/memory/areas/adapters-github.md`. |
 | `adapters/github/` | The **caller stubs** an intent repo carries, rendered by `vellum init` from `vellum.install.SHIPPED`. See `.vellum/memory/areas/adapters-github.md`. |
-| `.vellum/product.yaml` | Backref to the intent repo, and the pin of record — `pin.commit`. Nothing mounts the intent repo here; CI fetches it, and tests read `VELLUM_INTENT_REPO`. |
+| `.vellum/product.yaml` | Backref to the intent repo, and the pin of record — `pin.commit`. Nothing mounts the intent repo here; CI fetches it, and tests read `VELLUM_INTENT_REPO`. Also `write_boundaries`, which `vellum verify boundaries` reads. |
+| `LICENSE`, `pyproject.toml` | MIT, and the packaging metadata that declares and ships it. The `setuptools>=77` floor is load-bearing — see `.vellum/memory/waves/go-live-prep.md`. |
 
 ## Areas
 
@@ -28,6 +29,7 @@ notes live in `.vellum/memory/areas/`; wave worklogs in `.vellum/memory/waves/`.
 - [`.vellum/memory/waves/versions-are-commits.md`](waves/versions-are-commits.md) — versions became commits, the pin became a file, minting shrank, `Rule:` banned.
 - [`.vellum/memory/waves/cli-absorbs-workflows.md`](waves/cli-absorbs-workflows.md) — the workflow bodies became `vellum mint`, `vellum backpressure`, `vellum pin advance`.
 - [`.vellum/memory/waves/adapters-install-thin.md`](waves/adapters-install-thin.md) — the adapters became reusable workflows plus caller stubs; `vellum init` and `vellum doctor`.
+- [`.vellum/memory/waves/go-live-prep.md`](waves/go-live-prep.md) — MIT licence and packaging metadata; `VELLUM_TOKEN` became optional; a stranger's read over the prose.
 - [`.vellum/memory/waves/installer-provisions-the-pair.md`](waves/installer-provisions-the-pair.md) — `vellum init` grew a provisioning mode: three shapes, a plan, `gh` as the transport, and the seed.
 
 Worklogs up to `spec-v6.md` are named for the version they landed at. This one

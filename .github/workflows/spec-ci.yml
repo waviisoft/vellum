@@ -4,9 +4,10 @@
 # `workflow_call` workflow is the forge's own answer to "ship once, install
 # thin" (spec/features/installation.md, issue waviisoft/vellum-intent#23). An
 # intent repo carries a caller stub — `adapters/github/spec-ci.yml`, stamped by
-# `vellum init` — naming this file at a pinned ref and passing the one secret
-# it needs. The stub holds no logic, so it has nothing to drift; upgrading an
-# installation is bumping the ref in the stub.
+# `vellum init` — naming this file at a pinned ref, and passing VELLUM_TOKEN if
+# it has one to pass: that secret is optional (see `secrets:` below). The stub
+# holds no logic, so it has nothing to drift; upgrading an installation is
+# bumping the ref in the stub.
 #
 # THIS FILE NEVER RUNS FOR THIS REPO. It has no trigger of its own: `on:` is
 # `workflow_call` and nothing else, so `waviisoft/vellum`'s own PRs and pushes
@@ -19,12 +20,15 @@
 # installation's, not this repo's. The one checkout of THIS repo is the CLI
 # checkout, which names `waviisoft/vellum` and `inputs.vellum-ref` explicitly.
 #
-# Runners are Blacksmith (`blacksmith-2vcpu-ubuntu-2204`), matching this
-# organisation's setup — `ubuntu-latest` is never assigned a runner here, and a
-# job that asks for one is accepted and then fails in seconds with no logs. An
-# installation outside this organisation has to run this on its own labels;
-# that is a real limit of hosting the bodies centrally and it is named in
-# adapters/github/README.md rather than hidden.
+# Runners are Blacksmith (`blacksmith-2vcpu-ubuntu-2204`). That is a hosting
+# choice made by WAVIISoft, the organisation that publishes this repo, and not
+# a property of Vellum: WAVIISoft routes Actions through Blacksmith, so
+# `ubuntu-latest` is never assigned a runner there and a job that asks for one
+# is accepted and then fails in seconds with no logs. An installation in an
+# organisation without Blacksmith must run these jobs on labels of its own, and
+# today that means forking this repo and editing the label, because the label
+# lives in this file and no input overrides it. See adapters/github/README.md,
+# where the limit and the fix are stated in full.
 #
 # Implements spec/features/spec-pipeline.md: "Spec CI runs on every spec PR:
 # lint ..., coherence review (agent), coverage review (agent), and an impact
@@ -53,11 +57,15 @@ on:
     secrets:
       VELLUM_TOKEN:
         description: >-
-          A token that can read waviisoft/vellum, which is private. Declared
-          and passed BY NAME: a stub never uses `secrets: inherit`, so this
-          workflow holds exactly the credential its jobs name and nothing else
-          in the installation (spec/features/installation.md).
-        required: true
+          A token that can read waviisoft/vellum, the repo the CLI is installed
+          from. OPTIONAL: `required: false`, because once that repo is public
+          the caller's own `github.token` reads it and an installation that
+          passes nothing here still runs. Supply it while the repo is private,
+          or to reach a fork that is not public. When it IS passed it is passed
+          BY NAME — a stub never uses `secrets: inherit`, so this workflow holds
+          exactly the credential its jobs name and nothing else in the
+          installation (spec/features/installation.md).
+        required: false
 
 # Granted by the caller and consumed here. A called workflow's token can only
 # be narrowed by the callee, never widened, so the stub grants
@@ -91,30 +99,56 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Require the VELLUM_TOKEN secret
+      # A NOTICE, NOT A GATE — this step used to `exit 1` on an empty secret.
+      # VELLUM_TOKEN is optional now: the CLI checkout below falls back to the
+      # caller's own `github.token`, which reads waviisoft/vellum once that repo
+      # is public. What is left worth saying is WHICH of the two the run used,
+      # because a checkout that 404s against a repo that is still private is
+      # otherwise an opaque failure two steps further down.
+      #
+      # The secret reaches this body through `env:` and is only ever tested for
+      # emptiness — never echoed, never interpolated. `required: false` does not
+      # make this step redundant: it catches a caller that omits the key, and
+      # never an empty one, which is the case this reports.
+      - name: Say whether VELLUM_TOKEN was supplied
         env:
           VELLUM_TOKEN: ${{ secrets.VELLUM_TOKEN }}
         run: |
           if [ -z "$VELLUM_TOKEN" ]; then
-            echo "::error title=Missing secret::VELLUM_TOKEN must hold a token that can read waviisoft/vellum (private), the repo the CLI installs from"
-            exit 1
+            echo "::notice title=No VELLUM_TOKEN::no VELLUM_TOKEN — checking out waviisoft/vellum without a token; this works once the repo is public"
+          else
+            echo "VELLUM_TOKEN was supplied; the CLI checkout uses it rather than the caller's github.token."
           fi
 
-      # Checked out rather than pip-installed from the git URL. This was
-      # originally because pip's VCS install recursively initialized the
-      # private spec submodule and failed; that submodule is gone
-      # (spec/decisions/2026-08-28-pin-file.md), but the checkout stays because
-      # waviisoft/vellum is private and a token has to be supplied either way.
+      # Checked out rather than pip-installed from the git URL. Two reasons are
+      # now spent: pip's VCS install recursively initialized the private spec
+      # submodule and failed (that submodule is gone —
+      # spec/decisions/2026-08-28-pin-file.md), and a private waviisoft/vellum
+      # needed a credential `pip install "vellum @ git+https://..."` has nowhere
+      # to put. What keeps the checkout is that it takes a ref directly, so the
+      # `vellum-ref` input pins the CLI in one obvious place, and that it is the
+      # one shape that works whether or not a token is supplied.
       - name: Check out the vellum CLI
         uses: actions/checkout@v4
         with:
           repository: waviisoft/vellum
           ref: ${{ inputs.vellum-ref }}
-          token: ${{ secrets.VELLUM_TOKEN }}
+          # The secret when the caller passed one, the caller's own job token
+          # otherwise. `actions/checkout` reads `token` as a REQUIRED input, so
+          # an empty value is not "fall back to the default" — it is
+          # "Input required and not supplied", before the clone is attempted.
+          # The `||` supplies the default explicitly. It is written here, in
+          # `with:`, rather than as two checkout steps with opposite `if:`
+          # conditions, because the `secrets` context is not available in an
+          # `if:` at all — that shape needs the secret laundered through a step
+          # output first, and a mis-set output silently runs both checkouts or
+          # neither. Both values are registered as secrets and masked in the log.
+          token: ${{ secrets.VELLUM_TOKEN || github.token }}
           path: vellum-cli
-          # Nothing in this workflow pushes. VELLUM_TOKEN reads a private repo,
-          # and this job's workspace root is a pull request's merged tree, so
-          # the credential should not be left sitting in `.git/config`.
+          # Nothing in this workflow pushes, and this job's workspace root is
+          # a pull request's merged tree, so whichever credential the line above
+          # resolved to should not be left sitting in `.git/config`. That is
+          # true of the caller's own `github.token` as much as of VELLUM_TOKEN.
           persist-credentials: false
 
       - name: Install the vellum CLI
@@ -331,13 +365,25 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Require the VELLUM_TOKEN secret
+      # A NOTICE, NOT A GATE — this step used to `exit 1` on an empty secret.
+      # VELLUM_TOKEN is optional now: the CLI checkout below falls back to the
+      # caller's own `github.token`, which reads waviisoft/vellum once that repo
+      # is public. What is left worth saying is WHICH of the two the run used,
+      # because a checkout that 404s against a repo that is still private is
+      # otherwise an opaque failure two steps further down.
+      #
+      # The secret reaches this body through `env:` and is only ever tested for
+      # emptiness — never echoed, never interpolated. `required: false` does not
+      # make this step redundant: it catches a caller that omits the key, and
+      # never an empty one, which is the case this reports.
+      - name: Say whether VELLUM_TOKEN was supplied
         env:
           VELLUM_TOKEN: ${{ secrets.VELLUM_TOKEN }}
         run: |
           if [ -z "$VELLUM_TOKEN" ]; then
-            echo "::error title=Missing secret::VELLUM_TOKEN must hold a token that can read waviisoft/vellum (private), the repo the CLI installs from"
-            exit 1
+            echo "::notice title=No VELLUM_TOKEN::no VELLUM_TOKEN — checking out waviisoft/vellum without a token; this works once the repo is public"
+          else
+            echo "VELLUM_TOKEN was supplied; the CLI checkout uses it rather than the caller's github.token."
           fi
 
       - name: Check out the vellum CLI
@@ -345,9 +391,19 @@ jobs:
         with:
           repository: waviisoft/vellum
           ref: ${{ inputs.vellum-ref }}
-          token: ${{ secrets.VELLUM_TOKEN }}
+          # The secret when the caller passed one, the caller's own job token
+          # otherwise. `actions/checkout` reads `token` as a REQUIRED input, so
+          # an empty value is not "fall back to the default" — it is
+          # "Input required and not supplied", before the clone is attempted.
+          # The `||` supplies the default explicitly. It is written here, in
+          # `with:`, rather than as two checkout steps with opposite `if:`
+          # conditions, because the `secrets` context is not available in an
+          # `if:` at all — that shape needs the secret laundered through a step
+          # output first, and a mis-set output silently runs both checkouts or
+          # neither. Both values are registered as secrets and masked in the log.
+          token: ${{ secrets.VELLUM_TOKEN || github.token }}
           path: vellum-cli
-          # VELLUM_TOKEN reads the private product repo and has no business
+          # Whichever credential the line above resolved to has no business
           # outliving the checkout that needed it, least of all in a workspace
           # whose root is a pull request's merged tree.
           persist-credentials: false

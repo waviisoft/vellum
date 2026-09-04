@@ -1567,9 +1567,24 @@ passing over." A report that lists its blind spots only when something else went
 wrong is one nobody reads at the moment they matter, so
 `test_it_says_what_a_checkout_cannot_know` asserts it on the passing run
 specifically. The two are: whether `VELLUM_TOKEN` is set, and whether
-`waviisoft/vellum` permits reuse of its workflows within the organization
-(Actions > General > Access). Both are forge state and no checkout can see
-either.
+`waviisoft/vellum` permits reuse of its workflows by the repository calling them
+(Actions > General > Access, for as long as it is private). Both are forge state
+and no checkout can see either. The first is *softer* since the go-live wave —
+an unset secret is a fallback, not a failed run — and it is still printed,
+because "cannot see" has not changed and the state still decides which of two
+credentials a run uses.
+
+**`no-secret` is GONE, and what replaced it is nothing.** The go-live wave made
+`VELLUM_TOKEN` `required: false` in all three shipped workflows, so a stub that
+passes no secret describes an installation that needs none rather than one whose
+every run dies in its first step. Reporting it would be doctor calling a correct
+configuration drift — the failure mode `on.push.branches` already taught this
+command, arriving by a different door. What did NOT relax is the pair of
+findings about a secret that IS passed: `secrets-inherit`, and `secret-remapped`
+for a different credential under an audited name. The branch is now
+`elif isinstance(secrets, dict)`, so an absent key and an empty `secrets:` block
+(which YAML reads back as `None`, not as `{}`) both fall past it silently and a
+mapping is still audited entry by entry.
 
 **A finding is read out of the parsed stub, never grepped for.** `inspect()`
 parses the YAML and reads `jobs`, `uses`, `secrets` and `with`. The stub's own

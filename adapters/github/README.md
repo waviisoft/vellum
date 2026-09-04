@@ -1,10 +1,17 @@
 # GitHub adapter — the caller stubs
 
-Three **caller stubs** for the intent repo (`waviisoft/vellum-intent`). Each is
-a dozen lines that name a reusable workflow in this repo at a pinned ref and
-pass the one secret it needs. The logic lives in
+Three **caller stubs** for an installation's intent repo. Each is a dozen lines
+that name a reusable workflow in this repo at a pinned ref, and pass
+`VELLUM_TOKEN` if the installation has one to pass — that secret is optional
+(see [Prerequisites](#prerequisites)). The logic lives in
 [`.github/workflows/`](../../.github/workflows/) of this repo, as
 `workflow_call` workflows, and is reviewed there alongside the CLI it calls.
+
+The committed copies here are stamped for **this** repo's own installation,
+whose intent repo is `waviisoft/vellum-intent`; every path and slug specific to
+it is something `vellum init` restamps for yours. What is not restamped, and
+what a fork has to change by hand, is listed under
+[Prerequisites](#prerequisites).
 
 | Stub | Reusable workflow | Trigger | Does |
 |---|---|---|---|
@@ -20,7 +27,7 @@ nothing — repos, seed, stubs and the cross-repo secrets in one command — see
 stamping exactly the stubs below.
 
 ```sh
-cd ../vellum-intent
+cd /path/to/your-intent-repo     # `../vellum-intent`, in this repo's own layout
 vellum init .                    # pins this CLI's own version
 vellum init . --ref main         # or pin something else
 vellum init . --branch trunk     # if the default branch is not `main`
@@ -131,7 +138,9 @@ repo's own unrelated CI is not reported.
   the reusable workflow a different — very possibly wider — credential under the
   name it audits. Doctor reads the referenced secret back out of the expression
   and compares it to the key, so spacing an operator changed is not a finding
-  and a remap is (`secret-remapped`).
+  and a remap is (`secret-remapped`). The rule is about the secrets a stub
+  *does* pass: passing none at all is a valid installation, because
+  `VELLUM_TOKEN` is `required: false`.
 
 ## Installing changes your required check names
 
@@ -149,17 +158,24 @@ about this.
 
 ## Prerequisites
 
-- **`waviisoft/vellum` must allow its workflows to be reused within the
-  organization.** It is a private repo, so this is an Actions setting on *it*:
+- **`waviisoft/vellum` must allow its workflows to be reused by the calling
+  repository.** While it is a private repo this is an Actions setting on *it* —
   Settings > Actions > General > Access > "Accessible from repositories in the
-  organization". Without it the caller's run fails at `uses:` with a resolution
-  error. **Neither checkout can see this setting**, so `vellum doctor` says it
-  cannot check it rather than passing over it.
-- **The intent repo needs a `VELLUM_TOKEN` secret** holding a token that can
-  read `waviisoft/vellum`. This repo is private, so the intent repo's own job
-  token cannot read it. Every shipped workflow asserts the secret in its first
-  step and fails with a named error when it is empty, rather than failing later
-  and less legibly inside pip. **A checkout cannot see whether a secret is
+  organization" — and it also bounds who may call: only repositories in the same
+  organization, whatever the setting says. Once the repo is public, any
+  repository can call them and the setting stops applying. Without it the
+  caller's run fails at `uses:` with a resolution error. **Neither checkout can
+  see this setting**, so `vellum doctor` says it cannot check it rather than
+  passing over it.
+- **`VELLUM_TOKEN` is OPTIONAL.** It holds a token that can read
+  `waviisoft/vellum`, which is the repo the CLI is installed from. Supply it
+  while that repo is private, or to reach a fork of it that is not public; leave
+  it unset otherwise, and each shipped workflow checks the CLI out with the
+  calling repository's own `github.token` instead, raising a `::notice` that
+  says which of the two it used. It is a `required: false` secret, so a stub may
+  pass it or omit it and `vellum doctor` reports neither. What doctor still
+  reports is a stub that passes a *different* secret under this name, and one
+  that uses `secrets: inherit`. **A checkout cannot see whether a secret is
   set**, so doctor says that too.
 - **The pinned ref has to exist in `waviisoft/vellum`.** `vellum init` defaults
   to `v<this CLI's version>` and *cannot confirm from an intent checkout that
@@ -178,14 +194,21 @@ about this.
   every installation at once. Tag protection on `waviisoft/vellum`, or pinning a
   sha (`vellum init . --ref <sha>`, which both commands accept), are the two
   ways to narrow it. Nothing here enforces either.
-- **Runners are Blacksmith** (`blacksmith-2vcpu-ubuntu-2204`). This
-  organisation never assigns a runner to `ubuntu-latest`: the job is accepted
-  and then fails in seconds with `runner_id: 0`, no logs and no steps, which
-  reads like an infrastructure blip and is not one. The labels are in the
-  *shipped* workflows now, which is a real limit of hosting the bodies
-  centrally: an installation outside this organisation cannot change them from
-  its stub. Making the label an input is the fix when a second organisation
-  needs it; nothing has asked yet.
+- **Runners are Blacksmith** (`blacksmith-2vcpu-ubuntu-2204`), and that is a
+  hosting choice rather than something Vellum requires. WAVIISoft — the
+  organisation that publishes this repo — schedules its Actions on Blacksmith,
+  so in *its* setup `ubuntu-latest` is never assigned a runner: the job is
+  accepted and then fails in seconds with `runner_id: 0`, no logs and no steps,
+  which reads like an infrastructure blip and is not one. **An installation in
+  an organisation without the Blacksmith app inherits those labels and cannot
+  change them from its stub**, because they live in the *shipped* workflows —
+  a real limit of hosting the bodies centrally. Today the only ways round it are
+  to install the Blacksmith app, or to fork this repo and edit `runs-on:` in the
+  three workflow files and point the stubs at the fork with
+  `vellum init . --from <owner>/<fork>`. Making the label a `workflow_call`
+  input with a default is the proper fix; it is not built, because nothing has
+  asked for it yet and inventing configuration ahead of the ask is how these
+  files acquire options nobody uses.
 - **`on-spec-merge` needs `contents: write` and `issues: write`** — granted in
   its stub — and branch protection on `main` that lets the workflow token push,
   or the ledger commit step fails.
