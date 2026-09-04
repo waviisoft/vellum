@@ -110,6 +110,10 @@ from vellum.ledger import (
 from vellum.lint import run as lint_run
 from vellum.mint import MintError, mint as mint_run
 from vellum.pin import PinError, advance as pin_advance
+from vellum.provision import SHAPES, VISIBILITIES, ProvisionError
+from vellum.seeds import SeedsMissing
+from vellum.provision import requested as provision_requested
+from vellum.provision import run_provision as provision_run
 from vellum.reconcile import DEFAULT_CORPUS_MATCH, DEFAULT_LEASE_MINUTES, TickError
 from vellum.release import SUITE_RESULTS, ReleaseError, ReleaseRefused
 from vellum.release import run_cut, run_partition
@@ -728,7 +732,10 @@ def _add_install(sub) -> None:
     )
     init.add_argument(
         "--branch",
-        default=DEFAULT_BRANCH,
+        # No argparse default, so `resolve` can tell "the operator said `main`"
+        # from "the operator said nothing" and prompt for the one and not the
+        # other. Stub-stamping substitutes DEFAULT_BRANCH below, so part 1's
+        # behavior with no `--branch` is what it always was.
         help=f"the default branch on-spec-merge watches (default: {DEFAULT_BRANCH}). "
              f"Installation data, not logic: an installation whose default branch "
              f"is not {DEFAULT_BRANCH} is not a drifted one, and `doctor` exempts "
@@ -739,6 +746,7 @@ def _add_install(sub) -> None:
         action="store_true",
         help="restamp a stub that exists and differs; this is how a ref is bumped",
     )
+    _add_provision(init)
     _add_install_common(init)
 
     doctor = sub.add_parser(
@@ -768,6 +776,86 @@ def _add_install(sub) -> None:
         "checkout", nargs="?", default=".", help="the intent repo checkout (default: .)"
     )
     _add_install_common(doctor)
+
+
+def _add_provision(p: argparse.ArgumentParser) -> None:
+    """``init``'s provisioning mode (installation, part 2).
+
+    Every one of these is also a prompt, and that equivalence is the point:
+    ``spec/features/installation.md`` — "every prompt is answerable by a flag, so
+    an unattended run is the same command with no prompts left". They are on
+    ``init`` rather than on a second command because provisioning and stamping
+    are two ends of one act; which end a run is, is decided by
+    ``vellum.provision.requested`` from these arguments alone and never from the
+    directory, because the shape "is chosen by the operator, never inferred from
+    a directory".
+    """
+    group = p.add_argument_group(
+        "provisioning (part 2)",
+        "Given any of these, `init` provisions a repo pair instead of stamping "
+        "stubs into an existing installation. Given none of them it is part 1's "
+        "command, unchanged.",
+    )
+    group.add_argument(
+        "--shape",
+        choices=SHAPES,
+        help="which shape this installation is: `greenfield` creates both repos "
+             "and seeds a skeletal spec; the two brownfield shapes create the "
+             "intent repo beside an EXISTING product repo and start the "
+             "surveyor's path, `brownfield-with-docs` staging the documentation "
+             "`--docs` names as the survey's sources",
+    )
+    group.add_argument("--product", help="the product's name; a lowercase slug")
+    group.add_argument("--org", help="the forge organization or user that owns both repos")
+    group.add_argument(
+        "--intent-repo", dest="intent_repo",
+        help="the intent repository's name (default: <product>-intent)",
+    )
+    group.add_argument(
+        "--product-repo", dest="product_repo",
+        help="the product repository's name (default: <product>). For a "
+             "brownfield shape this names the repository that already exists",
+    )
+    group.add_argument(
+        "--visibility", choices=VISIBILITIES,
+        help="visibility for both repositories (default: private)",
+    )
+    group.add_argument(
+        "--intent-visibility", dest="intent_visibility", choices=VISIBILITIES,
+        help="override --visibility for the intent repository",
+    )
+    group.add_argument(
+        "--product-visibility", dest="product_visibility", choices=VISIBILITIES,
+        help="override --visibility for the product repository",
+    )
+    group.add_argument(
+        "--area", action="append", default=[], dest="areas",
+        help="a feature area's name, a lowercase slug; repeatable. Greenfield "
+             "seeds one spec file per area with a placeholder scenario; a "
+             "brownfield shape seeds each one `unsurveyed`",
+    )
+    group.add_argument(
+        "--docs", action="append", default=[],
+        help="an existing documentation path to stage as a survey source; "
+             "repeatable, and for --shape brownfield-with-docs only. The path "
+             "must exist",
+    )
+    group.add_argument(
+        "--into",
+        help="provision into local directories under this one — <into>/<intent-repo> "
+             "and <into>/<product-repo>, each git-initialised — and reach no forge "
+             "at all. This is the half a checkout can hold, and it is how the "
+             "acceptance suite drives provisioning without a forge",
+    )
+    group.add_argument(
+        "--plan", action="store_true",
+        help="print the plan and stop, having created nothing; exits 0",
+    )
+    group.add_argument(
+        "--yes", action="store_true",
+        help="accept the defaults and the plan without confirming. The plan is "
+             "still printed — this skips the confirmation, not the plan",
+    )
 
 
 def _add_install_common(p: argparse.ArgumentParser) -> None:
@@ -833,6 +921,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "verify":
             return _verify(args)
         if args.command == "init":
+            # Two commands behind one name, and the fork is the command line
+            # alone. With any provisioning argument this is part 2; with none it
+            # is part 1, whose behavior is untouched.
+            if provision_requested(args):
+                return provision_run(args)
             return init_run(
                 args.checkout,
                 ref=args.ref,
@@ -840,7 +933,7 @@ def main(argv: list[str] | None = None) -> int:
                 forge=args.forge,
                 force=args.force,
                 releases_from=args.releases_from,
-                branch=args.branch,
+                branch=args.branch or DEFAULT_BRANCH,
             )
         if args.command == "doctor":
             return doctor_run(
@@ -877,8 +970,13 @@ def main(argv: list[str] | None = None) -> int:
     # broken chain link and a parked queue are all 1, and 1 is what a workflow
     # blocks a merge on; a mistyped `--role` reaching a caller as "this PR wrote
     # outside its trees" would be a red nobody can find the cause of.
+    # `SeedsMissing` belongs in this set for the same reason: an install whose
+    # wheel carries no harness skeleton cannot seed one, which is a command that
+    # could not answer rather than a finding about anybody's spec — and reaching
+    # a caller as a traceback would make it look like a crash in the seed.
     except (BoundaryError, ChainError, BudgetError, DependencyError, ExitDutyError,
-            InstallError, TickError, ReleaseError) as exc:
+            InstallError, ProvisionError, SeedsMissing, TickError,
+            ReleaseError) as exc:
         print(f"vellum: {exc}", file=sys.stderr)
         return 2
     # A cut that cannot be made, a pointer that would move backwards, a shallow

@@ -21,6 +21,11 @@ what a fork has to change by hand, is listed under
 
 ## Installing
 
+Into an intent repo that **already exists**. To create the repo pair from
+nothing — repos, seed, stubs and the cross-repo secrets in one command — see
+`vellum init --shape …` in the [root README](../../README.md); it ends by
+stamping exactly the stubs below.
+
 ```sh
 cd /path/to/your-intent-repo     # `../vellum-intent`, in this repo's own layout
 vellum init .                    # pins this CLI's own version
