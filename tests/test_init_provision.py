@@ -449,6 +449,18 @@ class WithoutAForgeCliTheStepsAreAChecklist(ProvisionCase):
             self.assertIn(step.what, plan, step.what[:60])
             self.assertIn(step.what, checklist, step.what[:60])
 
+    def test_the_checklist_carries_no_unfilled_placeholder(self):
+        # "with the exact values" (spec/features/installation.md). Where each
+        # checkout is, is not known when the step list is built — without
+        # `--into` the staging directory must not exist until the plan is
+        # confirmed — so the paths travel as placeholders and are filled in for
+        # both renderings from one mapping.
+        checklist = self.out.split("Do these yourself, in order")[1]
+        self.assertNotIn("<intent checkout>", checklist)
+        self.assertNotIn("<product checkout>", checklist)
+        self.assertIn(str(self.staging / "acme-intent"), checklist)
+        self.assertIn(str(self.staging / "acme"), checklist)
+
     def test_nothing_is_created_on_a_forge(self):
         self.assertIsNone(shutil.which("gh"))
         self.assertEqual(self.recorded(), [])

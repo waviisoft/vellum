@@ -866,10 +866,19 @@ class ForgeStep:
     #: this only says where in the run it happens.
     before: bool = False
 
-    def command(self) -> str:
+    def command(self, places: dict[str, str] | None = None) -> str:
+        """The step as it would be typed, with *places* filled in.
+
+        The checklist has to carry "the exact values"
+        (``spec/features/installation.md``), and two of them — where each
+        checkout is — are not known when :func:`forge_steps` builds the list.
+        They travel as ``<intent checkout>`` / ``<product checkout>`` and are
+        substituted here and in :func:`_take`, from one mapping, so what an
+        operator is told to run is what the transport would have run.
+        """
         if not self.argv:
             return ""
-        rendered = " ".join(_quote(a) for a in self.argv)
+        rendered = " ".join(_quote((places or {}).get(a, a)) for a in self.argv)
         return f"printf %s \"$TOKEN\" | {rendered}" if self.stdin else rendered
 
 
@@ -1014,6 +1023,24 @@ class Plan:
     intent_dir: Path
     product_dir: Path
 
+    @property
+    def places(self) -> dict[str, str]:
+        """The two checkout placeholders, filled in from this plan's paths."""
+        return {
+            "<intent checkout>": str(self.intent_dir),
+            "<product checkout>": str(self.product_dir),
+        }
+
+    def at(self, intent_dir: Path, product_dir: Path) -> None:
+        """Move the plan to the checkouts a confirmed run actually made.
+
+        Without ``--into`` the staging directory does not exist when the plan is
+        printed — it must not, or ``--plan`` would create something — so the plan
+        names a placeholder and the *report* names the real thing. One mutation,
+        in one place, rather than a second list of steps carrying real paths.
+        """
+        self.intent_dir, self.product_dir = intent_dir, product_dir
+
     def render(self) -> str:
         a = self.answers
         lines = [
@@ -1068,7 +1095,7 @@ class Plan:
         for number, step in enumerate(self.steps, start=1):
             lines.append(f"  {number:>2}. {step.what}")
             if step.argv:
-                lines.append(f"      {step.command()}")
+                lines.append(f"      {step.command(self.places)}")
             if step.stdin:
                 lines.append(f"      stdin: {step.stdin}")
             if step.manual:
@@ -1448,6 +1475,7 @@ def run(
         root = Path(tempfile.mkdtemp(prefix="vellum-init-"))
         intent_dir = root / answers.intent_repo
         product_dir = root / answers.product_repo
+        plan.at(intent_dir, product_dir)
         print(f"\nStaging the local half in {root}", file=stream)
 
     # ------------------------------------------------------------------
@@ -1460,7 +1488,7 @@ def run(
         _check_forge_names(gh, answers)
     _check_directories(answers, intent_dir, product_dir)
 
-    places = {"<intent checkout>": str(intent_dir), "<product checkout>": str(product_dir)}
+    places = plan.places
     pin, stubs = build_intent(intent_dir, answers, host=host, ref=pinned)
     # The one forge step the local half depends on: the clone a brownfield
     # adoption branches from. Without a transport it stays on the checklist and
@@ -1664,20 +1692,20 @@ def _report(plan: Plan, answers: Answers, pin: str, stubs: list[str],
         for number, step in enumerate(remaining, start=1):
             lines.append(f"  {number:>2}. {step.what}")
             if step.argv:
-                lines.append(f"      {step.command()}")
+                lines.append(f"      {step.command(plan.places)}")
             if step.stdin:
                 lines.append(f"      stdin: {step.stdin}")
             if step.manual:
                 lines.append("      (no transport takes this one; it is yours)")
         lines.append("")
         lines.append(
-            "  Then `vellum doctor <intent checkout>` verifies the whole: what a "
-            "checkout can see it checks, and what it cannot it says it cannot."
+            f"  Then `vellum doctor {intent_dir}` verifies the whole: what a "
+            f"checkout can see it checks, and what it cannot it says it cannot."
         )
     else:
         lines.append(
-            "Nothing is left over. `vellum doctor <intent checkout>` verifies the "
-            "installation from the checkout alone."
+            f"Nothing is left over. `vellum doctor {intent_dir}` verifies the "
+            f"installation from the checkout alone."
         )
     lines += ["", *install.CANNOT_KNOW]
     return "\n".join(lines)
