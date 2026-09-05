@@ -1136,7 +1136,24 @@ class TheStampWritesTheManifest(InstallCase):
         self.assertIn("had no manifest", out)
         self.assertIn("caller stub(s) as the owned set", out)
 
-    def test_a_stamp_refreshes_the_release_and_keeps_the_owned_list(self):
+    def test_a_stamp_refreshes_the_release_of_an_installation_that_owns_only_stubs(self):
+        checkout = self.intent()
+        run_cli(["init", str(checkout)])
+        before = manifest.load(checkout).owned
+        code, out = run_cli(["init", str(checkout), "--ref", "v9.9.9", "--force"])
+        self.assertEqual(code, 0, out)
+        found = manifest.load(checkout)
+        self.assertEqual(found.release, "v9.9.9")
+        # The list is never recomputed, only carried forward.
+        self.assertEqual(found.owned, before)
+
+    def test_a_stamp_holds_the_release_when_a_file_it_does_not_write_is_owned(self):
+        # The release line is a claim about the FILES. A stamp writes the stubs
+        # and nothing else — it never reads `.vellum/config.yaml`, let alone
+        # brings it to v9.9.9 — so moving the line would leave the next `vellum
+        # upgrade --to v9.9.9` comparing that file against v9.9.9's template and
+        # refusing it as an edit this installation had made. Holding the line is
+        # what keeps `upgrade` the command that moves both together.
         checkout = self.intent()
         run_cli(["init", str(checkout)])
         manifest.write(checkout, default_ref(),
@@ -1144,10 +1161,21 @@ class TheStampWritesTheManifest(InstallCase):
         code, out = run_cli(["init", str(checkout), "--ref", "v9.9.9", "--force"])
         self.assertEqual(code, 0, out)
         found = manifest.load(checkout)
-        self.assertEqual(found.release, "v9.9.9")
-        # The operator's addition survives: `init` refreshes the release line
-        # and never recomputes the list.
+        self.assertEqual(found.release, default_ref())
         self.assertIn(".vellum/config.yaml", found.owned)
+        self.assertIn("left alone", out)
+        self.assertIn(".vellum/config.yaml", out)
+        self.assertIn("vellum upgrade --to v9.9.9", out)
+
+    def test_the_stubs_still_move_when_the_release_line_is_held(self):
+        # Held is about the MANIFEST, not about the stamp: `--force` restamped
+        # the stubs, and only the claim about the other owned files is withheld.
+        checkout = self.intent()
+        run_cli(["init", str(checkout)])
+        manifest.write(checkout, default_ref(),
+                       [*manifest.load(checkout).owned, ".vellum/config.yaml"])
+        run_cli(["init", str(checkout), "--ref", "v9.9.9", "--force"])
+        self.assertIn("@v9.9.9", self.stub(checkout, "spec-ci").read_text(encoding="utf-8"))
 
     def test_a_second_identical_stamp_writes_nothing(self):
         checkout = self.intent()
@@ -1216,6 +1244,38 @@ class DoctorReportsTheManifest(InstallCase):
         self.assertEqual(code, 0, out)
         self.assertIn(f"brought to {default_ref()}", out)
         self.assertIn(f"ok       {manifest.MANIFEST_RELPATH.as_posix()}", out)
+
+    def test_the_missing_manifest_finding_names_the_fix_and_what_it_will_own(self):
+        # Every installation provisioned before the manifest existed sees this
+        # once, so it has to be actionable on its own: the command to run, and
+        # what that command will claim. "Run `vellum init`" without the second
+        # half means running it to find out what it took.
+        checkout = self.installed()
+        (checkout / manifest.MANIFEST_RELPATH).unlink()
+        code, out = run_cli(["doctor", str(checkout)])
+        self.assertEqual(code, 1, out)
+        self.assertIn(f"vellum init {checkout}", out)
+        for shipped in SHIPPED:
+            self.assertIn((WORKFLOWS / shipped.filename).as_posix(), out, shipped.name)
+
+    def test_the_advice_stops_naming_force_when_a_seeded_file_is_owned(self):
+        # `init --ref <newer> --force` restamps the stubs and HOLDS the release
+        # line for this installation, so advertising it as "the stubs half of an
+        # upgrade" would send an operator to a command that cannot do it.
+        checkout = self.installed()
+        found = manifest.load(checkout)
+        manifest.write(checkout, found.release, [*found.owned, ".vellum/config.yaml"])
+        code, out = run_cli(["doctor", str(checkout)])
+        self.assertEqual(code, 0, out)
+        self.assertIn("vellum upgrade --to <newer>", out)
+        self.assertIn("is NOT the second half", out)
+        self.assertIn(".vellum/config.yaml", out)
+
+    def test_the_advice_still_names_force_for_an_installation_of_stubs_alone(self):
+        code, out = run_cli(["doctor", str(self.installed())])
+        self.assertEqual(code, 0, out)
+        self.assertIn("`vellum init --ref <newer> --force`", out)
+        self.assertNotIn("is NOT the second half", out)
 
 
 class TheManifestFormat(unittest.TestCase):

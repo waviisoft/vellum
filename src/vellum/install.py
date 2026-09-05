@@ -757,6 +757,16 @@ def stamp_manifest(root: Path, *, ref: str, stamps: list[Stamp]) -> ManifestStam
     installation with no manifest writes one whose owned set is the stubs and
     nothing else, because those are the only files this command wrote and the
     only ones it can honestly say Vellum owns.
+
+    The same sentence is why an owned set wider than the stubs **holds** the
+    release line rather than refreshing it. A stamp writes the stubs and nothing
+    else: it does not read `.vellum/config.yaml` or the harness machinery, let
+    alone bring them to *ref*. Refreshing the line anyway would move the release
+    every owned file is compared against while leaving those files at the
+    release before it — so the next `vellum upgrade --to <ref>` would find every
+    one of them differing from *ref*'s template and refuse the whole set as
+    edits this installation had made. `vellum upgrade` is the command that moves
+    them, and it restamps the stubs itself on the way.
     """
     path = manifest.path_for(root)
     if any(stamp.outcome == LEFT for stamp in stamps):
@@ -784,6 +794,24 @@ def stamp_manifest(root: Path, *, ref: str, stamps: list[Stamp]) -> ManifestStam
     # which is the same rule that leaves a hand-edited stub alone.
     if existing is not None and existing.release == ref and existing.owned == owned:
         return ManifestStamp(path, MANIFEST_CURRENT, release=ref)
+    # The release line is a claim about the FILES, and a stamp only ever wrote
+    # the stubs. So it may refresh the line only for an installation whose owned
+    # set is stubs and nothing else; anything wider is `vellum upgrade`'s to
+    # move, and moving it here would arm a refusal for every other owned file.
+    # "The files a stamp writes" is not a table to consult: it is the stamps
+    # this run just made.
+    stubs = {stamp.path.relative_to(root).as_posix() for stamp in stamps}
+    if existing is not None and existing.release != ref and not set(owned) <= stubs:
+        outside = sorted(set(owned) - stubs)
+        return ManifestStamp(path, MANIFEST_HELD, release=existing.release, note=(
+            f"this installation owns {len(outside)} file(s) a stamp does not "
+            f"write ({one_line(', '.join(outside))}), so the release line stays "
+            f"at {existing.release}. A stamp brings the STUBS to {ref} and "
+            f"nothing else; recording {ref} would leave `vellum upgrade` "
+            f"comparing those files against {ref}'s templates and refusing every "
+            f"one of them as an edit. `vellum upgrade --to {ref}` moves the "
+            f"files and the line together, and restamps the stubs on the way."
+        ))
     manifest.write(root, ref, owned)
     if existing is not None:
         return ManifestStamp(path, MANIFEST_REFRESHED, release=ref)
@@ -1335,17 +1363,53 @@ class Doctor:
                 if ref is None:
                     continue
                 lines.append(f"  {relative}: {self.currency.about(ref)}")
-        lines.append(
-            "  An installation behind the newest release is divergence to "
-            "summarise, not a broken install; upgrading an installation's FILES "
-            "is `vellum upgrade --to <newer>`, and its stubs alone is `vellum "
-            "init --ref <newer> --force`."
-        )
+        lines += self.upgrade_advice()
         lines.append("")
         lines += self.compatibility()
         lines.append("")
         lines += CANNOT_KNOW
         return "\n".join(lines)
+
+    def upgrade_advice(self) -> list[str]:
+        """How THIS installation moves to a newer release — not how one does.
+
+        The distinction is the whole line. ``vellum init --ref <newer> --force``
+        moves the stubs, and for an installation that owns only stubs that is
+        the whole of an upgrade. For one that owns seeded files too it is half
+        of it, and the wrong half to advertise: a stamp writes the stubs and
+        does not touch `.vellum/config.yaml` or the harness machinery, so
+        ``stamp_manifest`` deliberately holds the release line for such an
+        installation rather than moving it out from under files nobody rewrote.
+        Advice that named `--force` anyway would send an operator to a command
+        that cannot do what they asked for.
+        """
+        head = (
+            "  An installation behind the newest release is divergence to "
+            "summarise, not a broken install; upgrading an installation's FILES "
+            "is `vellum upgrade --to <newer>`"
+        )
+        stubs_only = (
+            head + ", and its stubs alone is `vellum init --ref <newer> --force`."
+        )
+        try:
+            found = manifest.read(self.checkout)
+        except manifest.ManifestError:
+            return [stubs_only]
+        if found is None:
+            return [stubs_only]
+        stubs = {(WORKFLOWS_DIR[self.forge] / s.filename).as_posix() for s in SHIPPED}
+        outside = sorted(set(found.owned) - stubs)
+        if not outside:
+            return [stubs_only]
+        return [
+            head + ".",
+            f"  `vellum init --ref <newer> --force` is NOT the second half of "
+            f"that here: this installation owns {len(outside)} file(s) a stamp "
+            f"does not write ({one_line(', '.join(outside))}), so a stamp "
+            f"restamps the stubs and leaves the manifest's release line where it "
+            f"is. Moving the line without the files would make the next upgrade "
+            f"refuse every one of them as an edit.",
+        ]
 
     def compatibility(self) -> list[str]:
         """The third pin: this CLI against the CLI the stubs install in CI.
@@ -1437,11 +1501,11 @@ def doctor(
             root / directory, host=host,
             known={s.filename for s in SHIPPED}, relative_to=directory,
         ),
-        manifest=manifest_findings(root),
+        manifest=manifest_findings(root, chosen),
     )
 
 
-def manifest_findings(root: Path) -> list[Finding]:
+def manifest_findings(root: Path, forge: str = "github") -> list[Finding]:
     """Findings about ``.vellum/install.yaml``: absent, or malformed.
 
     A finding rather than a report, and the difference from ref currency beside
@@ -1451,8 +1515,14 @@ def manifest_findings(root: Path) -> list[Finding]:
     files Vellum may rewrite, so ``vellum upgrade`` cannot run at all and the
     next release lands by hand. That is installed-not-matching-shipped, which is
     what this command's exit code means (``spec/features/installation.md``).
+
+    Every installation provisioned before the release that introduced the
+    manifest sees this finding exactly once, so the detail names the fix and
+    spells out what that fix will mark owned — an operator reading "run `vellum
+    init`" without the second half has to run it to find out what it claimed.
     """
     relative = manifest.MANIFEST_RELPATH.as_posix()
+    stubs = sorted((WORKFLOWS_DIR[forge] / s.filename).as_posix() for s in SHIPPED)
     try:
         found = manifest.read(root)
     except manifest.ManifestError as exc:
@@ -1463,10 +1533,15 @@ def manifest_findings(root: Path) -> list[Finding]:
     if found is None:
         return [Finding(relative, "no-manifest", (
             f"this installation carries no manifest, so nothing says which files "
-            f"Vellum owns and `vellum upgrade` cannot run. `vellum init` writes "
-            f"one — over an existing installation it records the caller stubs and "
-            f"nothing else, and the seeded files you want upgrades to rewrite are "
-            f"yours to add (spec/features/installation.md)."
+            f"Vellum owns and `vellum upgrade` cannot run. The fix is `vellum "
+            f"init {root}`, which writes one recording this CLI's ref and these "
+            f"{len(stubs)} caller stub(s) as the owned set: {', '.join(stubs)}. "
+            f"It marks nothing else — a stamp cannot know whether the rest of "
+            f"the tree came from a Vellum seed or from your own hand — so the "
+            f"seeded files you want upgrades to rewrite are yours to add to "
+            f"`{manifest.OWNED_KEY}:` afterwards. Every installation provisioned "
+            f"before the manifest existed sees this once "
+            f"(spec/features/installation.md)."
         ))]
     return []
 

@@ -236,14 +236,18 @@ class UpgradeCase(unittest.TestCase):
     def restamp(self, ref: str) -> None:
         """Move the installation to *ref*: the stubs and the manifest together.
 
-        The pair is the point. A manifest edited on its own leaves the stubs
-        pinned somewhere else, and `upgrade` then reports all three as edited —
-        correctly, because they are not what the release the manifest names
-        stamped. `vellum init --ref <ref> --force` is the one command that moves
-        both, which is why these tests use it rather than writing the manifest.
+        Two commands, because a stamp deliberately does only half of it. `vellum
+        init --ref <ref> --force` restamps the stubs and then HOLDS the
+        manifest's release line, since this installation owns seeded files a
+        stamp does not write and moving the line without them would arm a
+        refusal on every one (`install.stamp_manifest`). These tests want an
+        installation genuinely AT *ref*, which in the real world is what `vellum
+        upgrade` produces — so the manifest is written directly here rather than
+        pretending a stamp did it.
         """
         code, out = run_cli(["init", str(self.intent), "--ref", ref, "--force"])
         self.assertEqual(code, 0, out)
+        manifest.write(self.intent, ref, manifest.load(self.intent).owned)
         self.git(self.intent, "add", "-A")
         self.git(self.intent, "commit", "-qm", f"stamped at {ref}")
 
