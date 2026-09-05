@@ -26,11 +26,26 @@
 # `notes:` is for a shape change that is none of the four — a new command, a
 # provisioning flag — that an operator still wants named in the plan.
 #
-# Cutting a release adds its entry here. `template:` below is the shape to
-# copy, and it is prefilled with the entry the NEXT release wants: rename
-# `vNEXT` to the tag, move it under `releases:`, and leave a fresh template
-# behind. `tests/test_upgrade.py::EveryReleaseTagHasAShapeEntry` fails when a
-# `v*` tag in this repo has no entry here, which is the alarm for forgetting.
+# CUTTING A RELEASE, in order. Each step is checked by a test, so the procedure
+# is not a checklist somebody has to remember:
+#
+#   1. Bump `__version__` in `src/vellum/__init__.py` AND `version` in
+#      `pyproject.toml` to the new number. They are two files stating one fact;
+#      `tests/test_upgrade.py::TheReleaseThisCutIs` fails when they disagree.
+#   2. Add this release's entry here: rename `template:`'s `vNEXT` to `v<the
+#      version>`, move it under `releases:` (newest last), and leave a fresh
+#      `template:` behind for the next one. The same test fails when
+#      `f"v{__version__}"` has no entry, so the entry is written BEFORE the tag
+#      rather than remembered after it.
+#   3. Run the suite. Both alarms above are ordinary tests.
+#   4. The owner tags `v<the version>` and pushes the tag. Only then does
+#      `EveryReleaseTagHasAShapeEntry` — which reads the repository's real tags
+#      — have anything to say, which is why steps 1-3 carry their own alarm:
+#      a tag-reading test cannot fail for a tag nobody has cut yet.
+#
+# `tests/test_upgrade.py::EveryReleaseTagHasAShapeEntry` fails when a `v*` tag
+# in this repo has no entry here, which is the alarm for a release cut without
+# one.
 
 schema: 1
 
@@ -41,28 +56,12 @@ schema: 1
 template:
   release: vNEXT
   summary: >-
-    An installation names the files Vellum owns, and `vellum upgrade` rewrites
-    only those.
+    One sentence saying what this release changes about an INSTALLATION.
   config_keys_added: []
-  files_added:
-    - path: .vellum/install.yaml
-      what: >-
-        The installation manifest, on each side of the pair: the release this
-        installation was last brought to, and the repo-relative paths Vellum may
-        rewrite. `vellum init` writes one over an installation that has none,
-        with the caller stubs as the owned set.
+  files_added: []
   files_retired: []
   stub_inputs: []
-  notes:
-    - >-
-      New command: `vellum upgrade --to <release>`, run in an intent or product
-      checkout. It rewrites owned files from the release's templates, re-stamps
-      the stubs, and lands the change on `vellum/upgrade-<release>` as a pull
-      request — never as a push to the default branch.
-    - >-
-      `vellum doctor` gains two lines: the manifest is a finding when it is
-      absent or malformed, and the local CLI against the CLI the stubs install
-      in CI is reported and never failed on.
+  notes: []
 
 # ---------------------------------------------------------------------------
 # The releases, oldest first.
@@ -131,3 +130,47 @@ releases:
         (`.vellum/config.yaml`, `ledger/releases.yaml`, the harness skeleton, a
         skeletal spec tree) are what provisioning writes into a NEW pair, and an
         upgrade neither adds nor needs them.
+
+  - release: v0.3.0
+    summary: >-
+      An installation names the files Vellum owns, and `vellum upgrade` rewrites
+      only those, as a pull request.
+    config_keys_added: []
+    files_added:
+      - path: .vellum/install.yaml
+        what: >-
+          The installation manifest, on each side of the pair: the release this
+          installation was last brought to, and the repo-relative paths Vellum
+          may rewrite. `vellum init` writes one over an installation that has
+          none, with the caller stubs as the owned set; add the seeded files you
+          want upgrades to rewrite.
+    files_retired: []
+    stub_inputs: []
+    notes:
+      - >-
+        New command: `vellum upgrade --to <release>`, run in an intent or
+        product checkout, on its default branch. It rewrites owned files from
+        the release's templates, re-stamps the stubs, records the release, and
+        lands the change on `vellum/upgrade-<release>` as a pull request — never
+        as a push to the default branch. `--to` takes a release tag and nothing
+        else: installations pin cuts, never branches.
+      - >-
+        `ledger/releases.yaml` is NOT a Vellum-owned file. It is seeded, and
+        after that it is pipeline-written state — `vellum ledger open|advance`
+        and `vellum certify record` write to it — so a release that changes its
+        shape delivers that as a changelog migration and not as a rewrite. An
+        installation whose manifest lists it (one provisioned by an earlier
+        build of this release) sees it reported as `retired` and untouched;
+        taking the line out of `owned:` is the tidy-up.
+      - >-
+        `vellum init --ref <new> --force` restamps the stubs and now HOLDS the
+        manifest's release line for an installation that owns files a stamp does
+        not write. The line is a claim about the FILES, and moving it without
+        them made the next upgrade refuse every one of them as an edit.
+        `vellum upgrade --to <new>` moves the files and the line together.
+      - >-
+        `vellum doctor` gains two lines: the manifest is a finding when it is
+        absent or malformed, and the local CLI against the CLI the stubs install
+        in CI is reported and never failed on. An installation provisioned
+        before the manifest existed sees the first of those once, and the
+        finding names the fix and what it will mark owned.

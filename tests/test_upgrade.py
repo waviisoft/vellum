@@ -1180,6 +1180,43 @@ class TheShapeChangelogIsWellFormed(unittest.TestCase):
             changes.parse("schema: 99\nreleases: []\n")
 
 
+class TheReleaseThisCutIs(unittest.TestCase):
+    """The pre-tag alarm: three files state one release, before anybody tags it.
+
+    `EveryReleaseTagHasAShapeEntry` below is the post-tag alarm and it cannot
+    fire earlier — it reads the repository's real tags, and a release that has
+    not been cut has none. That left the window where the mistake actually
+    happens: a wave lands, the version is still the previous one, and nothing
+    says so until somebody pushes a tag with no changelog entry behind it. So
+    these two assertions read the version the working tree CLAIMS to be and hold
+    the other two files to it.
+    """
+
+    def test_the_two_files_that_state_the_version_agree(self):
+        # `src/vellum/__init__.py` is what `vellum --version` prints and what
+        # every stub is stamped with by default; `pyproject.toml` is what a
+        # wheel carries. Two files, one fact, and an installation stamped from a
+        # CLI whose wheel says something else is one nobody can reason about.
+        declared = yaml.safe_load(
+            "\n".join(
+                line for line in
+                (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8").splitlines()
+                if line.startswith("version = ")
+            ).replace(" = ", ": ")
+        )
+        self.assertEqual(declared["version"], vellum_version)
+
+    def test_this_versions_release_tag_has_a_shape_entry(self):
+        recorded = {entry.release for entry in changes.load().entries}
+        self.assertIn(
+            f"v{vellum_version}", recorded,
+            f"this checkout calls itself v{vellum_version} and "
+            f"{seeds.source_path(seeds.CHANGES)} has no entry for it. A release "
+            f"is cut by bumping the version, writing the entry, and THEN tagging "
+            f"— the entry goes in before the tag, not after it.",
+        )
+
+
 class EveryReleaseTagHasAShapeEntry(unittest.TestCase):
     """A cut release with no entry is a `--plan` that cannot describe it.
 

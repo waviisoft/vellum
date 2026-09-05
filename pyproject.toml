@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vellum"
-version = "0.1.0"
+version = "0.3.0"
 description = "Spec-driven product engineering tooling: lint, suite extraction, ledger."
 readme = "README.md"
 # SPDX, per PEP 639. No `License :: OSI Approved :: MIT License` classifier
