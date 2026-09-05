@@ -33,10 +33,17 @@ Why the paths are validated on the way in
 ``upgrade`` *writes* every path on this list, and the list is a file in a
 repository that anyone who can land a pull request can edit. So a path is held
 to being repo-relative and inside the checkout — no absolute path, no ``..``
-component, no backslash — and a manifest carrying one is **malformed**, not a
-list with one bad entry skipped. Skipping would let a manifest that half-works
-go on half-working; refusing puts it in front of the operator once, which is
-also what ``doctor`` reports it as.
+component, no backslash, nothing under ``.git/`` — and to being a printable
+string with no surrounding whitespace, because the same entry is written back
+into this file unquoted and printed into reports and CI logs. A manifest
+carrying one bad entry is **malformed**, not a list with that entry skipped.
+Skipping would let a manifest that half-works go on half-working; refusing puts
+it in front of the operator once, which is also what ``doctor`` reports it as.
+
+These are the *lexical* half. They cannot see the filesystem, so they cannot
+tell that ``.github/workflows`` is a symlink pointing at ``.git/hooks``:
+``vellum.upgrade`` walks the components of every path it is about to write and
+refuses a symlink among them, which is the half that needs a checkout.
 
 The manifest is not itself owned. It is rewritten by every stamp and every
 upgrade unconditionally, so listing it would compare a file against a template
@@ -63,13 +70,23 @@ MANIFEST_RELPATH = Path(".vellum") / "install.yaml"
 RELEASE_KEY = "vellum"
 OWNED_KEY = "owned"
 
+#: The one directory name no owned path may start with, lower-cased for the
+#: comparison. Named rather than spelled inline because ``vellum.upgrade``
+#: refuses the same component when it walks a path it is about to write.
+GIT_DIR = ".git"
+
 #: A release the manifest may name. Deliberately wider than
 #: ``install.RELEASE_RE`` — a manifest written by a pre-release install may name
 #: ``main`` or a sha, and refusing to *read* such a file would leave an
 #: installation with no way to upgrade off it. It is narrow enough to be a
 #: single-line YAML scalar and a git ref: what it must not be is a value that
 #: reshapes the file it is written back into.
-RELEASE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/-]{0,199}$")
+#:
+#: The ``..`` look-ahead is ``install.REF_RE``'s and is here for the same
+#: reason: this value is handed to git as ``<ref>:<path>``, and ``a..b`` is a
+#: range rather than a ref — so a manifest naming one would have every owned
+#: file compared against whatever a range happens to resolve to.
+RELEASE_RE = re.compile(r"^(?!.*\.\.)[A-Za-z0-9_][A-Za-z0-9._/-]{0,199}$")
 
 HEADER = """# The installation manifest. Written by `vellum init` and rewritten by every
 # stamp and every `vellum upgrade` (spec/features/installation.md).
@@ -134,6 +151,22 @@ def check_owned_path(value: str) -> str:
             f"`{OWNED_KEY}:` carries an empty path. Every entry names one file "
             f"`vellum upgrade` may rewrite; an empty one names the checkout."
         )
+    # Printable, and already stripped. Both are about what this string does
+    # somewhere OTHER than the filesystem. A control character in it reaches a
+    # terminal and a CI log as itself — a carriage return followed by
+    # `::add-mask::` or `::error::` is a workflow command at column 0, written
+    # by whoever could land a line in this file — and `dump` writes the entry
+    # back unquoted, so a value carrying a newline or a leading space comes back
+    # as a different YAML document (or none). Refused rather than sanitised: an
+    # ownership claim nobody can read is not one to guess the intent of.
+    if not text.isprintable() or text != text.strip():
+        raise ManifestError(
+            f"`{OWNED_KEY}:` carries {one_line(text)!r}, which is not a printable "
+            f"path with no surrounding whitespace. Every entry is written back "
+            f"into this file unquoted and printed into reports and CI logs, so a "
+            f"control character or a stray space is a value that reshapes one of "
+            f"those rather than naming a file."
+        )
     if "\\" in text:
         raise ManifestError(
             f"`{OWNED_KEY}:` carries {one_line(text)!r}, which uses a backslash. "
@@ -165,6 +198,20 @@ def check_owned_path(value: str) -> str:
             f"`{OWNED_KEY}:` carries {one_line(text)!r}, which names the "
             f"checkout rather than a file in it. Every entry is one file "
             f"`vellum upgrade` may rewrite."
+        )
+    # The repository's own directory, refused by name. `upgrade` walks the
+    # components of every path it writes and refuses a symlink among them, which
+    # is the check that actually stops a write into `.git/`; this is the second
+    # lock on the same door, and it is the cheap one — an `owned:` entry naming
+    # `.git/hooks/pre-commit` asks Vellum to install a program that the
+    # upgrade's own commit then executes. Case-folded because a
+    # case-insensitive filesystem opens `.GIT/` as `.git/`.
+    if pure.parts[0].lower() == GIT_DIR:
+        raise ManifestError(
+            f"`{OWNED_KEY}:` carries {one_line(text)!r}, which is inside the "
+            f"repository's own `{GIT_DIR}` directory. Vellum owns files in a "
+            f"working tree; a path in there is git's private state — and a hook "
+            f"written into it would run during the upgrade's own commit."
         )
     if pure == PurePosixPath(MANIFEST_RELPATH.as_posix()):
         raise ManifestError(

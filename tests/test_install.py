@@ -1260,6 +1260,33 @@ class TheManifestFormat(unittest.TestCase):
             with self.assertRaises(manifest.ManifestError, msg=path):
                 self.parse(f"vellum: v0.2.0\nowned:\n  - {path}\n")
 
+    def test_a_path_inside_the_git_directory_is_refused(self):
+        # `upgrade` writes every path on this list, and a hook written into
+        # `.git/hooks/` runs during the upgrade's own commit — in the operator's
+        # shell, in the same run. Case-folded, because a case-insensitive
+        # filesystem opens `.GIT/` as `.git/`.
+        for path in (".git/hooks/pre-commit", ".git/config", ".GIT/hooks/pre-push"):
+            with self.assertRaises(manifest.ManifestError, msg=path) as raised:
+                self.parse(f"vellum: v0.2.0\nowned:\n  - {path}\n")
+            self.assertIn(".git", str(raised.exception))
+
+    def test_a_path_with_a_control_character_or_stray_space_is_refused(self):
+        # Two failures in one rule. The entry is written back into this file
+        # UNQUOTED, so a newline or a leading space makes a manifest that reads
+        # back as something else or not at all; and it is printed into reports
+        # and CI logs as itself, where a carriage return followed by
+        # `::add-mask::` at column 0 is a workflow command somebody wrote into a
+        # file anyone who can land a pull request can edit.
+        for path in ('"a\\nowned: []"', '"a\\r::error::x"', '"a\\u0000b"',
+                     '" a.yaml"', '"a.yaml "', '"a\\tb"'):
+            with self.assertRaises(manifest.ManifestError, msg=path):
+                self.parse(f"vellum: v0.2.0\nowned:\n  - {path}\n")
+
+    def test_a_release_naming_a_range_is_refused(self):
+        # It is handed to git as `<ref>:<path>`, and `a..b` is a range.
+        with self.assertRaises(manifest.ManifestError):
+            self.parse("vellum: v0.1.0..v0.2.0\nowned: []\n")
+
     def test_the_manifest_may_not_own_itself(self):
         with self.assertRaises(manifest.ManifestError):
             self.parse(
