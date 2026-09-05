@@ -104,12 +104,15 @@ ADOPTING = (BROWNFIELD, BROWNFIELD_WITH_DOCS)
 
 VISIBILITIES = ("public", "private")
 
-#: Where the adoption pull request's body is written, inside the product
-#: checkout and deliberately **not** committed: the transport passes it to
-#: ``gh pr create --body-file`` and the manual rung's checklist names the same
-#: path, so an operator following the checklist has the body the transport would
-#: have used rather than a placeholder it never filled in.
-ADOPT_PR_RELPATH = ".vellum/ADOPT_PR.md"
+#: Where the adoption pull request's body is written: under the product
+#: checkout's ``.git/``, and so outside the working tree. The transport passes
+#: it to ``gh pr create --body-file`` and the manual rung's checklist names the
+#: same path, so an operator following the checklist has the body the transport
+#: would have used rather than a placeholder it never filled in — which means it
+#: has to survive the command. In the working tree it did that by being left
+#: behind untracked, which is a file the next run's dirty-tree check refuses on.
+#: ``.git/`` is per-checkout, never committed and never in ``git status``.
+ADOPT_PR_RELPATH = ".git/vellum/ADOPT_PR.md"
 
 #: The branch a brownfield installation's ``.vellum/`` arrives on.
 #: ``spec/features/installation.md``: "its ``.vellum/`` arrives on a branch as a
@@ -1600,13 +1603,14 @@ surveyed areas, so normal work continues while the survey proceeds.
 
 
 def _write_adopt_body(directory: Path, answers: Answers, base: str) -> Path:
-    """The adoption pull request's body, in the product checkout, uncommitted.
+    """The adoption pull request's body, under the checkout's ``.git/``.
 
     In the checkout rather than in a temporary directory that is deleted on the
     way out, because the manual rung's checklist names this path: an operator
-    reaching the ``gh pr create`` line needs the file to still be there. It is
-    written after the adoption commit and never added, so the branch carries the
-    two seeded files and nothing else.
+    reaching the ``gh pr create`` line needs the file to still be there. Under
+    ``.git/`` rather than in the tree, because a file that survives the command
+    and sits in the tree is an untracked file every later dirty-tree check
+    refuses on — and this one lands in a repository Vellum is a guest in.
     """
     path = directory / ADOPT_PR_RELPATH
     path.parent.mkdir(parents=True, exist_ok=True)

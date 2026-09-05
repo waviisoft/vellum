@@ -620,15 +620,22 @@ class WithoutAForgeCliTheStepsAreAChecklist(ProvisionCase):
     def test_the_adoption_pr_body_is_a_file_the_checklist_can_point_at(self):
         # `--body-file <adopt PR body>` was never substituted on this rung: the
         # operator was told to pass a filename that was four words of English.
-        # The body is written into the product checkout, uncommitted.
+        # The body is written under the product checkout's `.git/`, outside the
+        # working tree: it has to survive the command for the operator to pass
+        # it to `gh`, and a file that survives IN the tree is one the next
+        # dirty-tree check refuses on.
         out, staging = self._checklist_run("brownfield", "legacy", [])
-        body = staging / "legacy" / ".vellum" / "ADOPT_PR.md"
+        body = staging / "legacy" / ".git" / "vellum" / "ADOPT_PR.md"
         self.assertIn(f"--body-file {body}", out)
         self.assertTrue(body.is_file())
         self.assertIn("Adopt Vellum", body.read_text(encoding="utf-8"))
-        # Uncommitted: the branch carries the two seeded files and nothing else.
+        # The branch carries the two seeded files and nothing else, and the
+        # working tree is clean rather than carrying an untracked body.
         tracked = self.git(staging / "legacy", "ls-tree", "-r", "--name-only", "HEAD")
         self.assertNotIn(".vellum/ADOPT_PR.md", tracked.splitlines())
+        self.assertEqual(
+            self.git(staging / "legacy", "status", "--porcelain").strip(), ""
+        )
 
     def test_nothing_is_created_on_a_forge(self):
         self.assertIsNone(shutil.which("gh"))
@@ -1223,14 +1230,15 @@ class TheAdoptionIsAGuestInTheCheckout(ProvisionCase):
             self.host("ls-tree", "-r", "--name-only", provision.ADOPT_BRANCH).split(),
         )
 
-    def test_the_pr_body_is_the_only_thing_left_uncommitted(self):
+    def test_the_adoption_leaves_the_working_tree_clean(self):
+        # The pull request's body used to be the one thing left behind here, and
+        # being left behind in the TREE is what made it a problem: it is
+        # untracked, so the next command with a dirty-tree check refused on the
+        # leavings of this one. It lives under `.git/` now, which is
+        # per-checkout, never committed and never in `git status`.
         code, out = self.adopt()
         self.assertEqual(code, 0, out)
-        self.assertEqual(
-            [line.split()[-1] for line in
-             self.host("status", "--porcelain").splitlines()],
-            [".vellum/ADOPT_PR.md"],
-        )
+        self.assertEqual(self.host("status", "--porcelain").strip(), "")
 
 
 class AForgeFailureMidRunStillReportsWhatItDid(ProvisionCase):
