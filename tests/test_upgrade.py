@@ -445,7 +445,14 @@ class ThePlanNamesWhatWouldChangeAndCreatesNothing(UpgradeCase):
 
     def test_it_names_the_files_unchanged_between_the_releases(self):
         self.assertRegex(self.out, r"unchanged\s+harness/support/world\.py")
-        self.assertRegex(self.out, r"unchanged\s+ledger/releases\.yaml")
+        self.assertRegex(self.out, r"unchanged\s+harness/support/report\.py")
+
+    def test_the_release_ledger_is_not_owned_so_it_is_not_in_the_plan(self):
+        # Pipeline-written state, not a template Vellum keeps current. Owning it
+        # made every installation that had cut a release refuse its first
+        # upgrade by name (`vellum.owned` states the rule).
+        self.assertNotIn("ledger/releases.yaml", self.manifest_of(self.intent).owned)
+        self.assertNotIn("ledger/releases.yaml", self.out)
 
     def test_it_names_the_installation_shape_changes_of_the_range(self):
         self.assertIn(f"({BASE}, {NEWER}]", self.out)

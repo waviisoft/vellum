@@ -56,14 +56,21 @@ reason rather than by a blanket rule:
                                      that it has no template and touch nothing.
 ``.vellum/install.yaml``             Vellum's own bookkeeping, rewritten
                                      unconditionally (``vellum.manifest``).
+``ledger/releases.yaml``             Pipeline-written state, not a template —
+                                     see the paragraph below.
 ===================================  ============================================
 
-``ledger/releases.yaml`` is the uncomfortable row and it is owned deliberately:
-the seed ships its *shape*, and a release that changes that shape has no other
-way to deliver it. The consequence is real and is the mechanism working — an
-installation that has cut a release has written to the file, so its first
-upgrade refuses it by name and the operator either takes it back or drops the
-line from ``owned:``. That is one review, once, and it is visible.
+``ledger/releases.yaml`` is seeded and is **not** owned, and the row is worth a
+paragraph because it was owned once. The seed ships its *shape*, which reads
+like a template Vellum should keep current — but the file is **pipeline-written
+state**: ``vellum ledger open|advance`` and ``vellum certify record`` write to
+it, so every installation that has done any work at all has edited it, and every
+first upgrade would refuse by name on a file whose contents Vellum has no
+business restoring. A shape change there is a *changelog migration* — a release
+says what changed and the pipeline commands move the file — not a rewrite an
+upgrade performs. The other rows are all files an installation is expected never
+to write; this one is a file it is expected to write constantly, which is the
+line.
 """
 
 from __future__ import annotations
@@ -87,6 +94,10 @@ SEED, STUB = "seed", "stub"
 
 #: The template file names under ``src/vellum/seeds/templates/``.
 CONFIG_TEMPLATE = "config.yaml"
+#: Seeded by ``vellum init`` and deliberately absent from :func:`table` — the
+#: release ledger is pipeline-written state, not a file an upgrade rewrites (see
+#: the module docstring). The name stays here because ``vellum.provision`` seeds
+#: the file from it.
 RELEASES_TEMPLATE = "releases.yaml"
 MEMORY_MAP_TEMPLATE = "memory-map.md"
 
@@ -181,17 +192,6 @@ def table(forge: str = "github") -> dict[str, Owned]:
                 "the installation config, seeded with the defaults. It is where a "
                 "release's new keys arrive — always with a default — so a release "
                 "that adds one has no way to deliver it if this is not Vellum's"
-            ),
-        ),
-        Owned(
-            path="ledger/releases.yaml",
-            kind=SEED,
-            side=INTENT,
-            source=seeds.source_path(seeds.TEMPLATES, RELEASES_TEMPLATE),
-            why=(
-                "the release ledger's SHAPE, seeded empty. An installation that "
-                "has cut a release has written to it and its first upgrade will "
-                "say so by name; taking the line out of `owned:` is the answer"
             ),
         ),
         Owned(

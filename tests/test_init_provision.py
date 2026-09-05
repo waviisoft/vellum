@@ -419,10 +419,20 @@ class AGreenfieldSeedIsGreen(ProvisionCase):
 
     def test_the_seeded_manifest_owns_the_stubs_the_config_and_the_machinery(self):
         listed = manifest.load(self.intent).owned
-        for relative in (".vellum/config.yaml", "ledger/releases.yaml",
-                         "harness/run.py", "harness/support/runner.py",
+        for relative in (".vellum/config.yaml", "harness/run.py",
+                         "harness/support/runner.py",
                          (WORKFLOWS / "spec-ci.yml").as_posix()):
             self.assertIn(relative, listed, relative)
+
+    def test_the_seeded_manifest_does_not_own_the_release_ledger(self):
+        # Seeded, and not owned. `ledger/releases.yaml` is pipeline-written
+        # state — `vellum ledger open|advance` and `vellum certify record` write
+        # to it — so every installation that has done any work has edited it,
+        # and owning it would make every first upgrade refuse on a file Vellum
+        # has no business restoring. A shape change there is a changelog
+        # migration, not a rewrite (`vellum.owned` states the rule).
+        self.assertTrue((self.intent / "ledger" / "releases.yaml").is_file())
+        self.assertNotIn("ledger/releases.yaml", manifest.load(self.intent).owned)
 
     def test_the_seeded_manifest_owns_no_spec_file_and_nothing_that_is_ours(self):
         # The spec is the product's own words; the workspace file is the repo
