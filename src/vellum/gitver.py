@@ -139,6 +139,23 @@ def show(repo: Path, ref: str, path: str) -> str | None:
         return None
 
 
+def blob_at(repo: Path, ref: str, path: str) -> str | None:
+    """File contents at *ref*, or None when *path* is not a FILE there.
+
+    The difference from :func:`show` is the whole reason this exists: ``git show
+    <ref>:<a directory>`` succeeds and prints a tree listing, so a caller asking
+    "what does this branch carry at this path" gets prose about a directory
+    where it expected a file's bytes — and then compares it against a template.
+    ``cat-file -t`` is asked first and anything but a blob is "not a file here",
+    which is the same answer as "nothing here" to every caller.
+    """
+    try:
+        kind = _git(repo, "cat-file", "-t", f"{ref}:{path}").strip()
+    except GitUnavailable:
+        return None
+    return show(repo, ref, path) if kind == "blob" else None
+
+
 def head_commit(repo: Path) -> str | None:
     try:
         return _git(repo, "rev-parse", "HEAD").strip()

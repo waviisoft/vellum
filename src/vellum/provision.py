@@ -1510,16 +1510,24 @@ class Gh:
     path: str
 
     def run(self, argv: Sequence[str], *, stdin: str | None = None,
-            check: bool = True) -> subprocess.CompletedProcess:
+            check: bool = True, cwd: str | Path | None = None) -> subprocess.CompletedProcess:
         """One ``gh`` (or ``git``) invocation. List arguments, no shell.
 
         *stdin* is the one place a secret value appears, and it appears nowhere
         else: not in ``argv``, not in this object, not in any report. The
         subprocess reads it from a pipe, so it is never in ``/proc/<pid>/cmdline``
         and never in a shell history.
+
+        *cwd* matters for one reason and it is not cosmetic: ``gh`` resolves
+        *which repository* a command is about from the directory it runs in, and
+        the default here is this process's — wherever the operator happened to
+        be standing. A caller acting on a specific checkout passes it, and names
+        the repository with ``--repo`` as well, so neither the directory nor the
+        remote alone decides where a pull request is opened.
         """
         command = [self.path if argv[0] == "gh" else argv[0], *argv[1:]]
-        proc = subprocess.run(command, input=stdin, capture_output=True, text=True)
+        proc = subprocess.run(command, input=stdin, capture_output=True, text=True,
+                              cwd=str(cwd) if cwd is not None else None)
         if check and proc.returncode != 0:
             raise ProvisionError(
                 f"`{' '.join(_quote(a) for a in argv)}` exited {proc.returncode}: "

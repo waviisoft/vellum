@@ -30,9 +30,12 @@ three are the command's whole contract (``vellum.cli``'s docstring).
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -40,8 +43,9 @@ from pathlib import Path
 import yaml
 
 from support import REPO_ROOT, run_cli, run_cli_streams
-from vellum import changes, install, manifest, owned, seeds
-from vellum.gitver import tags
+from vellum import __version__ as vellum_version
+from vellum import changes, install, manifest, owned, seeds, upgrade as upgrade_module
+from vellum.gitver import show, tags
 
 #: The release the installation is provisioned at, and the one it is upgraded
 #: to. Both are far above anything this product will cut, so a test that started
@@ -520,11 +524,27 @@ class WithoutAReachableSourceItCannotAnswer(UpgradeCase):
         self.assertIn("carries no ref", out)
 
     def test_a_to_that_is_not_a_usable_ref_is_two(self):
-        # It is pasted into the stubs' `uses:` lines and handed to git; the same
-        # refusal `init --ref` makes, for the same reason.
+        # It is pasted into the stubs' `uses:` lines and handed to git.
         code, out = self.upgrade(to="v1.0.0 && rm -rf /")
         self.assertEqual(code, 2, out)
-        self.assertIn("check-ref-format", out)
+        self.assertIn("is not a release", out)
+
+    def test_a_to_that_is_a_branch_rather_than_a_release_is_two(self):
+        # "Upgrading is adopting a cut": installations pin releases, never a
+        # branch. A branch is a pin that moves under the manifest without
+        # anybody having upgraded anything, so the manifest would record a claim
+        # about files that stopped being true the next time it moved. The
+        # sandbox carries `at-the-base` as a real branch, so this is refused for
+        # being a branch and not for being unknown.
+        code, out = self.upgrade(to=BRANCH_REF)
+        self.assertEqual(code, 2, out)
+        self.assertIn("is not a release", out)
+        self.assertEqual(self.branches(self.intent), ["main"])
+
+    def test_a_to_that_is_a_plain_word_is_two(self):
+        code, out = self.upgrade(to="sandbox")
+        self.assertEqual(code, 2, out)
+        self.assertIn("is not a release", out)
 
     def test_an_installation_with_no_manifest_is_two(self):
         (self.intent / manifest.MANIFEST_RELPATH).unlink()
@@ -629,6 +649,456 @@ class DoctorReportsTheLocalCliAgainstTheStubs(UpgradeCase):
         self.assertEqual(code, 0, out)
         self.assertIn("the same", out)
         self.assertNotIn("NOT this CLI", out)
+
+
+class AnUpgradeRunsOnTheBranchItCutsFrom(UpgradeCase):
+    """@id:upgrade-rewrites-only-owned-files — the half about WHICH tree.
+
+    The upgrade branch is cut from the default branch and its pull request
+    merges back into it, so the default branch is the tree this rewrite lands
+    on. A run from anywhere else compares one tree and writes another, and it is
+    wrong in both directions: an edit made on `main` and hidden by a feature
+    branch checked out over it compares as unedited and gets overwritten, and an
+    edit made only on the feature branch is reported as one the installation
+    made to `main`. The comparison reads `main` (below), and this refuses to run
+    off it at all — either alone still leaves one direction live.
+    """
+
+    def test_a_checkout_standing_on_a_feature_branch_is_refused(self):
+        self.git(self.intent, "checkout", "-q", "-b", "feature/work")
+        code, out = self.upgrade()
+        self.assertEqual(code, 2, out)
+        self.assertIn("feature/work", out)
+        self.assertIn("main", out)
+
+    def test_it_creates_no_branch_and_writes_nothing(self):
+        before = self.files_at(self.intent, "HEAD")
+        self.git(self.intent, "checkout", "-q", "-b", "feature/work")
+        self.upgrade()
+        self.assertEqual(self.branches(self.intent), ["feature/work", "main"])
+        self.assertEqual(self.files_at(self.intent, "HEAD"), before)
+
+    def test_the_plan_is_refused_too(self):
+        # A plan computed off the wrong branch describes an upgrade nobody would
+        # get. Reporting it as though it were the plan is the failure.
+        self.git(self.intent, "checkout", "-q", "-b", "feature/work")
+        code, out = self.upgrade("--plan")
+        self.assertEqual(code, 2, out)
+        self.assertIn("feature/work", out)
+
+    def test_a_detached_head_is_refused(self):
+        self.git(self.intent, "checkout", "-q", "--detach", "HEAD")
+        code, out = self.upgrade()
+        self.assertEqual(code, 2, out)
+        self.assertIn("main", out)
+
+
+class TheComparisonReadsTheBaseBranchNotTheWorkingTree(UpgradeCase):
+    """The other half: what `main` carries decides, not what is on disk.
+
+    Set up as the dangerous direction. The installation edited an owned file and
+    committed it to `main`; the working tree then carries the pristine template
+    again — a stash popped elsewhere, a `git checkout <ref> -- <file>`, an editor
+    reverting. Reading the tree, the file is exactly what the release shipped and
+    the upgrade rewrites it, silently landing a pull request that undoes the
+    installation's edit. Reading `main`, it is an edit and the upgrade refuses.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.owned_file = self.intent / ".vellum" / "config.yaml"
+        self.pristine = self.owned_file.read_text(encoding="utf-8")
+        self.owned_file.write_text(self.pristine + "\n# raised by hand\n",
+                                   encoding="utf-8")
+        self.git(self.intent, "add", "-A")
+        self.git(self.intent, "commit", "-qm", "the installation tunes its config")
+        # And the tree hides it again.
+        self.owned_file.write_text(self.pristine, encoding="utf-8")
+
+    def test_the_edit_on_the_base_branch_is_found_though_the_tree_hides_it(self):
+        code, out = self.upgrade("--plan")
+        self.assertEqual(code, 1, out)
+        self.assertRegex(out, r"edited\s+\.vellum/config\.yaml")
+
+
+class AStubIsComparedAtTheRefItItselfPins(UpgradeCase):
+    """Stubs ahead of the manifest are ordinary, not three edits.
+
+    `vellum init --ref <new> --force` restamps the stubs and deliberately holds
+    the manifest's release line when the installation owns files a stamp does
+    not write (`install.stamp_manifest`). So an installation whose stubs pin a
+    newer ref than its manifest names is the expected state after that command —
+    and rendering each stub at the MANIFEST's release reported all three of them
+    as edits the installation had made, refusing an upgrade with nothing wrong
+    with it.
+    """
+
+    def setUp(self):
+        super().setUp()
+        code, out = run_cli(["init", str(self.intent), "--ref", NEWER, "--force"])
+        self.assertEqual(code, 0, out)
+        self.git(self.intent, "add", "-A")
+        self.git(self.intent, "commit", "-qm", "restamped the stubs alone")
+
+    def test_the_manifest_is_held_at_the_older_release(self):
+        self.assertEqual(self.manifest_of(self.intent).release, BASE)
+        for shipped in install.SHIPPED:
+            text = (self.intent / install.WORKFLOWS_DIR["github"]
+                    / shipped.filename).read_text(encoding="utf-8")
+            self.assertIn(f"@{NEWER}", text, shipped.name)
+
+    def test_no_stub_is_reported_as_edited(self):
+        code, out = self.upgrade("--plan")
+        self.assertEqual(code, 0, out)
+        for shipped in install.SHIPPED:
+            relative = (install.WORKFLOWS_DIR["github"] / shipped.filename).as_posix()
+            self.assertNotRegex(out, rf"edited\s+{re.escape(relative)}")
+
+    def test_the_upgrade_goes_through_and_records_the_newer_release(self):
+        code, out = self.upgrade()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.manifest_of(self.intent).release, NEWER)
+
+
+class AnUpgradeBranchThatAlreadyExistsIsRefused(UpgradeCase):
+    def test_one_that_exists_only_on_the_remote_is_two(self):
+        # One branch per release by design, so a second run for the same release
+        # is a retry or a second operator — and if the first run pushed, that
+        # branch has a pull request on it. Only what this checkout ALREADY knows
+        # is consulted: nothing fetches, because a refusal that reached the
+        # network would answer differently on a laptop with no signal.
+        self.git(self.intent, "update-ref",
+                 f"refs/remotes/origin/{upgrade_module.BRANCH_PREFIX}{NEWER}", "HEAD")
+        code, out = self.upgrade()
+        self.assertEqual(code, 2, out)
+        self.assertIn("on origin", out)
+        self.assertIn("nothing here fetches", out)
+        self.assertEqual(self.branches(self.intent), ["main"])
+
+
+class APathTheTreeRedirectsIsNeverWritten(UpgradeCase):
+    """An `owned:` line is not permission to write wherever the tree points.
+
+    The manifest is a file in the repository, so its list is written by whoever
+    can land a pull request — and `upgrade` writes every path on it after a
+    `mkdir -p`. The lexical checks (`vellum.manifest`) cannot see a symlink;
+    these are the ones that look at the checkout.
+    """
+
+    def exclude(self, checkout: Path, *paths: str) -> None:
+        """Hide untracked paths from `git status`, without touching the tree.
+
+        `.git/info/exclude` is git's own per-checkout ignore file: it is not
+        committed, so using it here does not change what the branch carries —
+        which is the point. An attacker's symlink that showed up in `git status`
+        would be refused by the dirty-tree check before any of this was reached,
+        and a `.gitignore` covering it is one commit away.
+        """
+        info = checkout / ".git" / "info"
+        info.mkdir(parents=True, exist_ok=True)
+        (info / "exclude").write_text("\n".join(paths) + "\n", encoding="utf-8")
+
+    def test_a_dangling_symlink_into_git_hooks_is_refused(self):
+        stub = self.intent / install.WORKFLOWS_DIR["github"] / "harness-ci.yml"
+        relative = (install.WORKFLOWS_DIR["github"] / "harness-ci.yml").as_posix()
+        stub.unlink()
+        self.git(self.intent, "add", "-A")
+        self.git(self.intent, "commit", "-qm", "this installation runs no harness CI")
+        self.exclude(self.intent, relative)
+        stub.symlink_to(Path("../../.git/hooks/pre-commit"))
+        hook = self.intent / ".git" / "hooks" / "pre-commit"
+        self.assertFalse(hook.exists())
+
+        code, out = self.upgrade("--restore")
+        self.assertEqual(code, 2, out)
+        self.assertIn("symlink", out)
+        self.assertIn(relative, out)
+        # The hook was not installed, so the commit this run would have made
+        # could not have executed it.
+        self.assertFalse(hook.exists())
+        self.assertEqual(self.branches(self.intent), ["main"])
+
+    def test_a_directory_symlink_out_of_the_checkout_is_refused(self):
+        memory = self.product / ".vellum" / "memory"
+        self.git(self.product, "rm", "-r", "-q", "--", ".vellum/memory")
+        self.git(self.product, "commit", "-qm", "no memory map here")
+        self.exclude(self.product, ".vellum/memory")
+        outside = self.root / "outside"
+        outside.mkdir()
+        memory.symlink_to(outside, target_is_directory=True)
+
+        code, out = self.upgrade("--restore", checkout=self.product)
+        self.assertEqual(code, 2, out)
+        self.assertIn("symlink", out)
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertEqual(self.branches(self.product), ["main"])
+
+    def test_a_git_path_in_the_owned_list_is_refused_by_the_manifest(self):
+        # Written as raw text, because `manifest.write` refuses it too: this is
+        # the manifest an attacker commits, not one Vellum could produce.
+        path = manifest.path_for(self.intent)
+        path.write_text(
+            path.read_text(encoding="utf-8") + "  - .git/hooks/pre-commit\n",
+            encoding="utf-8",
+        )
+        self.git(self.intent, "add", "-A")
+        self.git(self.intent, "commit", "-qm", "an owned path in the git directory")
+        code, out = self.upgrade()
+        self.assertEqual(code, 2, out)
+        self.assertIn(".git", out)
+        self.assertEqual(self.branches(self.intent), ["main"])
+
+
+class AHalfWrittenUpgradeIsWoundBack(UpgradeCase):
+    """A failure part way through the writes leaves the checkout as it was.
+
+    "Nothing is written" is the refusals' promise, and this is the same promise
+    arrived at from the other side: without it, the first unwritable path left an
+    operator standing on `vellum/upgrade-<release>` with half a release's files
+    in their tree and a command that had already exited.
+    """
+
+    def test_a_regular_file_where_a_parent_belongs_is_refused_before_the_branch(self):
+        self.git(self.intent, "rm", "-r", "-q", "--", "harness/support")
+        (self.intent / "harness" / "support").write_text("not a directory\n",
+                                                         encoding="utf-8")
+        self.git(self.intent, "add", "-A")
+        self.git(self.intent, "commit", "-qm", "harness/support is a file now")
+        code, out = self.upgrade("--restore")
+        self.assertEqual(code, 2, out)
+        self.assertIn("harness/support is a file", out)
+        self.assertEqual(self.branches(self.intent), ["main"])
+        self.assertEqual(self.git(self.intent, "rev-parse", "--abbrev-ref", "HEAD"),
+                         "main")
+
+    def test_a_write_that_fails_part_way_puts_the_checkout_back(self):
+        # A directory where a file belongs passes every check a path can be
+        # given — its parent is a directory, nothing is a symlink — and fails at
+        # the write itself, which is exactly the case the wind-back is for.
+        self.git(self.intent, "rm", "-q", "--", ".vellum/config.yaml")
+        blocking = self.intent / ".vellum" / "config.yaml"
+        blocking.mkdir()
+        (blocking / "keep.txt").write_text("in the way\n", encoding="utf-8")
+        self.git(self.intent, "add", "-A")
+        self.git(self.intent, "commit", "-qm", "a directory where the config was")
+
+        code, out = self.upgrade("--restore")
+        self.assertEqual(code, 2, out)
+        self.assertEqual(self.git(self.intent, "rev-parse", "--abbrev-ref", "HEAD"),
+                         "main")
+        self.assertEqual(self.branches(self.intent), ["main"])
+        self.assertEqual(self.git(self.intent, "status", "--porcelain"), "")
+        self.assertIn("back on 'main'", out)
+        # The stubs it had already rewritten before the failure are back as they
+        # were, rather than left at the new release on a branch nobody has.
+        for shipped in install.SHIPPED:
+            text = (self.intent / install.WORKFLOWS_DIR["github"]
+                    / shipped.filename).read_text(encoding="utf-8")
+            self.assertIn(f"@{BASE}", text, shipped.name)
+
+
+class TheForgeHalfNamesTheRepository(UpgradeCase):
+    """`--yes` opens the pull request against a repository it NAMES.
+
+    `gh pr create` resolves the repository from the directory it runs in, and
+    the transport's directory was this process's — wherever the operator was
+    standing when they ran `vellum upgrade <some other checkout>`. Both halves
+    are fixed: the command carries `--repo`, and the transport is given the
+    checkout as its working directory.
+    """
+
+    FAKE_GH = """#!{python}
+import json, os, sys
+with open(os.environ["GH_TRACE"], "a", encoding="utf-8") as trace:
+    trace.write(json.dumps({{"argv": sys.argv[1:], "cwd": os.getcwd()}}) + "\\n")
+if sys.argv[1:3] == ["pr", "create"]:
+    print("https://github.com/waviisoft/acme-intent/pull/7")
+sys.exit(0)
+"""
+
+    def setUp(self):
+        super().setUp()
+        self.trace = self.root / "gh-trace.jsonl"
+        directory = Path(os.environ["PATH"].split(os.pathsep)[0])
+        fake = directory / "gh"
+        fake.write_text(self.FAKE_GH.format(python=sys.executable), encoding="utf-8")
+        fake.chmod(0o755)
+        self.addCleanup(fake.unlink)
+        self.addCleanup(os.environ.pop, "GH_TRACE", None)
+        os.environ["GH_TRACE"] = str(self.trace)
+        # A remote whose URL is a forge one and whose PUSH url is a bare
+        # repository beside it: the slug has to come from a real remote, and
+        # this test must not touch a network to prove it.
+        self.bare = self.root / "origin.git"
+        _git(self.root, "init", "-q", "--bare", "-b", "main", str(self.bare))
+        self.git(self.intent, "remote", "add", "origin",
+                 "https://github.com/waviisoft/acme-intent.git")
+        self.git(self.intent, "remote", "set-url", "--push", "origin", str(self.bare))
+
+    def recorded(self) -> list[dict]:
+        if not self.trace.is_file():
+            return []
+        return [json.loads(line) for line in
+                self.trace.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    def test_pr_create_names_the_repo_and_runs_in_the_checkout(self):
+        code, out = self.upgrade("--yes")
+        self.assertEqual(code, 0, out)
+        created = [e for e in self.recorded() if e["argv"][:2] == ["pr", "create"]]
+        self.assertEqual(len(created), 1, self.recorded())
+        argv = created[0]["argv"]
+        self.assertIn("--repo", argv)
+        self.assertEqual(argv[argv.index("--repo") + 1], "waviisoft/acme-intent")
+        self.assertEqual(argv[argv.index("--base") + 1], "main")
+        self.assertEqual(argv[argv.index("--head") + 1],
+                         f"{upgrade_module.BRANCH_PREFIX}{NEWER}")
+        self.assertEqual(Path(created[0]["cwd"]).resolve(), self.intent.resolve())
+
+    def test_the_body_file_it_is_given_is_outside_the_working_tree(self):
+        self.upgrade("--yes")
+        created = [e for e in self.recorded() if e["argv"][:2] == ["pr", "create"]]
+        argv = created[0]["argv"]
+        body = Path(argv[argv.index("--body-file") + 1])
+        self.assertIn(".git", body.parts)
+        self.assertEqual(self.git(self.intent, "status", "--porcelain"), "")
+
+    def test_the_body_is_removed_once_gh_has_taken_it(self):
+        self.upgrade("--yes")
+        self.assertFalse((self.intent / upgrade_module.PR_BODY_RELPATH).exists())
+
+    def test_the_pull_request_url_is_reported(self):
+        code, out = self.upgrade("--yes")
+        self.assertEqual(code, 0, out)
+        self.assertIn("https://github.com/waviisoft/acme-intent/pull/7", out)
+
+    def test_the_printed_commands_carry_the_real_repo_when_gh_is_not_asked(self):
+        code, out = self.upgrade()
+        self.assertEqual(code, 0, out)
+        self.assertIn("--repo waviisoft/acme-intent", out)
+
+    def test_a_checkout_with_no_readable_origin_refuses_yes_before_writing(self):
+        self.git(self.intent, "remote", "remove", "origin")
+        before = self.files_at(self.intent, "HEAD")
+        code, out = self.upgrade("--yes")
+        self.assertEqual(code, 2, out)
+        self.assertIn("no `origin`", out)
+        self.assertEqual(self.branches(self.intent), ["main"])
+        self.assertEqual(self.files_at(self.intent, "HEAD"), before)
+        self.assertEqual(self.recorded(), [])
+
+
+class ThePullRequestBodyFencesTheChangelogItQuotes(unittest.TestCase):
+    """A summary carrying backticks must not close the fence around it.
+
+    The fenced block is a release's own changelog prose, and prose about a tool
+    says `like this`. A fixed three-backtick fence closes on the first line
+    carrying three of its own, and everything after it renders as markup in the
+    pull request body — a heading, a link, a checkbox somebody's summary
+    happened to contain. CommonMark closes a fence only with a run at least as
+    long as the opener, so the opener counts.
+    """
+
+    def test_it_is_longer_than_the_longest_run_in_the_content(self):
+        lines = ["a ``` b", "c ````` d"]
+        self.assertEqual(upgrade_module._fence(lines), "`" * 6)
+
+    def test_plain_content_keeps_the_ordinary_fence(self):
+        self.assertEqual(upgrade_module._fence(["nothing to see", "`one`"]),
+                         upgrade_module.FENCE)
+
+
+class TheOriginUrlIsReadAsAForgeRepository(unittest.TestCase):
+    def test_the_two_shapes_a_forge_remote_takes(self):
+        for url in ("https://github.com/waviisoft/vellum.git",
+                    "https://github.com/waviisoft/vellum",
+                    "https://user@github.example/waviisoft/vellum.git",
+                    "ssh://git@github.com/waviisoft/vellum.git",
+                    "git@github.com:waviisoft/vellum.git",
+                    "git@github.com:waviisoft/vellum"):
+            self.assertEqual(upgrade_module.slug_of(url), "waviisoft/vellum", url)
+
+    def test_anything_that_is_not_one_is_not_guessed_at(self):
+        # A local clone's last two path components are not a forge repository,
+        # and handing them to `gh pr create --repo` would name somebody else's.
+        for url in ("", "/home/me/work/acme", "../acme", "file:///tmp/x/acme.git",
+                    "https://github.com/waviisoft", "https://github.com/a/b/c"):
+            self.assertIsNone(upgrade_module.slug_of(url), url)
+
+
+class ReleasesFromBeforeTemplatesExistedCanStillBeRead(unittest.TestCase):
+    """@id:upgrade-rewrites-only-owned-files, for the installations that exist.
+
+    Every installation in the world was provisioned by v0.2.0 or earlier, and at
+    those releases the seeded config, the release ledger and the memory map were
+    string constants in `src/vellum/provision.py` rather than files under
+    `src/vellum/seeds/templates/`. Without the fallback, an upgrade off such an
+    installation reads no template for them at the release the manifest names
+    and reports every one as `unverifiable` — permanently, because that release
+    never changes by itself. So the fallback is what lets an existing
+    installation own a seeded file at all.
+    """
+
+    OLD = "v0.2.0"
+
+    def setUp(self):
+        try:
+            found = tags(REPO_ROOT, self.OLD)
+        except Exception as exc:  # not a checkout, or git is unavailable
+            self.skipTest(f"release tags could not be read: {exc}")
+        if not found:
+            self.skipTest(f"this checkout carries no {self.OLD} tag")
+        self.source = upgrade_module.Templates(checkout=REPO_ROOT)
+
+    def paths(self):
+        for name in (owned.CONFIG_TEMPLATE, owned.RELEASES_TEMPLATE,
+                     owned.MEMORY_MAP_TEMPLATE):
+            yield name, seeds.source_path(seeds.TEMPLATES, name)
+
+    def test_that_release_really_ships_none_of_these_files(self):
+        # The premise, asserted rather than assumed: if `templates/` did exist at
+        # v0.2.0 the fallback would be dead code and the tests below would be
+        # passing on the ordinary path.
+        for name, path in self.paths():
+            self.assertIsNone(show(REPO_ROOT, self.OLD, path), name)
+
+    def test_it_reads_back_what_that_release_seeded(self):
+        # Byte for byte against the templates as they are shipped today, because
+        # the move out of `provision.py` was byte for byte. A release that
+        # genuinely CHANGES one of these templates makes this assertion wrong
+        # rather than the code: freeze v0.2.0's bytes as a fixture then, and
+        # keep comparing against those.
+        for name, path in self.paths():
+            self.assertEqual(self.source.read(self.OLD, path), seeds.template(name),
+                             name)
+
+    def test_the_interpolation_that_release_applied_is_reproduced(self):
+        config = self.source.read(
+            self.OLD, seeds.source_path(seeds.TEMPLATES, owned.CONFIG_TEMPLATE)
+        )
+        self.assertIn("divergence_cap: 3", config)
+        self.assertNotIn("{divergence_cap}", config)
+
+    def test_a_placeholder_the_checkout_fills_is_left_alone(self):
+        # `{intent_slug}` is still a placeholder today; the upgrade fills it from
+        # `.vellum/product.yaml`. Substituting it here would hand the comparison
+        # a template with somebody's slug already in it.
+        memory = self.source.read(
+            self.OLD, seeds.source_path(seeds.TEMPLATES, owned.MEMORY_MAP_TEMPLATE)
+        )
+        self.assertIn("{intent_slug}", memory)
+
+    def test_a_release_after_the_move_is_not_read_this_way(self):
+        # The fallback is history, not a general mechanism: a release that ships
+        # no template ships no template, and saying otherwise would make every
+        # `files_retired` entry unverifiable instead.
+        self.assertIsNone(
+            self.source.pre_templates(
+                "v9.9.9", seeds.source_path(seeds.TEMPLATES, owned.CONFIG_TEMPLATE)
+            )
+        )
+        self.assertIsNone(
+            self.source.pre_templates(self.OLD, seeds.source_path(seeds.CHANGES))
+        )
 
 
 # =====================================================================

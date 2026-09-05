@@ -1180,30 +1180,60 @@ def installed_shape(root: Path, forge: str) -> tuple[str, str]:
     """
     host, branch = HOST_REPO, DEFAULT_BRANCH
     directory = root / WORKFLOWS_DIR[forge]
-    prefix = f"/{WORKFLOWS_DIR[forge].as_posix()}/"
     for shipped in SHIPPED:
         try:
-            data = yaml.safe_load((directory / shipped.filename).read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, yaml.YAMLError):
+            text = (directory / shipped.filename).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
             continue
-        if not isinstance(data, dict):
-            continue
-        for job in (_jobs(data) or {}).values():
-            uses = job.get("uses") if isinstance(job, dict) else None
-            if isinstance(uses, str) and prefix in uses:
-                candidate = uses.split(prefix, 1)[0]
-                if SLUG_RE.match(candidate):
-                    host = candidate
+        found_host, _, found_branch = stub_shape(text, forge)
+        if found_host is not None:
+            host = found_host
         # The branch list lives on `on-spec-merge` alone; the other two carry no
         # branch at all, so reading "the first stub with an `on:`" would find
         # nothing and quietly keep the default.
-        push = (_caller_half(data).get("on") or {})
-        branches = push.get("push", {}).get("branches") if isinstance(push, dict) else None
-        if isinstance(branches, list) and branches:
-            first = str(branches[0])
-            if REF_RE.match(first):
-                branch = first
+        if found_branch is not None:
+            branch = found_branch
     return host, branch
+
+
+def stub_shape(text: str, forge: str) -> tuple[str | None, str | None, str | None]:
+    """The host, the pinned ref and the watched branch ONE caller stub carries.
+
+    Split out of :func:`installed_shape` because ``vellum upgrade`` needs the
+    third value per file rather than the first two across the set: it compares
+    each stub against a render **at the ref that stub itself pins**, so that an
+    installation whose three stubs were restamped at different times is not
+    reported as having edited the ones that moved.
+
+    None for a value this stub does not carry, and None all round for text that
+    is not a parseable workflow: the caller is comparing against a render either
+    way, and ``doctor`` is the command whose job is saying a stub is unreadable.
+    """
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return None, None, None
+    if not isinstance(data, dict):
+        return None, None, None
+    prefix = f"/{WORKFLOWS_DIR[forge].as_posix()}/"
+    host = ref = branch = None
+    for job in (_jobs(data) or {}).values():
+        uses = job.get("uses") if isinstance(job, dict) else None
+        if not isinstance(uses, str) or prefix not in uses:
+            continue
+        candidate, _, rest = uses.partition(prefix)
+        if SLUG_RE.match(candidate):
+            host = candidate
+        pinned = rest.partition("@")[2]
+        if REF_RE.match(pinned):
+            ref = pinned
+    push = (_caller_half(data).get("on") or {})
+    branches = push.get("push", {}).get("branches") if isinstance(push, dict) else None
+    if isinstance(branches, list) and branches:
+        first = str(branches[0])
+        if REF_RE.match(first):
+            branch = first
+    return host, ref, branch
 
 
 def strays(directory: Path, *, host: str, known: set[str], relative_to: Path) -> list[Finding]:
