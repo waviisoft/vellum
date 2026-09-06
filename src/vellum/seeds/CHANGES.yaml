@@ -37,15 +37,22 @@
 #      `template:` behind for the next one. The same test fails when
 #      `f"v{__version__}"` has no entry, so the entry is written BEFORE the tag
 #      rather than remembered after it.
-#   3. Run the suite. Both alarms above are ordinary tests.
-#   4. The owner tags `v<the version>` and pushes the tag. Only then does
-#      `EveryReleaseTagHasAShapeEntry` — which reads the repository's real tags
-#      — have anything to say, which is why steps 1-3 carry their own alarm:
-#      a tag-reading test cannot fail for a tag nobody has cut yet.
+#   3. Run the suite. Both alarms above are ordinary tests, and step 2's is now
+#      load-bearing beyond the suite: `.vellum/product.yaml` names THIS file as
+#      the changelog, so `vellum release tag` refuses a version it does not
+#      describe and the forge does not tag one.
+#   4. Merge. The `release-cut` workflow tags `v<the version>` on the merge that
+#      bumps the version and pushes the tag with the job token — nobody pushes a
+#      release tag by hand (spec/features/release-tags.md). `v0.3.0` was the last
+#      hand-cut tag, because the workflow ships inside it. Only after the tag
+#      exists does `EveryReleaseTagHasAShapeEntry` — which reads the repository's
+#      real tags — have anything to say, which is why steps 1-3 carry their own
+#      alarm: a tag-reading test cannot fail for a tag nobody has cut yet.
 #
 # `tests/test_upgrade.py::EveryReleaseTagHasAShapeEntry` fails when a `v*` tag
 # in this repo has no entry here, which is the alarm for a release cut without
-# one.
+# one. `tests/test_tag.py::ThisRepoDogfoodsIt` is the same alarm one step
+# earlier, and the one the forge acts on.
 
 schema: 1
 
@@ -174,3 +181,74 @@ releases:
         in CI is reported and never failed on. An installation provisioned
         before the manifest existed sees the first of those once, and the
         finding names the fix and what it will mark owned.
+
+  - release: v0.4.0
+    summary: >-
+      The product side of the pair gets its first caller stub, and a release tag
+      becomes something the forge mints from a version the installation declares.
+    config_keys_added:
+      - key: release
+        default: absent
+        what: >-
+          A block in `.vellum/product.yaml` — not `.vellum/config.yaml`, because
+          it is a fact about ONE product repo and the config is the intent
+          repo's — naming where that repo's version lives, and optionally the
+          changelog that must describe it. Absent by default and never inferred:
+          a product repo that declares none is one `vellum release tag` cannot
+          answer about, and the `release-cut` workflow fails saying so rather
+          than guessing a version out of a file that happens to be lying there.
+          Declare it as `release:` with `version_source:` naming
+          `pyproject.toml` (its `[project] version`), `package.json` (its
+          `version`), or any other path read as that file's trimmed contents,
+          and optionally `changelog:` naming the file that must carry an entry
+          for `v<version>` or `<version>`.
+    files_added:
+      - path: .github/workflows/release-cut.yml
+        what: >-
+          The PRODUCT side's caller stub, and the first file Vellum stamps in a
+          product repo. It runs on every push to the default branch, installs
+          the CLI at the ref it pins and runs `vellum release tag`; when the
+          declared version names a tag that does not exist, the workflow creates
+          it and pushes it with the caller's own job token. Stamped by `vellum
+          init <product-checkout>` — a second stamp, in that checkout, which
+          provisioning does not make — verified by `vellum doctor` there, and
+          re-stamped by `vellum upgrade`. A pair provisioned before this release
+          has it owned and absent until that stamp is made, and doctor in the
+          product checkout is what says so.
+    files_retired: []
+    stub_inputs:
+      - >-
+        `release-cut` takes the same two as the other three: `vellum-ref`
+        (required, quoted) and `VELLUM_TOKEN` (secret, optional, passed by name).
+        Its caller stub grants `permissions: contents: write`, which is what
+        pushes the tag — a called workflow's token can only be narrowed by the
+        callee, so an installation whose stub grants less fails at the push. A
+        tag protection rule on `v*` withholds it even when the grant is right;
+        that is forge state and nothing in either checkout can see it.
+    notes:
+      - >-
+        New command: `vellum release tag <product-checkout> [--plan]`. It
+        computes and never applies — no tag created, nothing pushed, nothing
+        written — and the `release-cut` workflow is what applies the name. Exit 0
+        whether the name is unused (the report names it and the commit) or
+        already used (reported and left alone, so re-runs and merges that do not
+        bump the version are no-ops); 1 when a declared changelog carries no
+        entry for the version, naming the file and the entry; 2 when it cannot
+        answer.
+      - >-
+        `vellum init` now stamps EITHER side of a pair, and which side is read
+        off the checkout rather than given: `.vellum/workspace.yaml` makes it an
+        intent checkout and gets the three stubs that run there,
+        `.vellum/product.yaml` makes it a product checkout and gets
+        `release-cut`. A checkout carrying both, or neither, is refused at exit 2
+        as it always was.
+      - >-
+        `vellum doctor <intent-checkout> --product <product-checkout>` covers
+        both halves of a pair in one report and one exit code, with a per-file
+        verdict for every stub on both sides. The path is an input because
+        `.vellum/workspace.yaml` names the product REPOSITORY and not where it is
+        checked out, which is the same reason `--releases-from` takes one.
+      - >-
+        Nothing in an existing INTENT checkout changes. This release adds a file
+        to the product half and a block an installation writes for itself; an
+        intent-side upgrade crossing it rewrites nothing new.
