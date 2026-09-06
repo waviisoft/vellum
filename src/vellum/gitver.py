@@ -123,6 +123,28 @@ def tags(repo: Path, pattern: str) -> list[str]:
     ]
 
 
+def ref_format_ok(repo: Path, name: str) -> bool:
+    """Whether git itself would accept *name* as a ref name.
+
+    ``git check-ref-format`` is the only complete statement of what a ref name
+    may be, and it is git's own: the rules run to a dozen clauses (no ``..``, no
+    control character, no trailing ``.``, no ``.lock`` component, no ``@{``, no
+    ``\``, and more), they are the forge's rules too, and a regex kept beside
+    them is a regex that drifts from them. A caller that has already narrowed
+    the value asks this as the last word rather than as the only one — a name
+    git refuses is a tag no ``git tag`` will create and no forge will resolve,
+    which is worth finding here rather than in the middle of a workflow's push.
+
+    False when git refuses the name, and only then: the command reads nothing
+    and needs no repository, so a non-zero exit is an answer about *name*.
+    """
+    try:
+        _git(repo, "check-ref-format", "--allow-onelevel", name)
+    except GitUnavailable:
+        return False
+    return True
+
+
 def markdown_at(repo: Path, ref: str, prefix: str) -> list[str]:
     """Repo-relative paths of every ``.md`` file under *prefix* at *ref*."""
     args = ["ls-tree", "-r", "--name-only", ref]

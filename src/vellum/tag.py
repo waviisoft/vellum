@@ -41,6 +41,27 @@ Which of the three is decided by the file's **name**, not by its contents: a
 declaration naming ``pyproject.toml`` and getting the trimmed-contents reader
 because the parse failed would report a version that is most of a TOML file.
 
+What a declaration may name, and why the checks are where they are
+------------------------------------------------------------------
+The ``release:`` block is a file in a repository anybody who can land a pull
+request writes, and this command opens what it names and prints what it read —
+in CI, on a runner holding ``contents: write`` for the repository it is about.
+So a declared path is held three times, each in the place that can answer:
+
+* **as a string** (:func:`_relative`): repo-relative, POSIX, printable, no
+  ``..``, no first component ``.git``.
+* **as a path on a disk** (``vellum.paths.unsafe_read``): no component a
+  symlink, resolving inside the checkout, and a regular file — a FIFO never
+  ends and ``/dev/zero`` never stops.
+* **as bytes** (:data:`VERSION_SOURCE_LIMIT`): the one reader with no parser in
+  front of it reads at most 4 KiB, because "a version file is one line".
+
+And what comes back is held twice: :data:`VERSION_RE` says what a version may
+be, and ``git check-ref-format`` says what a ref may be, which is the rule that
+actually decides whether the workflow's ``git tag`` can succeed. No message on
+any of these paths quotes what was read — the file's contents are the pull
+request author's text, and this command's report is a CI log.
+
 The exit codes, and why a missing changelog entry is 1 rather than 2
 --------------------------------------------------------------------
 "Exit codes follow the guards' contract" — 0 is an answer, 1 is the answer you
@@ -60,8 +81,10 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-from vellum import product
-from vellum.gitver import GitUnavailable, resolve, tags
+import yaml
+
+from vellum import paths, product
+from vellum.gitver import GitUnavailable, ref_format_ok, resolve, tags
 from vellum.text import one_line
 
 #: The block a product repo declares, and the two keys under it. Only these two
@@ -70,6 +93,14 @@ from vellum.text import one_line
 RELEASE_KEY = "release"
 VERSION_SOURCE_KEY = "version_source"
 CHANGELOG_KEY = "changelog"
+
+#: The two keys a YAML changelog is read through: the top-level list of entries,
+#: and the key inside an entry that names the release. Both are the shape
+#: ``src/vellum/seeds/CHANGES.yaml`` ships and ``vellum.changes`` reads, named
+#: here rather than imported so that a module about tags does not depend on the
+#: upgrade machinery to ask one question about a file.
+RELEASES_KEY = "releases"
+RELEASE_ENTRY_KEY = "release"
 
 #: The two version sources that need a parser, by file name. Matched on the
 #: name and never on the contents: a ``pyproject.toml`` this failed to parse
@@ -84,11 +115,33 @@ PACKAGE_JSON = "package.json"
 #: pre-release or build suffix is allowed after the dotted core — those are
 #: versions somebody chose — and a bare integer is not, because that is what an
 #: unrelated one-line file looks like.
-VERSION_RE = re.compile(r"^\d+(?:\.\d+)+(?:[-+][0-9A-Za-z][0-9A-Za-z.\-]*)?$")
+#:
+#: ``[0-9]`` and not ``\d``, and the three look-aheads, are all one point: this
+#: value becomes a REF NAME, so what it may be is what git will accept. ``\d``
+#: matches the fullwidth digits and every other decimal digit Unicode has, and
+#: ``０.４.０`` is a version no forge resolves and no operator can type back.
+#: ``..``, a trailing ``.`` and a ``.lock`` suffix are three names git itself
+#: refuses — the same look-aheads ``install.REF_RE`` carries, for the same
+#: reason. :func:`plan` asks ``git check-ref-format`` as the last word;
+#: this is the first, so a value that never reaches git is refused with a
+#: message about versions rather than one about refs.
+VERSION_RE = re.compile(
+    r"^(?!.*\.\.)(?!.*\.lock$)"
+    r"[0-9]+(?:\.[0-9]+)+(?:[-+][0-9A-Za-z][0-9A-Za-z.\-]*)?(?<!\.)$"
+)
 
-#: How wide a commit is printed. Long enough to be unambiguous in any repository
-#: anybody will run this in, short enough to read; the full sha is what the
-#: workflow tags, and it never travels through this report.
+#: How much of a plain-text version source this reads before refusing it. A
+#: version file is one line; a `version_source` naming a log, an archive or a
+#: device is a file this would otherwise read to the end of, in a workflow, into
+#: a string it then puts in a report. 4 KiB is far past every real one and far
+#: short of anything that hurts.
+VERSION_SOURCE_LIMIT = 4096
+
+#: How wide a commit is printed in the PROSE report. Long enough to be
+#: unambiguous in any repository anybody will run this in, short enough to read.
+#: The full sha is what the workflow tags, and `--json` carries it — that is the
+#: answer a machine reads, and abbreviating it there would make the workflow
+#: resolve a name this had already resolved. Only the prose is abbreviated.
 ABBREV = 12
 
 
@@ -205,24 +258,53 @@ def _relative(value, *, where: str, path: Path) -> str:
     """
     if not isinstance(value, str) or not value.strip():
         raise TagError(
-            f"{path}: {where} is {value!r}; it must be a repo-relative path to "
-            f"the file the version is read from."
+            f"{one_line(path)}: {where} is {one_line(value)!r}; it must be a "
+            f"repo-relative path to the file the version is read from."
         )
-    text = value.strip()
+    text = value
+    # Printable, and already stripped — the rule `vellum.manifest` states for an
+    # `owned:` entry, for the same reason one repo over. This value is printed
+    # into a report, and that report is piped into `$GITHUB_STEP_SUMMARY` and cut
+    # down to one line for a `::error` annotation by the `release-cut` workflow.
+    # A carriage return followed by `::error title=…` is a workflow command at
+    # column 0, written by whoever could land a line in `.vellum/product.yaml`;
+    # `one_line` flattens what reaches a message, and this refuses the value
+    # outright, because a path with a newline in it names no file anyway.
+    if not text.isprintable() or text != text.strip():
+        raise TagError(
+            f"{one_line(path)}: {where} is {one_line(text)!r}, which is not a "
+            f"printable path with no surrounding whitespace. A control character "
+            f"reaches a CI log as itself, where a line of its own is all a "
+            f"workflow command needs — so it is refused rather than trimmed."
+        )
     if text.startswith("/") or "\\" in text:
         raise TagError(
-            f"{path}: {where} is {one_line(text)!r}; entries are repo-relative "
-            f"POSIX paths, so an absolute path or a backslash is refused."
+            f"{one_line(path)}: {where} is {one_line(text)!r}; entries are "
+            f"repo-relative POSIX paths, so an absolute path or a backslash is "
+            f"refused."
         )
     parts = [p for p in PurePosixPath(text).parts if p != "."]
     if any(p == ".." for p in parts):
         raise TagError(
-            f"{path}: {where} is {one_line(text)!r}, which escapes the repository "
-            f"with '..'. The version lives in the repo whose version it is."
+            f"{one_line(path)}: {where} is {one_line(text)!r}, which escapes the "
+            f"repository with '..'. The version lives in the repo whose version "
+            f"it is."
         )
     if not parts:
         raise TagError(
-            f"{path}: {where} is {one_line(text)!r}, which names no file."
+            f"{one_line(path)}: {where} is {one_line(text)!r}, which names no file."
+        )
+    # Lexical, and kept beside the filesystem walk that also refuses it
+    # (`vellum.paths.unsafe_read`) rather than instead of it: this one is about
+    # the string an operator wrote and can be answered without a disk, and the
+    # other is about where the components actually lead.
+    if parts[0] == paths.GIT_DIR:
+        raise TagError(
+            f"{one_line(path)}: {where} is {one_line(text)!r}, which reads out of "
+            f"`{paths.GIT_DIR}/` — git's own directory, not this repository's "
+            f"content. It carries the remotes and, on a runner, the credential "
+            f"`actions/checkout` persisted there. A version lives in a file the "
+            f"repository tracks."
         )
     return "/".join(parts)
 
@@ -284,23 +366,61 @@ def declaration(checkout: str | Path) -> Declaration:
     return Declaration(version_source=source, changelog=changelog)
 
 
-def _read(root: Path, relative: str, *, what: str) -> str:
+def _read(root: Path, relative: str, *, what: str, limit: int | None = None) -> str:
+    """The declared file's text, after the walk that says it is a file to read.
+
+    :func:`vellum.paths.unsafe_read` comes first and the ``open()`` second, and
+    the order is the whole point: `_relative` held the *string* to being
+    repo-relative, and a string that is repo-relative still reaches
+    ``/etc/shadow`` when ``VERSION`` is a symlink to it, or reads forever when it
+    is ``/dev/zero``. What this command does with what it read is print it, in
+    CI, so the check has to be about where the path leads rather than about how
+    it is spelled.
+
+    *limit*, when given, is the most this will read — see
+    :data:`VERSION_SOURCE_LIMIT`. A file longer than it is refused by LENGTH and
+    never by content: "a version file is one line", and a message that quoted
+    what it found would be this command printing the file it just declined to
+    read.
+    """
+    where = one_line(root / relative)
+    refusal = paths.unsafe_read(root, relative)
+    if refusal is not None:
+        raise TagError(f"{where}: this is not a {what} to read — {refusal}")
+    path = root / relative
+    if limit is not None:
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            raise TagError(
+                f"{where}: cannot read the {what}: {one_line(str(exc))}"
+            ) from exc
+        if size > limit:
+            raise TagError(
+                f"{where}: the {what} is {size} bytes and this reads at most "
+                f"{limit}. A version file is one line; a declaration naming a "
+                f"log, an archive or a device is one this will not read to the "
+                f"end of. Nothing of what is in it is quoted here, because a "
+                f"file this refused to read is not one to print."
+            )
     try:
-        return (root / relative).read_text(encoding="utf-8")
+        return path.read_text(encoding="utf-8")
     except OSError as exc:
         raise TagError(
-            f"{root / relative}: cannot read the {what}: {one_line(str(exc))}"
+            f"{where}: cannot read the {what}: {one_line(str(exc))}"
         ) from exc
     except UnicodeDecodeError as exc:
         # A ValueError, not an OSError. Uncaught it left this exiting 1 with a
-        # traceback, and 1 is the code that must mean the changelog refusal.
+        # traceback, and 1 is the code that must mean the changelog refusal. The
+        # position is named and the byte is not: `str(exc)` carries the value it
+        # choked on, which is one byte of the file's contents.
         raise TagError(
-            f"{root / relative}: the {what} is not UTF-8 text "
-            f"({one_line(str(exc))})."
+            f"{where}: the {what} is not UTF-8 text (it stops being text at "
+            f"byte {exc.start})."
         ) from exc
 
 
-def _from_pyproject(text: str, where: Path) -> str:
+def _from_pyproject(text: str, where: str) -> str:
     if _toml is None:  # pragma: no cover - both readers are present in CI
         raise TagError(
             f"{where} is a TOML version source and this Python has neither "
@@ -311,7 +431,20 @@ def _from_pyproject(text: str, where: Path) -> str:
         data = _toml.loads(text)
     except Exception as exc:  # the reader's own error type varies by backport
         raise TagError(f"{where}: not valid TOML: {one_line(str(exc))}") from exc
-    version = (data.get("project") or {}).get("version")
+    project = data.get("project")
+    # `isinstance`, not `or {}`: a `project = "0.4.0"` line — or a `[project]`
+    # somebody wrote as an array of tables — parses fine and is not a mapping,
+    # and `.get` on it was an AttributeError that left this exiting 1 with a
+    # traceback. 1 is the code that must mean the changelog refusal, so a
+    # malformed pyproject reaching it would have the `release-cut` workflow tell
+    # an operator to write a changelog entry for a version it never read.
+    if project is not None and not isinstance(project, dict):
+        raise TagError(
+            f"{where}: `project` is not a table, so it declares no `[project] "
+            f"version`. The version source a `{RELEASE_KEY}:` block names has to "
+            f"be a pyproject this can read a version out of."
+        )
+    version = (project or {}).get("version")
     if version is None:
         raise TagError(
             f"{where} declares no `[project] version`, so the file this "
@@ -320,11 +453,14 @@ def _from_pyproject(text: str, where: Path) -> str:
     return str(version).strip()
 
 
-def _from_package_json(text: str, where: Path) -> str:
+def _from_package_json(text: str, where: str) -> str:
     try:
         data = json.loads(text)
     except ValueError as exc:
         raise TagError(f"{where}: not valid JSON: {one_line(str(exc))}") from exc
+    # A top-level array, string or number is JSON this parsed and cannot read a
+    # `version` out of; `isinstance` is what keeps it a refusal rather than a
+    # `TypeError` — the same guard `_from_pyproject` needs one file over.
     if not isinstance(data, dict) or "version" not in data:
         raise TagError(
             f"{where} declares no top-level `version`, so the file this "
@@ -340,39 +476,111 @@ def version_from(root: Path, declared: Declaration) -> str:
     or any other path, read as the trimmed contents of that file."
     """
     relative = declared.version_source
-    where = root / relative
-    text = _read(root, relative, what="version source")
+    where = one_line(root / relative)
     name = PurePosixPath(relative).name
     if name == PYPROJECT:
-        version = _from_pyproject(text, where)
+        version = _from_pyproject(_read(root, relative, what="version source"), where)
     elif name == PACKAGE_JSON:
-        version = _from_package_json(text, where)
+        version = _from_package_json(
+            _read(root, relative, what="version source"), where
+        )
     else:
-        version = text.strip()
+        # The one reader with no parser in front of it, and so the one that is
+        # capped: a `pyproject.toml` or a `package.json` this cannot parse is
+        # already a refusal, and "the trimmed contents of that file" is the
+        # branch where a declaration naming something enormous would otherwise be
+        # read to the end.
+        version = _read(
+            root, relative, what="version source", limit=VERSION_SOURCE_LIMIT,
+        ).strip()
     if not VERSION_RE.match(version):
+        # The LENGTH, never the contents. This message is printed in CI and cut
+        # to one line for a `::error` annotation by the `release-cut` workflow,
+        # and the file it is about is one anybody who can land a pull request
+        # writes — so quoting what was found would put their text in the log
+        # under this command's name. What an operator needs is which file, and
+        # that what came out of it is not a version.
         raise TagError(
-            f"{where} yields {one_line(version)!r}, which is not a version this "
-            f"can name a tag from. A tag is `v<version>` and a version is dotted "
-            f"— `0.4.0`, `1.10.2`, `2.0.0-rc.1`. Nothing is inferred from tags or "
-            f"commits, so there is no second place to look."
+            f"{where} yields {len(version)} characters that are not a version "
+            f"this can name a tag from. A tag is `v<version>` and a version is "
+            f"dotted, in ASCII digits — `0.4.0`, `1.10.2`, `2.0.0-rc.1` — and it "
+            f"may not carry `..`, end with `.`, or end with `.lock`, three names "
+            f"git itself refuses. Nothing is inferred from tags or commits, so "
+            f"there is no second place to look."
         )
     return version
 
 
-def changelog_names(text: str, version: str) -> bool:
-    """Whether a changelog carries an entry for *version*, either spelling.
+def _yaml_releases(text: str) -> list | None:
+    """The ``releases:`` list of a changelog that is YAML, or None.
 
-    A substring test, deliberately: a changelog is prose in whatever shape its
-    project keeps — a Markdown heading, a YAML key under ``releases:``, a line
-    in a table — and a reader that understood one of those would refuse the
-    other two. What the spec asks is whether the version is *described*, and the
-    honest checkable half of that is whether the file mentions it at all.
+    This project's own ``CHANGES.yaml`` is one, and so is every installation's:
+    the seeded changelog IS a YAML document with a ``releases:`` list whose
+    entries carry ``release: v0.4.0``. When a changelog is that, "does it carry
+    an entry for this version" is a question with an exact answer, and the
+    substring test that used to stand here was answering a different one.
 
-    Both spellings, because an entry may be headed ``v0.5.0`` or ``0.5.0`` and
-    refusing the second would fail a project whose changelog has always been
-    written the other way.
+    None for anything that is not that shape — a Markdown changelog, a table, a
+    text file — which is the common case and falls to :func:`_names_at_boundary`
+    below. A Markdown file whose lines all begin ``#`` parses as YAML to
+    ``None``; that is not a refusal, it is "this is not the YAML shape".
     """
-    return f"v{version}" in text or version in text
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    releases = data.get(RELEASES_KEY)
+    return releases if isinstance(releases, list) else None
+
+
+def _names_at_boundary(text: str, version: str) -> bool:
+    """Whether *version* appears in *text* as a name rather than inside one.
+
+    The old test was ``version in text``, and it said yes to three things that
+    are not an entry for this version: ``10.4.0`` contains ``0.4.0``,
+    ``0.4.0-rc1`` contains ``0.4.0``, and a sentence saying the number does not
+    describe a release. What is asked for here is a *heading or a line*, so the
+    version has to start one or follow the punctuation a changelog heads an entry
+    with — ``## 0.4.0``, ``## [0.4.0] - 2026-09-06``, ``* v0.4.0``, ``(0.4.0)``
+    — and nothing may follow it that would make it a longer name.
+
+    What this deliberately does NOT do is judge prose: a line reading "we shipped
+    0.4.0 last week" satisfies it, because a reader that refused that would have
+    to understand the changelog's shape, and the shape is whatever its project
+    keeps. The YAML branch above is where an exact answer is possible, and it is
+    taken when it is available.
+    """
+    return bool(re.search(
+        rf"(^|[\s#\[(])v?{re.escape(version)}(?![0-9A-Za-z.\-])", text, re.M,
+    ))
+
+
+def changelog_names(text: str, version: str) -> bool:
+    """Whether a changelog carries an entry for *version*, in either shape.
+
+    Two branches, because a changelog is either a document this can read or prose
+    in whatever shape its project keeps:
+
+    * **YAML with a ``releases:`` list** — this project's own ``CHANGES.yaml``,
+      and every installation's. An entry whose ``release`` is ``v<version>`` or
+      ``<version>``, and nothing else will do: a version named only in a comment
+      or in another entry's summary is a version nobody wrote an entry for, and
+      the whole refusal exists to say so.
+    * **anything else** — the version at a line or heading boundary, either
+      spelling, because an entry may be headed ``v0.5.0`` or ``0.5.0`` and
+      refusing the second would fail a project whose changelog has always been
+      written the other way.
+    """
+    releases = _yaml_releases(text)
+    if releases is not None:
+        wanted = {version, f"v{version}"}
+        return any(
+            isinstance(entry, dict) and str(entry.get(RELEASE_ENTRY_KEY)) in wanted
+            for entry in releases
+        )
+    return _names_at_boundary(text, version)
 
 
 def plan(checkout: str | Path) -> Plan:
@@ -387,6 +595,20 @@ def plan(checkout: str | Path) -> Plan:
     declared = declaration(root)
     version = version_from(root, declared)
     tag = f"v{version}"
+    # git's own answer, as the last word after `VERSION_RE`'s first one. The
+    # regex is what this module can say about a *version*; `check-ref-format` is
+    # the complete statement of what a REF may be, it is the forge's rule too,
+    # and it is a dozen clauses that a regex kept beside it would drift from. A
+    # name git refuses here is one `git tag` would refuse in the middle of the
+    # `release-cut` workflow, with `contents: write` in hand and half a job done.
+    if not ref_format_ok(root, f"refs/tags/{tag}"):
+        raise TagError(
+            f"{one_line(root / declared.version_source)} yields a version whose "
+            f"tag name `{one_line(tag)}` is one `git check-ref-format` refuses, "
+            f"so no tag by that name can be created and no forge would resolve "
+            f"it. Declare a version git will take: dotted ASCII digits, with no "
+            f"`..`, no trailing `.` and no `.lock`."
+        )
 
     # The changelog is checked BEFORE the name is looked up, and the ordering
     # is a reading of two spec sentences that only ever meet in one odd case: a
@@ -403,8 +625,9 @@ def plan(checkout: str | Path) -> Plan:
             # describes it." Both nouns are named because a refusal that named
             # neither leaves an operator with a red and no next step.
             raise TagRefused(
-                f"{root / declared.changelog} carries no entry for {tag}: it "
-                f"names neither `{tag}` nor `{version}`. A version its changelog "
+                f"{one_line(root / declared.changelog)} carries no entry for "
+                f"{tag}: it names neither `{tag}` nor `{version}`. A version its "
+                f"changelog "
                 f"does not describe is not tagged — write the {tag} entry in "
                 f"{declared.changelog} and run this again. Nothing was tagged "
                 f"(spec/features/release-tags.md)."
@@ -414,8 +637,9 @@ def plan(checkout: str | Path) -> Plan:
         commit = resolve(root, "HEAD")
     except GitUnavailable as exc:
         raise TagError(
-            f"{root}: cannot read HEAD ({one_line(str(exc))}). The tag names the "
-            f"commit the default branch is at, so this needs a git checkout."
+            f"{one_line(root)}: cannot read HEAD ({one_line(str(exc))}). The tag "
+            f"names the commit the default branch is at, so this needs a git "
+            f"checkout."
         ) from exc
     try:
         # An exact-name glob, so this asks about ONE name. Listing every tag and
@@ -425,8 +649,8 @@ def plan(checkout: str | Path) -> Plan:
         used = bool(tags(root, tag))
     except GitUnavailable as exc:
         raise TagError(
-            f"{root}: cannot read the tags ({one_line(str(exc))}), so this cannot "
-            f"say whether {tag} is already used."
+            f"{one_line(root)}: cannot read the tags ({one_line(str(exc))}), so "
+            f"this cannot say whether {tag} is already used."
         ) from exc
 
     return Plan(
