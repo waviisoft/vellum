@@ -22,6 +22,7 @@ from pathlib import Path
 import yaml
 
 from support import (
+    git as _git,
     make_installable_intent,
     make_releases_repo,
     run_cli,
@@ -31,8 +32,10 @@ from support import (
 )
 from vellum import manifest, owned
 from vellum.install import (
+    DEFAULT_BRANCH,
     INTENT,
     PRODUCT,
+    RELEASE_BLOCK,
     SHIPPED,
     WORKFLOWS_DIR,
     default_ref,
@@ -1143,6 +1146,21 @@ class TheProductSideIsTheOtherHalf(InstallCase):
         write_product(checkout)
         return checkout
 
+    def on_branch(self, name: str) -> Path:
+        """A product checkout that is a real repository, on *name*.
+
+        Committed, because "which branch is this checkout on" is a question
+        `git rev-parse --abbrev-ref HEAD` answers about a repository with a
+        commit in it; an unborn branch is one of the ways git cannot say, and
+        `install.resolve_branch` falls back rather than guessing there.
+        """
+        checkout = self.product()
+        _git(checkout, "init", "-q", "-b", name, ".")
+        _git(checkout, "add", "-A")
+        _git(checkout, "-c", "user.name=t", "-c", "user.email=t@t",
+             "commit", "-qm", "the product begins")
+        return checkout
+
     def test_a_product_checkout_gets_exactly_the_release_cut_stub(self):
         checkout = self.product()
         code, out = run_cli(["init", str(checkout), "--ref", "v0.1.0"])
@@ -1157,6 +1175,97 @@ class TheProductSideIsTheOtherHalf(InstallCase):
             text,
         )
         self.assertIn('vellum-ref: "v0.1.0"', text)
+
+    def test_a_product_checkout_on_another_branch_stamps_that_branch(self):
+        """The stub watches the branch this repository actually uses.
+
+        `release-cut` runs `on: push: branches: [<branch>]`, and a product repo
+        on `trunk` stamped with no `--branch` got one watching `main`: a
+        workflow that never runs, in a file `doctor` calls installed because the
+        branch list is exempt from its comparison. Silent by construction, which
+        is why the default is read from the checkout rather than assumed.
+        """
+        checkout = self.on_branch("trunk")
+        code, out = run_cli(["init", str(checkout), "--ref", "v0.1.0"])
+        self.assertEqual(code, 0, out)
+        text = self.stub(checkout, "release-cut").read_text(encoding="utf-8")
+        self.assertIn('branches: ["trunk"]', text)
+        # And the report says where the answer came from, because an operator
+        # whose stub watches the wrong branch has to be able to tell "I passed
+        # nothing" from "this checkout was on trunk".
+        self.assertIn("the branch this checkout is on", out)
+
+    def test_a_branch_given_wins_over_the_checkouts_own(self):
+        checkout = self.on_branch("trunk")
+        code, out = run_cli(
+            ["init", str(checkout), "--ref", "v0.1.0", "--branch", "release"]
+        )
+        self.assertEqual(code, 0, out)
+        self.assertIn(
+            'branches: ["release"]',
+            self.stub(checkout, "release-cut").read_text(encoding="utf-8"),
+        )
+        self.assertIn("given as --branch", out)
+
+    def test_a_product_checkout_git_cannot_answer_about_falls_back_to_main(self):
+        # Not a git repository at all: `init` stamps a checkout, and a checkout
+        # with no branch is still one to stamp.
+        checkout = self.product()
+        code, out = run_cli(["init", str(checkout), "--ref", "v0.1.0"])
+        self.assertEqual(code, 0, out)
+        self.assertIn(
+            f'branches: ["{DEFAULT_BRANCH}"]',
+            self.stub(checkout, "release-cut").read_text(encoding="utf-8"),
+        )
+        self.assertIn("no --branch was given", out)
+
+    def test_an_intent_checkout_keeps_the_default(self):
+        # The other side of the asymmetry: provisioning creates the intent repo
+        # with the branch the conversation named and passes it here explicitly,
+        # so a run with nothing given is one where nothing else knows either.
+        checkout = self.intent()
+        _git(checkout, "init", "-q", "-b", "trunk", ".")
+        _git(checkout, "add", "-A")
+        _git(checkout, "-c", "user.name=t", "-c", "user.email=t@t",
+             "commit", "-qm", "the intent repo begins")
+        code, out = run_cli(["init", str(checkout)])
+        self.assertEqual(code, 0, out)
+        self.assertIn(
+            f'branches: ["{DEFAULT_BRANCH}"]',
+            self.stub(checkout, "on-spec-merge").read_text(encoding="utf-8"),
+        )
+
+    def test_a_product_checkout_with_no_release_block_is_warned(self):
+        # A warning, not a finding: the stub is correctly stamped, and what is
+        # missing is the declaration its workflow reads. Nothing else mentions
+        # it until the next push fails — `vellum release tag` exits 2 for a repo
+        # that has not declared where its version lives, and `release-cut` fails
+        # with it.
+        checkout = self.product()
+        code, out = run_cli(["init", str(checkout), "--ref", "v0.1.0"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("WARNING", out)
+        self.assertIn(f"`{RELEASE_BLOCK}:` block", out)
+        self.assertIn("version_source:", out)
+
+    def test_a_product_checkout_that_has_declared_is_not_warned(self):
+        checkout = self.product()
+        path = checkout / ".vellum" / "product.yaml"
+        path.write_text(
+            path.read_text(encoding="utf-8")
+            + f"\n{RELEASE_BLOCK}:\n  version_source: VERSION\n",
+            encoding="utf-8",
+        )
+        code, out = run_cli(["init", str(checkout), "--ref", "v0.1.0"])
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("WARNING", out)
+
+    def test_the_block_this_warns_about_is_the_one_the_reader_reads(self):
+        # Named in two modules and equal by test rather than by import: `init`
+        # says the block is missing and `vellum release tag` is what reads it.
+        from vellum import tag
+
+        self.assertEqual(RELEASE_BLOCK, tag.RELEASE_KEY)
 
     def test_the_intent_repos_stubs_are_not_stamped_there(self):
         # The failure this is really about: three workflows in a product repo

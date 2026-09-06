@@ -123,6 +123,23 @@ def tags(repo: Path, pattern: str) -> list[str]:
     ]
 
 
+def branch(repo: Path) -> str | None:
+    """The branch *repo* has checked out, or None when git cannot say.
+
+    None covers every way there is no answer, because they are one answer to the
+    caller: not a git repository, a detached HEAD (``rev-parse --abbrev-ref``
+    says ``HEAD``, which is not a branch name), a repository with no commit yet,
+    or no git on PATH at all. A caller that wants a branch either way supplies
+    its own fallback — this returns what the checkout says and nothing it made
+    up.
+    """
+    try:
+        name = _git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip()
+    except (GitUnavailable, OSError):
+        return None
+    return name if name and name != "HEAD" else None
+
+
 def ref_format_ok(repo: Path, name: str) -> bool:
     """Whether git itself would accept *name* as a ref name.
 

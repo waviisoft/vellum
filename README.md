@@ -372,7 +372,14 @@ else — see `vellum upgrade` below.
 `release-cut` watches on the product side, and it is installation *data*, not
 this product's shape: an installation whose default branch is not `main` is
 not a drifted one, and `doctor` exempts the branch list from its `on:`
-comparison for exactly that reason.
+comparison for exactly that reason. **Given nothing, a product checkout is
+stamped for the branch it is on** (`git rev-parse --abbrev-ref HEAD`, falling
+back to `main` when git cannot say) — a product repo on `trunk` would
+otherwise get a `release-cut` watching a branch it never pushes, which never
+runs and which doctor calls installed, since the branch list is the one thing
+it does not compare. An intent checkout keeps `main`: provisioning creates
+that repo with the branch the conversation named and passes it explicitly. The
+report says which of the three answers a run took.
 
 Idempotent: run again over an installed checkout it writes nothing and says so.
 A stub that exists and *differs* is reported and left alone — writing is this

@@ -783,11 +783,13 @@ def _add_install(sub) -> None:
     )
     init.add_argument(
         "--branch",
-        # No argparse default, so `resolve` can tell "the operator said `main`"
-        # from "the operator said nothing" and prompt for the one and not the
-        # other. Stub-stamping substitutes DEFAULT_BRANCH below, so part 1's
-        # behavior with no `--branch` is what it always was.
-        help=f"the default branch on-spec-merge watches (default: {DEFAULT_BRANCH}). "
+        # No argparse default, so both readers can tell "the operator said
+        # `main`" from "the operator said nothing": provisioning prompts for the
+        # one and not the other, and stub-stamping resolves the second by side
+        # (`install.resolve_branch`).
+        help=f"the branch the stubs watch — on-spec-merge on the intent side, "
+             f"release-cut on the product side. Defaults to this checkout's own "
+             f"branch in a product checkout, and to {DEFAULT_BRANCH} otherwise. "
              f"Installation data, not logic: an installation whose default branch "
              f"is not {DEFAULT_BRANCH} is not a drifted one, and `doctor` exempts "
              f"the branch list from its `on:` comparison for that reason",
@@ -1051,7 +1053,10 @@ def main(argv: list[str] | None = None) -> int:
                 forge=args.forge,
                 force=args.force,
                 releases_from=args.releases_from,
-                branch=args.branch or DEFAULT_BRANCH,
+                # None, not a substituted default: which branch "nobody said"
+                # means differs by side (`install.resolve_branch`), and only
+                # that function can see which side the checkout is.
+                branch=args.branch,
             )
         if args.command == "upgrade":
             return upgrade_run(

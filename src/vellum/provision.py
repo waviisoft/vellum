@@ -2100,7 +2100,14 @@ def _report(plan: Plan, answers: Answers, pin: str, stubs: list[str],
     # would report a missing stub for a file nobody was told to write.
     lines += [
         f"  the product repo's stub is a second stamp, in that checkout:",
-        f"    vellum init {product_dir} --ref {plan.ref}",
+        # `--branch`, and it is not decoration: the stub's `on: push:
+        # branches:` is stamped from it, and a `release-cut` watching a branch
+        # this pair does not use never runs — silently, because `doctor` exempts
+        # the branch list from its comparison and calls the stub installed. The
+        # command run in the product checkout would read that checkout's own
+        # branch (`install.resolve_branch`), and this line says it outright so
+        # that pasting it cannot depend on which branch happens to be out.
+        f"    vellum init {product_dir} --ref {plan.ref} --branch {answers.branch}",
         f"    writes {(install.WORKFLOWS_DIR['github'] / install.RELEASE_CUT.filename).as_posix()},"
         f" which tags a version bump (spec/features/release-tags.md),",
         f"    and adds it to that manifest's `{manifest.OWNED_KEY}:` — this seed"

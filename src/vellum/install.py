@@ -129,7 +129,7 @@ from vellum import __version__
 from vellum import manifest
 from vellum import paths
 from vellum import product
-from vellum.gitver import GitUnavailable, tags
+from vellum.gitver import GitUnavailable, branch as checkout_branch, tags
 from vellum.text import one_line
 from vellum.workspace import WORKSPACE_RELPATH, SLUG_RE, WorkspaceError
 from vellum.workspace import forge as workspace_forge
@@ -195,6 +195,13 @@ DEFAULT_BRANCH = "main"
 #: ignored rather than refused — the same posture ``gitver.TAG_RE`` takes to
 #: the decorative ``spec-v<N>`` names.
 RELEASE_RE = re.compile(r"^v(\d+(?:\.\d+)*)$")
+
+#: The block `vellum release tag` reads out of `.vellum/product.yaml`, named
+#: here for one warning line in the product side's report. This is NOT a second
+#: reader of that file — `vellum.tag` is the reader, `RELEASE_KEY` is its name
+#: for the same key, and a test holds the two equal — it is `init` being able to
+#: say that the stub it just stamped has nothing to read yet.
+RELEASE_BLOCK = "release"
 
 #: The secret every shipped workflow declares.
 SECRET = "VELLUM_TOKEN"
@@ -739,6 +746,20 @@ class ManifestStamp:
     added: tuple[str, ...] = ()
 
 
+#: Where the branch a stub watches came from, for the one line of the report
+#: that says so. An operator whose stub watches the wrong branch has to be able
+#: to tell "I did not pass `--branch`" from "this checkout is on `trunk`".
+BRANCH_GIVEN, BRANCH_CHECKOUT, BRANCH_DEFAULT = "given", "checkout", "default"
+
+#: How each of those reads in the report. `--branch` is what changes any of
+#: them, so the line says which one this run took rather than only the name.
+_BRANCH_SOURCES = {
+    BRANCH_GIVEN: "given as --branch",
+    BRANCH_CHECKOUT: "the branch this checkout is on",
+    BRANCH_DEFAULT: "the default, since no --branch was given",
+}
+
+
 @dataclass
 class Init:
     """One run of ``vellum init``."""
@@ -758,6 +779,12 @@ class Init:
     #: map, and its branch is watched by `release-cut` rather than
     #: `on-spec-merge`.
     side: str = INTENT
+    #: Where :attr:`branch` came from: :data:`BRANCH_GIVEN`,
+    #: :data:`BRANCH_CHECKOUT` or :data:`BRANCH_DEFAULT`.
+    branch_source: str = BRANCH_GIVEN
+    #: Whether the product checkout declares a `release:` block. None on the
+    #: intent side, which carries no such file and no `release-cut` stub.
+    declares_release: bool | None = None
 
     def report(self) -> str:
         watcher = "on-spec-merge" if self.side == INTENT else "release-cut"
@@ -765,7 +792,8 @@ class Init:
             f"vellum init — {self.forge} {self.side}-side caller stubs "
             f"in {self.checkout}",
             f"  intent repo:  {self.intent}",
-            f"  branch:       {self.branch} (what {watcher} watches)",
+            f"  branch:       {self.branch} (what {watcher} watches; "
+            f"{_BRANCH_SOURCES[self.branch_source]})",
             f"  workflows:    {self.host} at {self.ref}",
         ]
         if self.side == INTENT:
@@ -803,6 +831,32 @@ class Init:
                 "secret and the caller half — so a comment somebody added is a "
                 "difference here and no finding there."
             )
+        if self.declares_release is False:
+            # A warning, not a finding: this command's job is the stub, and the
+            # stub is correctly stamped. What is missing is the declaration the
+            # stub's workflow reads, and it is missing in the one place nothing
+            # else will mention it until a push fails — `vellum release tag`
+            # exits 2 for a repo that has not declared where its version lives,
+            # so `release-cut` fails on the next push to this branch rather than
+            # guessing a version out of a file that happens to be lying there.
+            lines += [
+                f"WARNING: {product.PRODUCT_RELPATH.as_posix()} declares no "
+                f"`{RELEASE_BLOCK}:` block, so the stub just stamped has nothing "
+                f"to read.",
+                f"  `release-cut` runs on the next push to {self.branch} and "
+                f"fails at exit 2: a repo that has not declared where its "
+                f"version lives is one `vellum release tag` cannot answer about, "
+                f"and it says so rather than inferring one. Add, in "
+                f"{product.PRODUCT_RELPATH.as_posix()}:",
+                "",
+                f"      {RELEASE_BLOCK}:",
+                f"        version_source: pyproject.toml   # or package.json, or "
+                f"any path",
+                f"        changelog: CHANGELOG.md          # optional; a version "
+                f"it does not describe is not tagged",
+                "",
+                "  (spec/features/release-tags.md).",
+            ]
         lines.append("")
         if self.manifest is not None:
             lines.append(
@@ -860,6 +914,41 @@ CANNOT_KNOW = [
 ]
 
 
+def resolve_branch(root: Path, given: str | None, *,
+                   side: str) -> tuple[str, str]:
+    """The branch the stubs watch, and where that answer came from.
+
+    ``--branch`` wins wherever it is given. With nothing given the two sides
+    differ, and the asymmetry is the difference between the two repositories:
+
+    * a **product** checkout is a repository Vellum did not create, stamped by a
+      run in it, and its own ``HEAD`` says what its default branch is called. A
+      product repo on ``trunk`` stamped with no ``--branch`` got a `release-cut`
+      that watches ``main`` — a workflow that never runs, in a file `doctor`
+      calls installed because the branch list is exempt from its comparison
+      (see ``_comparable_on``), which is a silent failure by construction.
+    * an **intent** checkout keeps :data:`DEFAULT_BRANCH`. Provisioning creates
+      that repository with the branch the conversation named and passes it here
+      explicitly, so a run with nothing given is one where nothing else knows
+      either — and `main` stays what it always was.
+
+    ``HEAD`` and not ``origin/HEAD``: the question is which branch this checkout
+    is on, which is answerable in a repository with no remote at all — a
+    ``--into`` staging directory, a fresh ``git init`` — where ``origin/HEAD``
+    says nothing. When git cannot answer (not a repository, a detached HEAD, no
+    commit yet, no git at all) this falls back to :data:`DEFAULT_BRANCH` rather
+    than refusing: `init` stamps a checkout, and a checkout with no branch is
+    still one to stamp.
+    """
+    if given is not None:
+        return given, BRANCH_GIVEN
+    if side == PRODUCT:
+        found = checkout_branch(root)
+        if found is not None:
+            return found, BRANCH_CHECKOUT
+    return DEFAULT_BRANCH, BRANCH_DEFAULT
+
+
 def init(
     checkout: str | Path,
     ref: str | None = None,
@@ -867,7 +956,7 @@ def init(
     forge: str | None = None,
     force: bool = False,
     releases_from: str | Path | None = None,
-    branch: str = DEFAULT_BRANCH,
+    branch: str | None = None,
 ) -> Init:
     """Stamp the caller stubs into either side of a pair. Idempotent.
 
@@ -877,6 +966,9 @@ def init(
     the same one this command always made — it used to be spelled "is this an
     intent checkout?" — and it is still exit 2; what changed is that the other
     half of the pair is now an answer rather than a case of it.
+
+    ``branch`` None means "nobody said", and what that resolves to differs by
+    side — see :func:`resolve_branch`.
     """
     root = Path(checkout)
     if not root.is_dir():
@@ -884,14 +976,23 @@ def init(
             f"{root}: not a directory; is this an intent or product checkout?"
         )
     side = side_of(root)
+    branch, branch_source = resolve_branch(root, branch, side=side)
     chosen = read_forge(root, forge, side=side)
     intent_slug = installation_name(root, side)
     declared: dict[str, str] = {}
+    declares_release: bool | None = None
     if side == INTENT:
         try:
             declared = workspace_products(root)
         except WorkspaceError as exc:
             raise InstallError(str(exc)) from exc
+    else:
+        # Read after `installation_name`, which has already turned an unreadable
+        # pin file into an InstallError, so this is a question about a file that
+        # parses.
+        declares_release = isinstance(
+            product.load(root).get(RELEASE_BLOCK), dict
+        )
     pinned = ref if ref is not None else default_ref()
 
     directory = root / WORKFLOWS_DIR[chosen]
@@ -957,6 +1058,8 @@ def init(
         stamps=stamps,
         manifest=stamp_manifest(root, ref=pinned, stamps=stamps),
         side=side,
+        branch_source=branch_source,
+        declares_release=declares_release,
     )
 
 
@@ -1079,7 +1182,7 @@ def run_init(
     forge: str | None = None,
     force: bool = False,
     releases_from: str | None = None,
-    branch: str = DEFAULT_BRANCH,
+    branch: str | None = None,
     out=None,
 ) -> int:
     """Report what was stamped. Exit 0: it wrote, or there was nothing to do."""

@@ -495,6 +495,27 @@ class AGreenfieldSeedIsGreen(ProvisionCase):
         self.assertIn("[missing] no stub", out)
         self.assertIn(f"ok       {manifest.MANIFEST_RELPATH.as_posix()}", out)
 
+    def test_the_second_stamps_command_carries_the_branch(self):
+        # The stub's `on: push: branches:` is stamped from `--branch`, and a
+        # `release-cut` watching a branch this pair does not use never runs —
+        # silently, because doctor exempts the branch list from its comparison
+        # and calls the stub installed. So the command an operator pastes says
+        # which branch, rather than depending on which one happens to be out in
+        # the checkout they paste it into.
+        self.assertIn(
+            f"vellum init {self.product} --ref {default_ref()} --branch main",
+            self.out,
+        )
+
+    def test_a_pair_provisioned_on_another_branch_says_that_branch(self):
+        into = self.root / "trunked"
+        code, out, err = run_cli_streams(
+            self.greenfield(into, "--branch", "trunk")
+        )
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(f"vellum init {into / 'acme'} --ref {default_ref()} "
+                      f"--branch trunk", out)
+
     def test_the_product_half_carries_no_workflows_until_it_is_stamped(self):
         # The other half of the exemption above, asserted rather than implied:
         # provisioning writes no `.github/workflows/` into the product repo at
