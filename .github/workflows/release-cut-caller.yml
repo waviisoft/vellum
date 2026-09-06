@@ -1,0 +1,52 @@
+# release-cut — THIS repo's own caller. Not a stub `vellum init` stamped, and
+# the one difference is the reason this file exists at all.
+#
+# `waviisoft/vellum` is a product repo like any other: it has a version, a
+# changelog and a `release:` block in `.vellum/product.yaml`, so its release tag
+# is the forge's to mint. What it cannot do is carry the ordinary stub, because
+# a stub names the reusable workflow at a PINNED VELLUM REF — and this repo
+# cannot pin the tag it is about to mint. The decision says so in as many words:
+# "The Vellum product repo dogfoods the workflow by calling it by path within
+# its own repository — it cannot pin the tag it is about to mint"
+# (spec/decisions/2026-09-06-release-tags-are-minted-by-the-forge.md).
+#
+# So `uses:` is a LOCAL PATH — `./.github/workflows/release-cut.yml` — which the
+# forge resolves inside this repository at the commit that triggered the run.
+# That also makes this file the one place the workflow is exercised on the
+# commit that changes it, rather than on the last release's copy of it.
+#
+# `adapters/github/release-cut.yml` is what an ORDINARY installation carries,
+# stamped by `vellum init` in its product checkout, and it is a rendering that
+# `tests/test_install.py` holds byte-identical to what the CLI writes. This file
+# is deliberately NOT that rendering and is not compared against it.
+#
+# A local `uses:` passes no `secrets:`: this repo IS waviisoft/vellum, so the
+# CLI checkout the called workflow makes reads its own repository with the
+# caller's own `github.token`, and there is no VELLUM_TOKEN to hand over.
+#
+# `vellum-ref` is `github.sha` for the same reason the path is local: the CLI
+# that runs must be the one this commit ships, not the one the last release
+# did — and not `main` either, which is a moving target that another push can
+# advance between this run starting and its CLI checkout. An input is one of the
+# two places `${{ }}` is safe (the other is `env:`); what the rule forbids is
+# `${{ }}` inside a `run:` body, where the value would be pasted into the script
+# before the shell parses it.
+
+name: release-cut-caller
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-cut
+  cancel-in-progress: false
+
+jobs:
+  release-cut:
+    uses: ./.github/workflows/release-cut.yml
+    with:
+      vellum-ref: ${{ github.sha }}
