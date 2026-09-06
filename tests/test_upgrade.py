@@ -849,6 +849,41 @@ class APathTheTreeRedirectsIsNeverWritten(UpgradeCase):
         self.assertEqual(self.branches(self.intent), ["main"])
 
 
+class ACommitThatFailsLeavesNothingStaged(UpgradeCase):
+    """The wind-back runs after `git add -A`; it must not trust the index."""
+
+    def test_a_failing_pre_commit_hook_leaves_main_clean(self):
+        hook = self.intent / ".git" / "hooks" / "pre-commit"
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        hook.chmod(0o755)
+
+        code, out = self.upgrade()
+        self.assertEqual(code, 2, out)
+        self.assertEqual(self.git(self.intent, "rev-parse", "--abbrev-ref", "HEAD"),
+                         "main")
+        self.assertEqual(self.branches(self.intent), ["main"])
+        self.assertEqual(self.git(self.intent, "status", "--porcelain"), "")
+        self.assertIn("back on 'main'", out)
+        text = (self.intent / ".vellum" / "install.yaml").read_text(encoding="utf-8")
+        self.assertIn(f'"{BASE}"', text)
+
+
+class TheBaseIsTheBranchTheStubsWatch(UpgradeCase):
+    """No `origin/HEAD` to read: the stubs say which branch is the default."""
+
+    def test_an_installation_on_trunk_with_no_remote_is_not_refused(self):
+        self.git(self.intent, "branch", "-m", "main", "trunk")
+        run_cli(["init", str(self.intent), "--ref", BASE, "--branch", "trunk",
+                 "--force"])
+        self.git(self.intent, "add", "-A")
+        self.git(self.intent, "commit", "-qm", "the stubs watch trunk")
+
+        code, out = self.upgrade("--plan")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("an upgrade runs on 'main'", out)
+
+
 class AHalfWrittenUpgradeIsWoundBack(UpgradeCase):
     """A failure part way through the writes leaves the checkout as it was.
 

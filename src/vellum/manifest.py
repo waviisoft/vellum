@@ -167,6 +167,22 @@ def check_owned_path(value: str) -> str:
             f"control character or a stray space is a value that reshapes one of "
             f"those rather than naming a file."
         )
+    # The entry is written back UNQUOTED as `  - <entry>`, so it also has to
+    # survive that round trip as itself: a `#` turns the rest into a comment,
+    # `[a]` comes back as a list, `a: b` as a mapping, `&x` and `*y` as an
+    # anchor and an alias. Refused, for the same reason a control character
+    # is: an ownership claim that reshapes the file it lives in names nothing.
+    try:
+        round_trip = yaml.safe_load(f"- {text}")
+    except yaml.YAMLError:
+        round_trip = None
+    if round_trip != [text]:
+        raise ManifestError(
+            f"`{OWNED_KEY}:` carries {one_line(text)!r}, which does not survive "
+            f"being written back into this file as a plain YAML list entry. A "
+            f"path is plain text: no `#`, no leading `[`, `{{`, `&`, `*`, `!`, "
+            f"`|`, `>`, `%`, `@` or quote, and no `: ` inside it."
+        )
     if "\\" in text:
         raise ManifestError(
             f"`{OWNED_KEY}:` carries {one_line(text)!r}, which uses a backslash. "

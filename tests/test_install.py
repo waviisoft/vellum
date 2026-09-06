@@ -1330,6 +1330,16 @@ class TheManifestFormat(unittest.TestCase):
                 self.parse(f"vellum: v0.2.0\nowned:\n  - {path}\n")
             self.assertIn(".git", str(raised.exception))
 
+    def test_a_path_a_yaml_reader_would_reshape_is_refused(self):
+        from vellum.manifest import ManifestError, check_owned_path
+        for bad in ("harness/run.py #x", "[a]", "a: b", "&x", "*y", "{a}",
+                    "!tag", "'quoted'", '"quoted"', "%x", "@x", "| x"):
+            with self.assertRaises(ManifestError, msg=bad):
+                check_owned_path(bad)
+        # And the ordinary shapes survive the round trip.
+        for good in (".vellum/config.yaml", "harness/run.py", "a-b_c.d/e f.txt"):
+            self.assertEqual(check_owned_path(good), good)
+
     def test_a_path_with_a_control_character_or_stray_space_is_refused(self):
         # Two failures in one rule. The entry is written back into this file
         # UNQUOTED, so a newline or a leading space makes a manifest that reads

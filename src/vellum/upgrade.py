@@ -640,7 +640,7 @@ def compare(
             )))
             continue
         try:
-            current = blob_at(root, base, path)
+            current = blob_at(root, f"refs/heads/{base}", path)
         except (UnicodeDecodeError, ValueError) as exc:
             found.append(Change(path, UNVERIFIABLE, (
                 f"could not be read out of {base} ({one_line(str(exc))}), so it "
@@ -837,7 +837,12 @@ def upgrade(
         f"templates before anything is written",
     )
     forge = install.read_forge(root) if side == owned.INTENT else "github"
-    base = _base(root)
+    base = _base(root, forge)
+    # The manifest is the one file `_apply` writes that is not on the owned
+    # list, so it gets the same walk the owned paths get.
+    held = unsafe_write(root, manifest.MANIFEST_RELPATH.as_posix())
+    if held is not None:
+        raise UpgradeError(f"{manifest.MANIFEST_RELPATH.as_posix()}: {held}")
 
     found = compare(
         root, installed.owned, source=source, was=installed.release, to=to,
@@ -855,7 +860,7 @@ def upgrade(
     return result
 
 
-def _base(root: Path) -> str:
+def _base(root: Path, forge: str) -> str:
     """The branch this upgrade is computed from and cut from, checked to be HEAD.
 
     One ref does both jobs and that is the point. The branch is created off the
@@ -866,8 +871,12 @@ def _base(root: Path) -> str:
     other, this refuses and names both branches: whichever way the divergence
     goes, the operator can see it in one line.
     """
+    # `origin/HEAD` says which branch when there is a remote to say it; an
+    # installation provisioned `--branch trunk` with no remote yet has only its
+    # stubs to say so, and `on-spec-merge` watches exactly that branch.
+    _, watched = install.installed_shape(root, forge)
     try:
-        base = default_branch(root, install.DEFAULT_BRANCH)
+        base = default_branch(root, watched)
     except ProvisionError as exc:
         raise UpgradeError(str(exc)) from exc
     head = git(root, "rev-parse", "--abbrev-ref", "HEAD", check=False)
@@ -969,7 +978,9 @@ def _apply(result: Upgrade, *, yes: bool) -> None:
             )
         _branch_is_free(root, branch)
         start = git(root, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
-        git(root, "checkout", "-q", "-b", branch, base)
+        # Qualified: a tag that happened to share the branch's name would win
+        # git's disambiguation for a bare name.
+        git(root, "checkout", "-q", "-b", branch, f"refs/heads/{base}")
     except ProvisionError as exc:
         raise UpgradeError(str(exc)) from exc
 
@@ -1001,8 +1012,17 @@ def _apply(result: Upgrade, *, yes: bool) -> None:
             raise UpgradeError(str(exc)) from exc
 
     body = git_dir(root) / PR_BODY_UNDER_GIT
-    body.parent.mkdir(parents=True, exist_ok=True)
-    body.write_text(_body(result), encoding="utf-8")
+    try:
+        body.parent.mkdir(parents=True, exist_ok=True)
+        body.write_text(_body(result), encoding="utf-8")
+    except OSError as exc:
+        # After the commit, so nothing is wound back: the branch is real and
+        # the operator can land it by hand. Said plainly, not as a traceback.
+        raise UpgradeError(
+            f"{body}: cannot write the pull request body ({exc}). The upgrade "
+            f"commit {(result.commit or '')[:12]} exists on {branch}; push it and "
+            f"open the pull request by hand."
+        ) from exc
     result.pr_body_path = body
     _land(result, yes=yes)
 
@@ -1066,6 +1086,15 @@ def _wound_back(root: Path, *, start: str, branch: str):
 def _wind_back(root: Path, *, start: str, branch: str, written: list[str]) -> list[str]:
     """Undo a half-written upgrade. Returns what it could not undo, in words."""
     trouble: list[str] = []
+    # FIRST, before anything reads the index: a failure at `git commit` comes
+    # after `git add -A`, so every written path is staged by then and
+    # `ls-files` would call all of them tracked — leaving the whole upgrade
+    # staged on the branch this returns to. `reset --hard` is safe here
+    # because `_clean` proved the tree clean before the branch was cut: the
+    # only thing it can discard is this run's own writes.
+    done = git(root, "reset", "-q", "--hard", check=False)
+    if done.returncode != 0:
+        trouble.append(f"`git reset --hard` failed ({one_line(done.stderr or done.stdout)})")
     for relative in written:
         tracked = git(root, "ls-files", "--error-unmatch", "--", relative, check=False)
         if tracked.returncode == 0:
