@@ -48,3 +48,20 @@ write_boundaries:
 
 # The spec-first guard and the certification runner arrive in v0.2
 # (docs/design.md section 10); nothing in this repo enforces them yet.
+
+# Where this repo's version lives, and the changelog that must describe it
+# (spec/features/release-tags.md). The declaration is data: `vellum release tag`
+# reads THIS block and infers nothing from tags, commits or file contents it
+# does not name.
+#
+# `pyproject.toml` is the version source rather than `src/vellum/__init__.py`
+# because it is the one of the two the command can read without a Python
+# parser, and `tests/test_upgrade.py::TheReleaseThisCutIs` already holds the
+# two to each other. `CHANGES.yaml` is the changelog because that is where a
+# release's shape entry goes, and the entry is written before the tag rather
+# than remembered after it — which is the pre-tag alarm that test carries, made
+# live: from v0.4.0 the forge refuses to tag a version CHANGES.yaml does not
+# describe.
+release:
+  version_source: pyproject.toml
+  changelog: src/vellum/seeds/CHANGES.yaml

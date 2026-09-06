@@ -120,6 +120,8 @@ from vellum.provision import run_provision as provision_run
 from vellum.reconcile import DEFAULT_CORPUS_MATCH, DEFAULT_LEASE_MINUTES, TickError
 from vellum.release import SUITE_RESULTS, ReleaseError, ReleaseRefused
 from vellum.release import run_cut, run_partition
+from vellum.tag import TagError, TagRefused
+from vellum.tag import run_tag
 from vellum.reconcile import run as tick_run
 from vellum.specfile import SpecTreeError
 from vellum.suite import run as suite_run
@@ -564,6 +566,45 @@ def _add_release(sub) -> None:
         "--at",
         help="the moment of the cut, ISO 8601 (default: now, UTC). The cut's id is "
              "<channel>@<at>, so passing one makes a cut replayable",
+    )
+
+    # `tag` sits beside `cut` because both are about a release, and the pair is
+    # the spec's own division: the cut records commits in `ledger/releases.yaml`
+    # on the intent side, and the tag is "the friendly stamp a cut may carry"
+    # on the product side. Neither reads the other, and a `vellum release tag`
+    # that had grown out of `cut` would have inherited a ledger it never opens.
+    tag = release_sub.add_parser(
+        "tag",
+        help="name the release tag a product checkout's declared version mints",
+        description=(
+            "Reads the `release:` block in <product-checkout>/.vellum/product.yaml "
+            "— `version_source:` naming pyproject.toml (its [project] version), "
+            "package.json (its version), or any other path read as its trimmed "
+            "contents, and an optional `changelog:` — and reports the tag "
+            "`v<version>` and the commit it would name. COMPUTES AND NEVER "
+            "APPLIES: no tag is created, nothing is pushed, and nothing in the "
+            "checkout is written. The `release-cut` workflow applies the name "
+            "with the forge's own credential. Exit 0 whether the name is unused "
+            "(the report names it and the commit) or already used (reported and "
+            "left alone, so a re-run is a no-op); 1 when a declared changelog "
+            "carries no entry for the version, naming the file and the entry; 2 "
+            "when there is no answer — no `release:` block, an unreadable source, "
+            "a checkout that is not a product checkout."
+        ),
+    )
+    tag.add_argument("checkout", help="the product repo checkout")
+    tag.add_argument(
+        "--plan",
+        action="store_true",
+        dest="plan_only",
+        help="the same answer, stated as one. The command never applies the tag, "
+             "so this changes nothing about what it does; it is here because the "
+             "workflow that calls it says what it is asking for",
+    )
+    tag.add_argument(
+        "--json",
+        action="store_true",
+        help="the same answer as a JSON object, for a caller that parses it",
     )
 
 
@@ -1043,8 +1084,8 @@ def main(argv: list[str] | None = None) -> int:
     # could not answer rather than a finding about anybody's spec — and reaching
     # a caller as a traceback would make it look like a crash in the seed.
     except (BoundaryError, ChainError, BudgetError, DependencyError, ExitDutyError,
-            InstallError, ManifestError, ProvisionError, SeedsMissing, TickError,
-            ReleaseError, UpgradeError) as exc:
+            InstallError, ManifestError, ProvisionError, SeedsMissing, TagError,
+            TickError, ReleaseError, UpgradeError) as exc:
         print(f"vellum: {exc}", file=sys.stderr)
         return 2
     # A cut that cannot be made, a pointer that would move backwards, a shallow
@@ -1052,7 +1093,13 @@ def main(argv: list[str] | None = None) -> int:
     # answer is that this cannot proceed. `ReleaseRefused` is a sibling of
     # `ReleaseError` rather than a subclass precisely so this clause's position
     # relative to the one above decides nothing.
-    except ReleaseRefused as exc:
+    # A changelog with no entry for the declared version joins them: `vellum
+    # release tag` answered, and the answer is that a release nobody described
+    # is not one to name. `TagError` above is its "I could not answer" half —
+    # no `release:` block, an unreadable source — and the two must not share a
+    # code, or the `release-cut` workflow would fail a run that could not read
+    # the repository as though the version were undescribed.
+    except (ReleaseRefused, TagRefused) as exc:
         print(f"vellum: {exc}", file=sys.stderr)
         return 1
     return 2
@@ -1198,6 +1245,8 @@ def _suite(args: argparse.Namespace) -> int:
 
 
 def _release(args: argparse.Namespace) -> int:
+    if args.release_command == "tag":
+        return run_tag(args.checkout, as_json=args.json)
     return run_cut(
         args.checkout,
         args.channel,
