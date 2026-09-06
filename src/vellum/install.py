@@ -733,6 +733,10 @@ class ManifestStamp:
     #: Present on :data:`MANIFEST_WROTE` and :data:`MANIFEST_HELD`: the sentence
     #: the report prints under the outcome.
     note: str = ""
+    #: Paths this run added to `owned:` — the stubs it WROTE that the manifest
+    #: did not already name. Recorded even when the release line is held, so the
+    #: report can say which files became Vellum's on this run.
+    added: tuple[str, ...] = ()
 
 
 @dataclass
@@ -806,6 +810,17 @@ class Init:
                 f"{self.manifest.outcome}"
                 + (f", vellum: {self.manifest.release}" if self.manifest.release else "")
             )
+            if self.manifest.added:
+                # Said out loud, because it is the one thing a stamp changes
+                # about the manifest that is not the release line: these files
+                # are Vellum's from now on and `vellum upgrade` will rewrite
+                # them. An operator who disagrees takes the line back out.
+                lines.append(
+                    f"  added to {manifest.OWNED_KEY}: "
+                    + ", ".join(self.manifest.added)
+                    + " — written by this stamp, so `vellum upgrade` restamps "
+                      "them from here on."
+                )
             if self.manifest.note:
                 lines.append(f"  {self.manifest.note}")
             lines.append("")
@@ -945,62 +960,106 @@ def init(
     )
 
 
+def _held_by_a_left_stub(ref: str) -> str:
+    """The note for a run that left a stub alone. One sentence, said twice."""
+    return (
+        f"a stub exists and differs and was not restamped, so this installation "
+        f"has not been brought to {ref}. Recording the release anyway would "
+        f"leave the next upgrade comparing that stub against the wrong "
+        f"release's template. `vellum init --force` restamps, and then this is "
+        f"refreshed."
+    )
+
+
 def stamp_manifest(root: Path, *, ref: str, stamps: list[Stamp]) -> ManifestStamp:
     """Write or refresh ``.vellum/install.yaml`` after a stamp.
 
-    The rule is one sentence: **the release line is a claim that the
-    installation was brought to that ref**, so a run that left a stub alone
-    records nothing. Everything else here follows from it — a stamp over an
-    installation with no manifest writes one whose owned set is the stubs and
-    nothing else, because those are the only files this command wrote and the
-    only ones it can honestly say Vellum owns.
+    Two claims live in this file and they move on different rules.
 
-    The same sentence is why an owned set wider than the stubs **holds** the
-    release line rather than refreshing it. A stamp writes the stubs and nothing
-    else: it does not read `.vellum/config.yaml` or the harness machinery, let
-    alone bring them to *ref*. Refreshing the line anyway would move the release
-    every owned file is compared against while leaving those files at the
-    release before it — so the next `vellum upgrade --to <ref>` would find every
-    one of them differing from *ref*'s template and refuse the whole set as
-    edits this installation had made. `vellum upgrade` is the command that moves
-    them, and it restamps the stubs itself on the way.
+    **The release line** is a claim that the installation was brought to *ref*,
+    so a run that left a stub alone records nothing, and an owned set wider than
+    the stubs **holds** the line rather than refreshing it. A stamp writes the
+    stubs and nothing else: it does not read `.vellum/config.yaml` or the
+    harness machinery, let alone bring them to *ref*. Refreshing the line anyway
+    would move the release every owned file is compared against while leaving
+    those files at the release before it — so the next `vellum upgrade --to
+    <ref>` would find every one of them differing from *ref*'s template and
+    refuse the whole set as edits this installation had made. `vellum upgrade`
+    is the command that moves them, and it restamps the stubs on the way.
+
+    **The owned set** gains the files this run WROTE, and it gains them even
+    when the release line is held. Those files are Vellum's by construction —
+    they are the stubs this command just wrote, which is the same rule ("the
+    files a stamp writes") that decides the set for an installation with no
+    manifest at all. Held back, they were a file Vellum had written into a
+    checkout and would then never rewrite: a pair provisioned before the product
+    side had a stub kept a manifest that did not name it, so `vellum upgrade`
+    passed over the one file `vellum init` had put there, forever. The two
+    claims are independent, and this is where that shows: an installation whose
+    line is held still has the new stub recorded, and the report says which.
+
+    What is NOT added is a stub that was already installed or was left alone. A
+    path missing from `owned:` where the file exists is an operator's edit —
+    "leave it as it is and it stays yours" — and re-adding it on the next run
+    would undo the one edit the refusal exists to invite.
     """
     path = manifest.path_for(root)
-    if any(stamp.outcome == LEFT for stamp in stamps):
-        return ManifestStamp(path, MANIFEST_HELD, note=(
-            "a stub exists and differs and was not restamped, so this "
-            "installation has not been brought to " + ref + ". Recording the "
-            "release anyway would leave the next upgrade comparing that stub "
-            "against the wrong release's template. `vellum init --force` "
-            "restamps, and then this is refreshed."
-        ))
     # A malformed manifest is "I could not answer", not something to overwrite:
     # the file records which files are the INSTALLATION'S, and replacing an
     # unreadable one with a default would silently take back ownership of every
     # file the operator had removed from it.
     existing = manifest.read(root)
-    owned = (
-        existing.owned if existing is not None
-        else tuple(sorted(
-            stamp.path.relative_to(root).as_posix() for stamp in stamps
+    stubs = {stamp.path.relative_to(root).as_posix() for stamp in stamps}
+    written = {
+        stamp.path.relative_to(root).as_posix()
+        for stamp in stamps if stamp.outcome == WROTE
+    }
+    left = any(stamp.outcome == LEFT for stamp in stamps)
+
+    if existing is None:
+        if left:
+            return ManifestStamp(path, MANIFEST_HELD, note=_held_by_a_left_stub(ref))
+        owned = tuple(sorted(stubs))
+        manifest.write(root, ref, owned)
+        return ManifestStamp(path, MANIFEST_WROTE, release=ref, note=(
+            f"this installation had no manifest, so one was written with the "
+            f"{len(owned)} caller stub(s) as the owned set and nothing else. A "
+            f"stamp runs in a checkout whose repos already existed and cannot "
+            f"know whether the rest of the tree came from a Vellum seed or from "
+            f"your own hand — add the seeded files you want upgrades to rewrite "
+            f"(`{manifest.OWNED_KEY}:`), or leave it as it is and they stay "
+            f"yours."
         ))
-    )
+
+    added = tuple(sorted(written - set(existing.owned)))
+    owned = tuple(sorted(set(existing.owned) | written))
+
+    if left:
+        if added:
+            manifest.write(root, existing.release, owned)
+        return ManifestStamp(
+            path, MANIFEST_HELD, release=existing.release if added else None,
+            added=added, note=_held_by_a_left_stub(ref),
+        )
     # Compared as DATA, not as text. A manifest an operator has reflowed or
     # commented carries the same two claims, and rewriting it to canonicalise
     # them would make this command edit a file it had nothing to say about —
     # which is the same rule that leaves a hand-edited stub alone.
-    if existing is not None and existing.release == ref and existing.owned == owned:
+    if existing.release == ref and existing.owned == owned:
         return ManifestStamp(path, MANIFEST_CURRENT, release=ref)
     # The release line is a claim about the FILES, and a stamp only ever wrote
     # the stubs. So it may refresh the line only for an installation whose owned
     # set is stubs and nothing else; anything wider is `vellum upgrade`'s to
     # move, and moving it here would arm a refusal for every other owned file.
     # "The files a stamp writes" is not a table to consult: it is the stamps
-    # this run just made.
-    stubs = {stamp.path.relative_to(root).as_posix() for stamp in stamps}
-    if existing is not None and existing.release != ref and not set(owned) <= stubs:
+    # this run just made. The owned set still gains what this run wrote — that
+    # claim is about the files and not about the release.
+    if existing.release != ref and not set(owned) <= stubs:
         outside = sorted(set(owned) - stubs)
-        return ManifestStamp(path, MANIFEST_HELD, release=existing.release, note=(
+        if added:
+            manifest.write(root, existing.release, owned)
+        return ManifestStamp(path, MANIFEST_HELD, release=existing.release,
+                             added=added, note=(
             f"this installation owns {len(outside)} file(s) a stamp does not "
             f"write ({one_line(', '.join(outside))}), so the release line stays "
             f"at {existing.release}. A stamp brings the STUBS to {ref} and "
@@ -1010,16 +1069,7 @@ def stamp_manifest(root: Path, *, ref: str, stamps: list[Stamp]) -> ManifestStam
             f"files and the line together, and restamps the stubs on the way."
         ))
     manifest.write(root, ref, owned)
-    if existing is not None:
-        return ManifestStamp(path, MANIFEST_REFRESHED, release=ref)
-    return ManifestStamp(path, MANIFEST_WROTE, release=ref, note=(
-        f"this installation had no manifest, so one was written with the "
-        f"{len(owned)} caller stub(s) as the owned set and nothing else. A stamp "
-        f"runs in a checkout whose repos already existed and cannot know whether "
-        f"the rest of the tree came from a Vellum seed or from your own hand — "
-        f"add the seeded files you want upgrades to rewrite "
-        f"(`{manifest.OWNED_KEY}:`), or leave it as it is and they stay yours."
-    ))
+    return ManifestStamp(path, MANIFEST_REFRESHED, release=ref, added=added)
 
 
 def run_init(

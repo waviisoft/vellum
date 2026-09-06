@@ -212,9 +212,12 @@ releases:
           it and pushes it with the caller's own job token. Stamped by `vellum
           init <product-checkout>` — a second stamp, in that checkout, which
           provisioning does not make — verified by `vellum doctor` there, and
-          re-stamped by `vellum upgrade`. A pair provisioned before this release
-          has it owned and absent until that stamp is made, and doctor in the
-          product checkout is what says so.
+          re-stamped by `vellum upgrade`. The stamp is also what adds it to the
+          manifest's `owned:`: a seeded manifest lists the files the seed wrote,
+          so a provisioned product repo does not own a stub nobody has stamped.
+          Until that stamp is made, doctor in the product checkout reports the
+          missing stub and the provisioning report names the command that writes
+          it.
     files_retired: []
     stub_inputs:
       - >-

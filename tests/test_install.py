@@ -1423,6 +1423,47 @@ class TheStampWritesTheManifest(InstallCase):
         self.assertIn("has not been brought to v9.9.9", out)
         self.assertEqual(manifest.load(checkout).release, "v0.0.1")
 
+    def test_a_stamp_adds_the_stubs_it_wrote_to_the_owned_set(self):
+        # The two claims in this file move on different rules. The release line
+        # is held here — this installation owns a file a stamp does not write —
+        # and the file this run WROTE is still recorded, because it is Vellum's
+        # by construction: it is the stub this command just put there. Held
+        # back, it was a file `vellum init` had written and `vellum upgrade`
+        # would then never re-stamp.
+        checkout = self.intent()
+        run_cli(["init", str(checkout)])
+        stub = self.stub(checkout, "harness-ci")
+        relative = stub.relative_to(checkout).as_posix()
+        stub.unlink()
+        manifest.write(checkout, default_ref(), [
+            path for path in manifest.load(checkout).owned if path != relative
+        ] + [".vellum/config.yaml"])
+        self.assertNotIn(relative, manifest.load(checkout).owned)
+
+        code, out = run_cli(["init", str(checkout), "--ref", "v9.9.9"])
+        self.assertEqual(code, 0, out)
+        found = manifest.load(checkout)
+        self.assertIn(relative, found.owned)
+        # And only the owned set moved: the release line is still held.
+        self.assertEqual(found.release, default_ref())
+        self.assertIn(f"added to {manifest.OWNED_KEY}", out)
+        self.assertIn(relative, out)
+
+    def test_a_stub_that_was_already_installed_is_not_added_back(self):
+        # A path missing from `owned:` where the file exists is the operator's
+        # edit — "leave it as it is and they stay yours" — and re-adding it
+        # would undo the one edit the refusal exists to invite. Only the files
+        # THIS RUN wrote are added.
+        checkout = self.intent()
+        run_cli(["init", str(checkout)])
+        relative = self.stub(checkout, "harness-ci").relative_to(checkout).as_posix()
+        manifest.write(checkout, default_ref(), [
+            path for path in manifest.load(checkout).owned if path != relative
+        ])
+        code, out = run_cli(["init", str(checkout)])
+        self.assertEqual(code, 0, out)
+        self.assertNotIn(relative, manifest.load(checkout).owned)
+
     def test_a_malformed_manifest_is_two_and_is_not_overwritten(self):
         # Replacing an unreadable manifest with a default would silently take
         # back ownership of every file the operator had removed from it.

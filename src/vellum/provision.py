@@ -880,8 +880,24 @@ def product_seed(
     The product side gets a manifest too, and that is the decision's "on each
     side of the pair": a product repo carries a Vellum-seeded file — its memory
     map — and a side with no manifest is a side no upgrade can reason about.
+
+    **The manifest names what this seed wrote, and nothing else.** The product
+    side's ownership table has two rows and provisioning writes one of them: the
+    `release-cut` stub is stamped by `vellum init` run in the product checkout —
+    "stamped by `vellum init` on the product side"
+    (``spec/features/release-tags.md``) — which provisioning does not do. Listing
+    it here made a manifest that owned a file nobody had written, so a freshly
+    provisioned pair doctored with a finding on its first day and every report
+    had to explain it. It joins ``owned:`` when the stamp writes it, which is
+    the rule ``install.stamp_manifest`` states as "the files a stamp writes".
+
+    Filtered from :func:`vellum.owned.for_side` rather than derived from the
+    dict: ownership stays a table with a reason per row — a seed that owned
+    "whatever was written" would own ``.vellum/product.yaml``, which IS the pin
+    — and what this narrows is only *which* of that table's rows this run can
+    honestly claim.
     """
-    return dict(sorted({
+    files = {
         ".vellum/memory/map.md": seeds.template(owned.MEMORY_MAP_TEMPLATE).format(
             intent_slug=answers.intent_slug
         ),
@@ -890,10 +906,12 @@ def product_seed(
             commit=commit,
             product=answers.product,
         ),
-        manifest.MANIFEST_RELPATH.as_posix(): manifest.dump(
-            ref or install.default_ref(), owned.for_side(owned.PRODUCT)
-        ),
-    }.items()))
+    }
+    files[manifest.MANIFEST_RELPATH.as_posix()] = manifest.dump(
+        ref or install.default_ref(),
+        tuple(path for path in owned.for_side(owned.PRODUCT) if path in files),
+    )
+    return dict(sorted(files.items()))
 
 
 #: Where the local half is built when ``--into`` names nowhere. A placeholder in
@@ -2084,7 +2102,9 @@ def _report(plan: Plan, answers: Answers, pin: str, stubs: list[str],
         f"  the product repo's stub is a second stamp, in that checkout:",
         f"    vellum init {product_dir} --ref {plan.ref}",
         f"    writes {(install.WORKFLOWS_DIR['github'] / install.RELEASE_CUT.filename).as_posix()},"
-        f" which tags a version bump (spec/features/release-tags.md).",
+        f" which tags a version bump (spec/features/release-tags.md),",
+        f"    and adds it to that manifest's `{manifest.OWNED_KEY}:` — this seed"
+        f" owns only what it wrote.",
         f"    It needs a `release:` block in .vellum/product.yaml naming where"
         f" the version lives.",
         "",

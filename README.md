@@ -362,6 +362,12 @@ stamp.** `vellum init --shape …` leaves the product repo with no
 the stub as missing until it is stamped. That split is the spec's: the stub is
 "stamped by `vellum init` on the product side", a run in that checkout.
 
+A seeded manifest names the files that seed **wrote**, so the product side's
+`owned:` starts as its memory map alone; the stub joins it when the stamp
+writes it, and the stamp's report says so. That is the general rule and not a
+special case for this one file: a stamp owns the files it writes, and nothing
+else — see `vellum upgrade` below.
+
 `--branch` is the branch `on-spec-merge` watches on the intent side and
 `release-cut` watches on the product side, and it is installation *data*, not
 this product's shape: an installation whose default branch is not `main` is

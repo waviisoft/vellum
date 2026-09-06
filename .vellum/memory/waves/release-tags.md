@@ -86,16 +86,20 @@ its CLI checkout.
 
 ## Judgment calls
 
-1. **The product-side stub is owned before it exists.** Provisioning stamps the
-   intent half only — the spec has the stub "stamped by `vellum init` on the
-   product side", a run in that checkout — so a freshly provisioned pair has
-   `.github/workflows/release-cut.yml` in the product manifest's `owned:` and
-   not on disk. It is owned so that `vellum upgrade` can re-stamp it; it is
-   absent because nobody has stamped it. `vellum doctor` in that checkout
-   reports it as a `missing` finding, and the provisioning report names the
-   command that writes it. That is the one row in the ownership table where
-   owned and present come apart, and `tests/test_init_provision.py` names it
-   rather than leaving it to be discovered.
+1. **A seed owns what it wrote; a stamp adds what it wrote.** Provisioning
+   stamps the intent half only — the spec has the stub "stamped by `vellum
+   init` on the product side", a run in that checkout — so the seeded product
+   manifest owns `.vellum/memory/map.md` alone, and
+   `.github/workflows/release-cut.yml` joins `owned:` when the second stamp
+   writes it. This started as the opposite (owned at provisioning, absent on
+   disk, so that `upgrade` could re-stamp it later) and the review took it out:
+   a manifest that owns a file nobody has written makes a freshly provisioned
+   pair doctor with a finding on its first day, and it hid the real gap —
+   `stamp_manifest` never added the stubs it wrote, so a manifest predating the
+   product stub would never have gained it at all. Both halves are one rule now:
+   the files a stamp writes are the files it owns, added even when the release
+   line is held, because "brought to this ref" and "these files are Vellum's"
+   are different claims.
 2. **`--plan` changes nothing about what the command does.** It never applies a
    tag either way, so the flag is the caller stating what it is asking for. The
    spec asks for it in as many words ("`--plan` is the same answer, stated as

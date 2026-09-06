@@ -420,7 +420,15 @@ class AGreenfieldSeedIsGreen(ProvisionCase):
                                (self.product, owned.PRODUCT)):
             found = manifest.load(checkout)
             self.assertEqual(found.release, default_ref(), side)
-            self.assertEqual(list(found.owned), list(owned.for_side(side)), side)
+            # The rows of that side's table this run actually wrote. The intent
+            # half is stamped here, so that is all of them; the product half's
+            # `release-cut` stub is a second stamp in that checkout and joins
+            # `owned:` when it is made (`vellum.provision.product_seed`).
+            self.assertEqual(
+                list(found.owned),
+                [path for path in owned.for_side(side) if (checkout / path).is_file()],
+                side,
+            )
 
     def test_the_seeded_manifest_owns_the_stubs_the_config_and_the_machinery(self):
         listed = manifest.load(self.intent).owned
@@ -451,26 +459,41 @@ class AGreenfieldSeedIsGreen(ProvisionCase):
             self.assertNotIn(relative, listed, relative)
         self.assertNotIn(".vellum/product.yaml", manifest.load(self.product).owned)
 
-    #: The one owned path a seed does not write, and the reason it is exempt.
-    #: `release-cut` is stamped by `vellum init` run in the PRODUCT checkout —
-    #: "stamped by `vellum init` on the product side"
-    #: (spec/features/release-tags.md) — and provisioning stamps the intent
-    #: half only. So the seeded product manifest names a file that arrives with
-    #: that stamp: it is owned from the start, because owning it is what lets
-    #: `vellum upgrade` re-stamp it later, and it is absent until somebody
-    #: stamps it. `vellum doctor` in the product checkout is what says so.
+    #: The product side's other owned row, and the one provisioning does not
+    #: write: `release-cut` is stamped by `vellum init` run in the PRODUCT
+    #: checkout — "stamped by `vellum init` on the product side"
+    #: (spec/features/release-tags.md) — and provisioning stamps the intent half
+    #: only. It is not in the seeded manifest, because a manifest that owned a
+    #: file nobody had written made a freshly provisioned pair doctor with a
+    #: finding on its first day; it joins `owned:` when the stamp writes it.
     STAMPED_SEPARATELY = (WORKFLOWS / "release-cut.yml").as_posix()
 
     def test_every_owned_path_is_a_file_the_seed_actually_wrote(self):
         # The manifest is written from `vellum.owned`'s table and the seed from
-        # `intent_seed`; a row that named a file the seed does not write would
-        # be an installation whose first upgrade reports a missing owned file.
-        # The one exception is named above rather than left to be discovered.
+        # `intent_seed`/`product_seed`; a row that named a file the seed does
+        # not write would be an installation whose first upgrade reports a
+        # missing owned file. There is no exception to this any more.
         for checkout in (self.intent, self.product):
             for relative in manifest.load(checkout).owned:
-                if relative == self.STAMPED_SEPARATELY:
-                    continue
                 self.assertTrue((checkout / relative).is_file(), relative)
+
+    def test_the_product_manifest_does_not_own_the_stub_it_did_not_write(self):
+        # The other half of the sentence above, asserted rather than implied.
+        self.assertNotIn(
+            self.STAMPED_SEPARATELY, manifest.load(self.product).owned
+        )
+
+    def test_a_freshly_provisioned_product_checkout_has_one_thing_left_to_do(self):
+        # It carries no stub and its manifest does not claim one. So doctor's
+        # only finding is the stub that has not been stamped yet — the second
+        # stamp the provisioning report names — and the manifest itself is `ok`
+        # rather than a second finding about a file nobody deleted.
+        code, out = run_cli(["doctor", str(self.product)])
+        self.assertEqual(code, 1, out)
+        self.assertEqual(out.count("FINDING"), 1, out)
+        self.assertIn("release-cut.yml", out)
+        self.assertIn("[missing] no stub", out)
+        self.assertIn(f"ok       {manifest.MANIFEST_RELPATH.as_posix()}", out)
 
     def test_the_product_half_carries_no_workflows_until_it_is_stamped(self):
         # The other half of the exemption above, asserted rather than implied:
@@ -486,9 +509,10 @@ class AGreenfieldSeedIsGreen(ProvisionCase):
             sorted(p.name for p in (self.product / WORKFLOWS).iterdir()),
             ["release-cut.yml"],
         )
-        # And the manifest that named it before it existed now names a file
-        # that does, so `vellum upgrade` has something to re-stamp.
+        # And the stamp that wrote it is what adds it to `owned:`, so `vellum
+        # upgrade` has something to re-stamp from here on. It says so, too.
         self.assertIn(self.STAMPED_SEPARATELY, manifest.load(self.product).owned)
+        self.assertIn(self.STAMPED_SEPARATELY, out)
 
     def test_the_shipped_skeleton_is_exactly_this_set_of_files(self):
         # The seed comes out of package data, and a wheel carries it only

@@ -401,16 +401,24 @@ class TheProductSideUpgradesToo(UpgradeCase):
         self.assertIn(f'{install.REF_INPUT}: "{NEWER}"', text)
         self.assertNotRegex(out, rf"retired\s+{re.escape(relative.as_posix())}")
 
-    def test_an_unstamped_product_stub_is_reported_missing_and_not_invented(self):
-        # Straight out of provisioning the file is owned and absent, which is
-        # the one gap between the two: `upgrade` says so and writes nothing,
-        # because a file an installation removed was removed on purpose and an
-        # upgrade is not where that gets re-opened. `--restore` is the way back.
+    def test_an_unstamped_product_stub_is_not_owned_until_a_stamp_writes_it(self):
+        # The seeded manifest lists what the seed WROTE, and provisioning stamps
+        # the intent half only — so straight out of provisioning the product
+        # stub is not owned and not missing: it is a file Vellum has not put
+        # there yet. `vellum init <product-checkout>` writes it and adds it to
+        # `owned:` in the same run (`install.stamp_manifest`), which is what
+        # gives `upgrade` something to re-stamp.
         relative = install.WORKFLOWS_DIR["github"] / install.RELEASE_CUT.filename
+        self.assertNotIn(relative.as_posix(), self.manifest_of(self.product).owned)
         code, out = self.upgrade("--plan", checkout=self.product)
         self.assertEqual(code, 0, out)
-        self.assertRegex(out, rf"missing\s+{re.escape(relative.as_posix())}")
+        self.assertNotRegex(out, rf"missing\s+{re.escape(relative.as_posix())}")
         self.assertFalse((self.product / relative).exists())
+
+        code, out = run_cli(["init", str(self.product), "--ref", BASE])
+        self.assertEqual(code, 0, out)
+        self.assertIn(relative.as_posix(), self.manifest_of(self.product).owned)
+        self.assertIn(f"added to {manifest.OWNED_KEY}", out)
 
 
 class AnEditedOwnedFileStopsTheUpgrade(UpgradeCase):

@@ -2098,15 +2098,18 @@ path is an input, not something the command finds — the workspace names the
 product *repository* and not where it is checked out, the same reason
 `--releases-from` and `upgrade --from` take theirs.
 
-**The product-side stub is owned before it exists.** Provisioning stamps the
-intent half only (the spec has the stub "stamped by `vellum init` on the product
-side" — a run in that checkout), so a freshly provisioned pair has
-`.github/workflows/release-cut.yml` in the product manifest's `owned:` and not
-on disk. Owned so `vellum upgrade` can re-stamp it; absent because nobody has
-stamped it. `doctor` in that checkout reports it `missing`, and the provisioning
-report names the command that writes it. It is the one row where owned and
-present come apart, and `tests/test_init_provision.py::STAMPED_SEPARATELY` names
-it rather than leaving it to be found.
+**A manifest owns the files that wrote it, and a stamp adds the ones it
+wrote.** Provisioning stamps the intent half only (the spec has the stub
+"stamped by `vellum init` on the product side" — a run in that checkout), so a
+seeded product manifest owns `.vellum/memory/map.md` and nothing else;
+`.github/workflows/release-cut.yml` joins `owned:` when `vellum init` in that
+checkout writes it. `install.stamp_manifest` adds the stubs a run WROTE — never
+the ones it found installed, which is the operator's edit to keep — and it adds
+them **even when the release line is held**, because the two claims in that file
+move on different rules: the line says the installation was brought to a ref,
+and the owned set says which files are Vellum's. Owned-before-it-exists was the
+alternative and it cost a finding on a freshly provisioned pair's first day, for
+a file nobody had been asked to write yet.
 
 ## Patterns worth keeping
 
