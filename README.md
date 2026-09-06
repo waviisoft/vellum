@@ -955,8 +955,11 @@ release:
 `version_source` is read by the file's **name**: a `pyproject.toml` yields its
 `[project] version`, a `package.json` its `version`, and any other path yields
 that file's trimmed contents. `changelog`, when given, must carry an entry for
-`v<version>` or `<version>` — matched as text, because a changelog is prose in
-whatever shape its project keeps.
+the version: a YAML changelog with a `releases:` list (this repo's own
+`CHANGES.yaml`, and every seeded one) needs an entry whose `release` is
+`v<version>` or `<version>` — a mention in a comment is not an entry — and any
+other file needs the version at a line or heading boundary (`## 0.4.0`,
+`## [0.4.0] - 2026-09-06`), so `10.4.0` and `0.4.0-rc1` do not describe `0.4.0`.
 
 This repo declares its own block, so its release tag cuts itself.
 

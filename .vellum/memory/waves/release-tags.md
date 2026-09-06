@@ -93,8 +93,9 @@ its CLI checkout.
    `.github/workflows/release-cut.yml` joins `owned:` when the second stamp
    writes it. This started as the opposite (owned at provisioning, absent on
    disk, so that `upgrade` could re-stamp it later) and the review took it out:
-   a manifest that owns a file nobody has written makes a freshly provisioned
-   pair doctor with a finding on its first day, and it hid the real gap —
+   a manifest that owns a file nobody has written makes `vellum upgrade` report
+   it `missing` on every run over a freshly provisioned pair, and it hid the
+   real gap —
    `stamp_manifest` never added the stubs it wrote, so a manifest predating the
    product stub would never have gained it at all. Both halves are one rule now:
    the files a stamp writes are the files it owns, added even when the release

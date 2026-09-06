@@ -1382,3 +1382,7 @@ def _ledger(args: argparse.Namespace) -> int:
     )
     print(path)
     return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - `python -m vellum.cli`
+    sys.exit(main())

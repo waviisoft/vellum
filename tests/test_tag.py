@@ -567,6 +567,26 @@ class TheChangelogEntryIsLookedUpNotSearchedFor(TagCase):
         self.assertEqual(code, 1, out)
         self.assertIn("CHANGES.yaml", out)
 
+    def test_a_sentence_ending_period_does_not_extend_the_name(self):
+        # `Released 0.5.0.` names 0.5.0; only a dot that continues the version
+        # (`0.5.0.1`) makes it a longer name.
+        checkout = self.product(NEW, changelog="CHANGELOG.md")
+        self.changelog(checkout, "CHANGELOG.md", f"Released {NEW}.\n")
+        self.assertEqual(run_cli(["release", "tag", str(checkout)])[0], 0)
+        self.changelog(checkout, "CHANGELOG.md", f"## {NEW}.1\n")
+        code, out = run_cli(["release", "tag", str(checkout)])
+        self.assertEqual(code, 1, out)
+
+    def test_a_yaml_refusal_names_the_shape_it_read(self):
+        checkout = self.product(NEW, changelog="CHANGES.yaml")
+        self.changelog(
+            checkout, "CHANGES.yaml",
+            f"releases:\n  - version: {NEW}\n    summary: another key\n",
+        )
+        code, out = run_cli(["release", "tag", str(checkout)])
+        self.assertEqual(code, 1, out)
+        self.assertIn("no entry in `releases:`", out)
+
     def test_a_longer_version_containing_this_one_is_not_an_entry(self):
         # `10.4.0` contains `0.4.0`, and a changelog describing the first
         # describes nothing about the second.

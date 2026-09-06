@@ -2098,8 +2098,8 @@ path is an input, not something the command finds — the workspace names the
 product *repository* and not where it is checked out, the same reason
 `--releases-from` and `upgrade --from` take theirs.
 
-**A manifest owns the files that wrote it, and a stamp adds the ones it
-wrote.** Provisioning stamps the intent half only (the spec has the stub
+**A seeded manifest owns the files the seed wrote, and a stamp adds the ones
+it wrote.** Provisioning stamps the intent half only (the spec has the stub
 "stamped by `vellum init` on the product side" — a run in that checkout), so a
 seeded product manifest owns `.vellum/memory/map.md` and nothing else;
 `.github/workflows/release-cut.yml` joins `owned:` when `vellum init` in that
@@ -2108,8 +2108,9 @@ the ones it found installed, which is the operator's edit to keep — and it add
 them **even when the release line is held**, because the two claims in that file
 move on different rules: the line says the installation was brought to a ref,
 and the owned set says which files are Vellum's. Owned-before-it-exists was the
-alternative and it cost a finding on a freshly provisioned pair's first day, for
-a file nobody had been asked to write yet.
+alternative: `vellum upgrade` reported the stub `missing` on every run over a
+freshly provisioned pair, for a file nobody had been asked to write yet, and a
+manifest that predated the stub never gained it when a stamp finally wrote it.
 
 ## Patterns worth keeping
 

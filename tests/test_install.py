@@ -1195,6 +1195,33 @@ class TheProductSideIsTheOtherHalf(InstallCase):
         # nothing" from "this checkout was on trunk".
         self.assertIn("the branch this checkout is on", out)
 
+    def test_a_product_directory_inside_another_repository_is_not_on_its_branch(self):
+        """`rev-parse` answers for whatever repo CONTAINS the directory.
+
+        A product directory that is a plain subdirectory of some other checkout
+        is not a repository on that checkout's branch, and stamping it for
+        `outer` would be the silent-failure default this reader exists to end,
+        arrived at from the other side. Git cannot say anything about that
+        directory on its own behalf, so the default is `main`, and the report
+        says so.
+        """
+        outer = self.root / "outer"
+        outer.mkdir(parents=True, exist_ok=True)
+        _git(outer, "init", "-q", "-b", "outer", ".")
+        (outer / "keep").write_text("x\n", encoding="utf-8")
+        _git(outer, "add", "-A")
+        _git(outer, "-c", "user.name=t", "-c", "user.email=t@t",
+             "commit", "-qm", "the outer repo")
+        checkout = outer / "nested"
+        checkout.mkdir()
+        write_product(checkout)
+        code, out = run_cli(["init", str(checkout), "--ref", "v0.1.0"])
+        self.assertEqual(code, 0, out)
+        text = self.stub(checkout, "release-cut").read_text(encoding="utf-8")
+        self.assertIn('branches: ["main"]', text)
+        self.assertNotIn("outer", text)
+        self.assertIn("the default, since no --branch was given", out)
+
     def test_a_branch_given_wins_over_the_checkouts_own(self):
         checkout = self.on_branch("trunk")
         code, out = run_cli(

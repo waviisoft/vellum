@@ -553,7 +553,8 @@ def _names_at_boundary(text: str, version: str) -> bool:
     taken when it is available.
     """
     return bool(re.search(
-        rf"(^|[\s#\[(])v?{re.escape(version)}(?![0-9A-Za-z.\-])", text, re.M,
+        rf"(^|[\s#\[(])v?{re.escape(version)}(?![0-9A-Za-z\-])(?!\.[0-9A-Za-z])",
+        text, re.M,
     ))
 
 
@@ -624,11 +625,22 @@ def plan(checkout: str | Path) -> Plan:
             # release nobody described; the tag can wait for the line that
             # describes it." Both nouns are named because a refusal that named
             # neither leaves an operator with a red and no next step.
+            # Worded for the shape the file has: a YAML changelog is read as
+            # entries, so "names neither" would be false of a file whose
+            # entries use another key or describe other versions by name.
+            if _yaml_releases(text) is not None:
+                missing = (
+                    f"no entry in `{RELEASES_KEY}:` has `{RELEASE_ENTRY_KEY}: "
+                    f"{tag}` or `{RELEASE_ENTRY_KEY}: {version}`"
+                )
+            else:
+                missing = (
+                    f"no line or heading names `{tag}` or `{version}`"
+                )
             raise TagRefused(
                 f"{one_line(root / declared.changelog)} carries no entry for "
-                f"{tag}: it names neither `{tag}` nor `{version}`. A version its "
-                f"changelog "
-                f"does not describe is not tagged — write the {tag} entry in "
+                f"{tag}: {missing}. A version its changelog does not describe "
+                f"is not tagged — write the {tag} entry in "
                 f"{declared.changelog} and run this again. Nothing was tagged "
                 f"(spec/features/release-tags.md)."
             )

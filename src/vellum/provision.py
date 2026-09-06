@@ -886,10 +886,13 @@ def product_seed(
     `release-cut` stub is stamped by `vellum init` run in the product checkout —
     "stamped by `vellum init` on the product side"
     (``spec/features/release-tags.md``) — which provisioning does not do. Listing
-    it here made a manifest that owned a file nobody had written, so a freshly
-    provisioned pair doctored with a finding on its first day and every report
-    had to explain it. It joins ``owned:`` when the stamp writes it, which is
-    the rule ``install.stamp_manifest`` states as "the files a stamp writes".
+    it here made a manifest that owned a file nobody had written: ``vellum
+    upgrade`` reported it ``missing`` on every run, and a stamp that later wrote
+    it never added it to a manifest that lacked it. It joins ``owned:`` when the
+    stamp writes it, which is the rule ``install.stamp_manifest`` states as "the
+    files a stamp writes". (``doctor`` in a fresh product checkout still reports
+    the unstamped stub; that is the second stamp's reminder, and vellum#27 is
+    where it becomes opt-in by declaration.)
 
     Filtered from :func:`vellum.owned.for_side` rather than derived from the
     dict: ownership stays a table with a reason per row — a seed that owned

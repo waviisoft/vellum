@@ -134,8 +134,19 @@ def branch(repo: Path) -> str | None:
     up.
     """
     try:
+        top = _git(repo, "rev-parse", "--show-toplevel").strip()
         name = _git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip()
     except (GitUnavailable, OSError):
+        return None
+    # About THIS directory, not an enclosing repository: `rev-parse` answers
+    # for whatever repo contains *repo*, so a product directory that is a plain
+    # subdirectory of some other checkout would otherwise be stamped for that
+    # checkout's branch. A directory that is not itself the top of a repository
+    # is one git cannot say anything about on its own behalf.
+    try:
+        if Path(top).resolve() != Path(repo).resolve():
+            return None
+    except OSError:
         return None
     return name if name and name != "HEAD" else None
 
