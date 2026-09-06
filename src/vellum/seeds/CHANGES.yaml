@@ -1,0 +1,176 @@
+# The installation-shape changelog. One entry per release, naming what that
+# release changes about an INSTALLATION — not about this product's own code.
+# `vellum upgrade --plan` prints the entries for the range it would cross, so an
+# upgrade is reviewable as the change it is
+# (spec/decisions/2026-09-04-vellum-owned-files-and-upgrades.md).
+#
+# Four sections per entry, and each answers a question an operator asks before
+# they merge an upgrade pull request:
+#
+#   config_keys_added   what will be in `.vellum/config.yaml` that is not now.
+#                       ALWAYS with a `default:` — the decision is explicit that
+#                       a release never adds a required key without one, and
+#                       `tests/test_upgrade.py` fails an entry that omits it.
+#                       A release that needs a value it cannot default has to
+#                       ask for it, and an upgrade is not a conversation.
+#   files_added         what an upgrade will create in the installation.
+#   files_retired       what this release no longer ships. `upgrade` REPORTS
+#                       these and deletes nothing: a file Vellum has stopped
+#                       shipping is the installation's now, and removing it is
+#                       the operator's call.
+#   stub_inputs         what the caller stubs pass and what the shipped
+#                       workflows do with it. This is the one section about the
+#                       forge rather than the checkout, and it is where a
+#                       secret becoming optional or required belongs.
+#
+# `notes:` is for a shape change that is none of the four — a new command, a
+# provisioning flag — that an operator still wants named in the plan.
+#
+# CUTTING A RELEASE, in order. Each step is checked by a test, so the procedure
+# is not a checklist somebody has to remember:
+#
+#   1. Bump `__version__` in `src/vellum/__init__.py` AND `version` in
+#      `pyproject.toml` to the new number. They are two files stating one fact;
+#      `tests/test_upgrade.py::TheReleaseThisCutIs` fails when they disagree.
+#   2. Add this release's entry here: rename `template:`'s `vNEXT` to `v<the
+#      version>`, move it under `releases:` (newest last), and leave a fresh
+#      `template:` behind for the next one. The same test fails when
+#      `f"v{__version__}"` has no entry, so the entry is written BEFORE the tag
+#      rather than remembered after it.
+#   3. Run the suite. Both alarms above are ordinary tests.
+#   4. The owner tags `v<the version>` and pushes the tag. Only then does
+#      `EveryReleaseTagHasAShapeEntry` — which reads the repository's real tags
+#      — have anything to say, which is why steps 1-3 carry their own alarm:
+#      a tag-reading test cannot fail for a tag nobody has cut yet.
+#
+# `tests/test_upgrade.py::EveryReleaseTagHasAShapeEntry` fails when a `v*` tag
+# in this repo has no entry here, which is the alarm for a release cut without
+# one.
+
+schema: 1
+
+# ---------------------------------------------------------------------------
+# The shape to copy when a release is cut. NOT a release: nothing reads it into
+# a range, and `upgrade --plan` never prints it.
+# ---------------------------------------------------------------------------
+template:
+  release: vNEXT
+  summary: >-
+    One sentence saying what this release changes about an INSTALLATION.
+  config_keys_added: []
+  files_added: []
+  files_retired: []
+  stub_inputs: []
+  notes: []
+
+# ---------------------------------------------------------------------------
+# The releases, oldest first.
+# ---------------------------------------------------------------------------
+releases:
+  - release: v0.1.0
+    summary: >-
+      The adapters ship once and install thin: an installation's three forge
+      workflows become caller stubs naming reusable workflows at a pinned ref.
+    config_keys_added: []
+    files_added:
+      - path: .github/workflows/spec-ci.yml
+        what: >-
+          The caller stub for the spec-CI reusable workflow. Replaces the full
+          copy an installation used to carry.
+      - path: .github/workflows/on-spec-merge.yml
+        what: The caller stub for the on-spec-merge reusable workflow.
+      - path: .github/workflows/harness-ci.yml
+        what: The caller stub for the harness-CI reusable workflow.
+    files_retired: []
+    stub_inputs:
+      - >-
+        `vellum-ref` (required): the ref the shipped workflow checks the CLI out
+        at. Stamped equal to the `@<ref>` on the `uses:` line, and quoted, so one
+        installation runs one version of both.
+      - >-
+        `VELLUM_TOKEN` (secret, required): passed BY NAME, never
+        `secrets: inherit`. The shipped workflows assert it in their first step
+        and fail with a named error when it is empty.
+    notes:
+      - >-
+        `vellum init` and `vellum doctor` arrive. Upgrading an installation's
+        stubs is `vellum init --ref <new> --force`; doctor reports a ref behind
+        the newest release and never fails on it.
+
+  - release: v0.2.0
+    summary: >-
+      The token becomes optional, and `vellum init` learns to provision a repo
+      pair from nothing.
+    config_keys_added: []
+    files_added: []
+    files_retired: []
+    stub_inputs:
+      - >-
+        `VELLUM_TOKEN` is now `required: false` in all three shipped workflows.
+        A workflow that finds it empty raises a notice and checks the CLI out
+        with the caller's own `github.token` instead, which reads
+        waviisoft/vellum once that repo is public. An installation that passes
+        no secret still runs; while the repo is private it fails at that
+        checkout, which is why the notice names which credential the run used.
+      - >-
+        A stub that passes no secret is no longer a finding: `vellum doctor`'s
+        `no-secret` code is retired with the requirement it enforced. What did
+        not relax is `secrets: inherit` and a secret remapped to a different
+        credential under an audited name — both are still findings.
+    notes:
+      - >-
+        `vellum init` gains its provisioning flags — `--shape`
+        (greenfield | brownfield | brownfield-with-docs), `--org`, `--product`,
+        `--intent-repo`, `--product-repo`, `--visibility`, `--branch`, `--area`,
+        `--docs`, `--into`, `--plan`, `--yes` — and provisions a repo pair when
+        any of them is given. Given none it is the stub-stamping command it has
+        always been, unchanged.
+      - >-
+        No file in an EXISTING installation changes. v0.2.0's new files
+        (`.vellum/config.yaml`, `ledger/releases.yaml`, the harness skeleton, a
+        skeletal spec tree) are what provisioning writes into a NEW pair, and an
+        upgrade neither adds nor needs them.
+
+  - release: v0.3.0
+    summary: >-
+      An installation names the files Vellum owns, and `vellum upgrade` rewrites
+      only those, as a pull request.
+    config_keys_added: []
+    files_added:
+      - path: .vellum/install.yaml
+        what: >-
+          The installation manifest, on each side of the pair: the release this
+          installation was last brought to, and the repo-relative paths Vellum
+          may rewrite. `vellum init` writes one over an installation that has
+          none, with the caller stubs as the owned set; add the seeded files you
+          want upgrades to rewrite.
+    files_retired: []
+    stub_inputs: []
+    notes:
+      - >-
+        New command: `vellum upgrade --to <release>`, run in an intent or
+        product checkout, on its default branch. It rewrites owned files from
+        the release's templates, re-stamps the stubs, records the release, and
+        lands the change on `vellum/upgrade-<release>` as a pull request — never
+        as a push to the default branch. `--to` takes a release tag and nothing
+        else: installations pin cuts, never branches.
+      - >-
+        `ledger/releases.yaml` is NOT a Vellum-owned file. It is seeded, and
+        after that it is pipeline-written state — `vellum ledger open|advance`
+        and `vellum certify record` write to it — so a release that changes its
+        shape delivers that as a changelog migration and not as a rewrite. An
+        installation whose manifest lists it (one provisioned by an earlier
+        build of this release) sees it reported as `retired` and untouched;
+        taking the line out of `owned:` is the tidy-up.
+      - >-
+        `vellum init --ref <new> --force` restamps the stubs and now HOLDS the
+        manifest's release line for an installation that owns files a stamp does
+        not write. The line is a claim about the FILES, and moving it without
+        them made the next upgrade refuse every one of them as an edit.
+        `vellum upgrade --to <new>` moves the files and the line together.
+      - >-
+        `vellum doctor` gains two lines: the manifest is a finding when it is
+        absent or malformed, and the local CLI against the CLI the stubs install
+        in CI is reported and never failed on. An installation provisioned
+        before the manifest existed sees the first of those once, and the
+        finding names the fix and what it will mark owned.

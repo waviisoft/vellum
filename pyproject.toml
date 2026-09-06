@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vellum"
-version = "0.1.0"
+version = "0.3.0"
 description = "Spec-driven product engineering tooling: lint, suite extraction, ledger."
 readme = "README.md"
 # SPDX, per PEP 639. No `License :: OSI Approved :: MIT License` classifier
@@ -32,3 +32,14 @@ vellum = "vellum.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+# The seeds that are not Python. `seeds/harness/` ships whatever this says,
+# because every file in it is a module of an ordinary package
+# (`src/vellum/seeds/harness/__init__.py` has that argument); `CHANGES.yaml` and
+# `templates/` do not, and a wheel built without this declaration carries
+# neither. `vellum init` would then seed an installation with no config and
+# `vellum upgrade` would compare an owned file against a template it could not
+# read — so `vellum.seeds` refuses rather than returning an empty string, and
+# `tests/test_upgrade.py` reads both out of the installed package.
+"vellum.seeds" = ["CHANGES.yaml", "templates/*"]

@@ -1,0 +1,10 @@
+# The release ledger: what has been cut, and what each channel has conformed.
+# `spec_conformed: null` is the honest starting state — this installation has
+# certified nothing yet, so the armed/enforced partition arms every scenario and
+# enforces none.
+spec_head: null
+channels:
+  production:
+    spec_conformed: null
+cuts: []
+stamps: {}

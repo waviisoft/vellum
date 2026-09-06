@@ -50,10 +50,11 @@ there, its `paths:` are still compared, and a trigger added beside it is still
 drift.
 
 Copying by hand works too — the three files here are exactly what `init`
-writes, and `tests/test_install.py` asserts that byte for byte. **But the
-committed files pin `v0.1.0`, and `waviisoft/vellum` has cut no `v*` tag yet**,
-so a hand-copied stub resolves to nothing until one exists. Edit the two ref
-lines to `main`, or run `vellum init . --ref main`.
+writes, and `tests/test_install.py` asserts that byte for byte. The committed
+files pin **this checkout's own version**, which is what `init` pins when it is
+given no `--ref`; a copy taken from a checkout ahead of the newest cut release
+pins a tag that does not exist yet, and resolves to nothing until it does. `git
+tag -l 'v*'` in `waviisoft/vellum` says which do.
 
 ## Upgrading is bumping a ref
 
@@ -71,6 +72,22 @@ of a longer scalar. They are stamped equal and
 pin the CLI: the checkout of `waviisoft/vellum` inside the workflow body needs a
 ref it can be handed, and an installation's CLI version has to be readable in
 the repository that runs it.
+
+**The stubs are one of three things a release moves, and `vellum upgrade` moves
+all three.**
+
+```sh
+vellum upgrade . --to v0.3.0 --from ../vellum --plan   # see it first
+vellum upgrade . --to v0.3.0 --from ../vellum
+```
+
+It re-stamps the stubs at the new ref, rewrites every other file
+`.vellum/install.yaml` names as Vellum's, records the release in that manifest,
+and lands the lot on `vellum/upgrade-v0.3.0` as a pull request — never as a push
+to the default branch every stub watches. An owned file this installation has
+edited stops it: exit 1 naming the file, nothing written. `vellum init --ref
+<new> --force` above is still the right command when the *stubs alone* are what
+you are moving.
 
 ## Why stubs, and what a stub may not become
 
@@ -180,10 +197,11 @@ about this.
 - **The pinned ref has to exist in `waviisoft/vellum`.** `vellum init` defaults
   to `v<this CLI's version>` and *cannot confirm from an intent checkout that
   the tag exists*, so it says so rather than guessing a ref that does.
-  **This repo has cut no `v*` tag yet**: until it does, install with
-  `vellum init . --ref main`, or the stubs resolve to nothing. Pass
-  `--releases-from <a vellum checkout>` to have either command read the `v*`
-  tags and report currency.
+  This repo has cut `v0.1.0` and `v0.2.0`, and `v0.3.0` is this checkout's
+  version: a stub stamped from a checkout whose version is not yet tagged
+  resolves to nothing until the owner tags it, so pin the newest cut release
+  until then. Pass `--releases-from <a vellum checkout>` to have either command
+  read the `v*` tags and report currency.
 - **The pins are MUTABLE tags, and that is the trust model.** `uses:
   waviisoft/vellum/...@v0.1.0` names a tag, not a sha, and so does every
   `actions/checkout@v4` inside the reusable workflows. Whoever can move a tag in

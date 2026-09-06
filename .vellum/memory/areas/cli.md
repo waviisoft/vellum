@@ -1,12 +1,12 @@
 # Area: the `vellum` CLI
 
-`src/vellum/`. Eighteen commands — `lint`, `suite extract|partition`,
+`src/vellum/`. Nineteen commands — `lint`, `suite extract|partition`,
 `ledger open|advance|verify`, `certify record|check`, `release cut`, `tick`, the
 three pipeline commands `mint`, `backpressure`, `pin advance`, the five
 mechanical guards `verify boundaries|deps|exit-duty`, `ledger verify` and
-`budget`, and the two installer commands `init` and `doctor` — dispatched from
-`build_parser()` in `src/vellum/cli.py`. `init` is really two commands behind
-one name (stamping, and provisioning a repo pair); see below. Every claim below
+`budget`, and the three installer commands `init`, `doctor` and `upgrade` —
+dispatched from `build_parser()` in `src/vellum/cli.py`. `init` is really two
+commands behind one name (stamping, and provisioning a repo pair); see below. Every claim below
 names a file or symbol you can grep for.
 
 ## Module map
@@ -27,9 +27,13 @@ names a file or symbol you can grep for.
 | `src/vellum/pin.py` | `advance()` -> `Advance`, `verify_version()`, `_rewrite()`. The pin close. |
 | `src/vellum/config.py` | `load()`, `divergence_cap()`, `INTENT_ENV`. Reads `.vellum/config.yaml`. |
 | `src/vellum/workspace.py` | `load()`, `products()`, `intent()`, `forge()`, `WORKSPACE_RELPATH`, `DEFAULT_FORGE`. The one reader of `.vellum/workspace.yaml`. |
-| `src/vellum/install.py` | `init()` -> `Init`, `doctor()` -> `Doctor`, `render()`, `inspect()`, `strays()`, `releases()`, `currency()` -> `Currency`, `SHIPPED`, `HOST_REPO`, `JOB_KEYS`, `DEFAULT_BRANCH`, `CANNOT_KNOW`. The adapters install thin (installation, part 1). |
+| `src/vellum/install.py` | `init()` -> `Init`, `doctor()` -> `Doctor`, `render()`, `inspect()`, `strays()`, `releases()`, `currency()` -> `Currency`, `stamp_manifest()` -> `ManifestStamp`, `manifest_findings()`, `installed_shape()`, `SHIPPED`, `HOST_REPO`, `JOB_KEYS`, `DEFAULT_BRANCH`, `CANNOT_KNOW`. The adapters install thin (installation, part 1). |
 | `src/vellum/provision.py` | `run()`, `resolve()` -> `Answers`, `build_plan()` -> `Plan`, `forge_steps()` -> `[ForgeStep]`, `intent_seed()`, `product_seed()`, `build_intent()`, `build_product()`, `check_seed()` -> `SeedCheck`, `detect_gh()` -> `Gh`, `first_spec_commit()`, `requested()`, `Console`, `SHAPES`, `ADOPT_BRANCH`. Provisioning a repo pair (installation, part 2). |
-| `src/vellum/seeds/` | `harness_files()`, `NOT_SEEDED`, and `seeds/harness/` — the harness skeleton `init` seeds, shipped as package data. Every file in it is a module of a real package so a wheel carries it without a `package-data` declaration; `harness/__init__.py` exists for that and is not seeded, and the walk reads only `.py` because an installed copy has `__pycache__/` beside it. |
+| `src/vellum/seeds/` | `harness_files()`, `template()`, `changes_text()`, `read_source()`, `source_path()`, `NOT_SEEDED`, `PACKAGE_PATH`, and the data itself: `seeds/harness/` (the harness skeleton), `seeds/templates/` (the seeded config, release ledger and memory map) and `seeds/CHANGES.yaml` (the installation-shape changelog). Shipped as package data. Every file in it is a module of a real package or is declared in `pyproject.toml`'s `[tool.setuptools.package-data]`; `harness/__init__.py` exists for the first and is not seeded, and the walk reads only `.py` because an installed copy has `__pycache__/` beside it. |
+| `src/vellum/manifest.py` | `read()`, `load()`, `parse()`, `dump()`, `write()`, `check_owned_path()`, `Manifest`, `ManifestError`, `MANIFEST_RELPATH`. The only reader and writer of `.vellum/install.yaml`. |
+| `src/vellum/owned.py` | `table()` -> `{path: Owned}`, `for_side()`, `stub_paths()`, `INTENT`, `PRODUCT`, `SEED`, `STUB`, `HARNESS_MACHINERY`. The ownership table, with a reason per row and the reasons for every row that is NOT there. |
+| `src/vellum/changes.py` | `load()`, `parse()` -> `Changes`, `Entry`, `version_of()`, `render()`, `SECTIONS`, `ChangesError`. Reads `seeds/CHANGES.yaml` and selects `(after, to]`. |
+| `src/vellum/upgrade.py` | `upgrade()` -> `Upgrade`, `run_upgrade()`, `compare()` -> `[Change]`, `Templates`, `side_of()`, `BRANCH_PREFIX`, `UpgradeError`. Rewrites the owned files as a pull request. |
 | `src/vellum/product.py` | `load()`, `write_boundaries()`, `normalise_tree()`, `under()`, `PRODUCT_RELPATH`. Reads `.vellum/product.yaml`. |
 | `src/vellum/boundaries.py` | `check()` -> `Boundaries`, `run()`. The write-boundary guard. |
 | `src/vellum/exitduty.py` | `check()` -> `ExitDuty`, `run()`, `AREAS_TREE`. The memory-update guard. |
@@ -1898,6 +1902,144 @@ The delegation keeps its `ReleaseError` wrapper so a caller still learns which
 *command* refused — the same shape `config.write_boundaries` uses over
 `product.role_trees`, and for the same reason: two readers of one file is how
 the two come to disagree about what it says.
+
+## The manifest, and `vellum upgrade`
+
+`.vellum/install.yaml`, `src/vellum/manifest.py`, `src/vellum/owned.py`,
+`src/vellum/changes.py`, `src/vellum/upgrade.py`.
+`spec/features/installation.md` and
+`spec/decisions/2026-09-04-vellum-owned-files-and-upgrades.md`.
+
+**Ownership is DATA and every line of this is downstream of that.** The manifest
+records two things — the release the installation was last brought to, and the
+repo-relative paths Vellum may rewrite — and nothing anywhere reads a file's
+contents or its history to decide whether Vellum owns it. The decision rejected
+the heuristic by name ("a product that edited a seeded file once and reverted it
+would silently flip ownership"). Two consequences people will be tempted to
+undo:
+
+- **`upgrade` never edits `owned:`.** Not to add a file the release ships, not
+  to drop one it has retired. Adding would silently re-take a file the operator
+  had removed, which is the one edit the refusal exists to invite; dropping
+  would edit the operator's data on their behalf. A release's new files are
+  *reported* by `--plan` out of `CHANGES.yaml` and are the operator's to add.
+- **`init` writes the whole owned set only at PROVISIONING.** A stamp over an
+  existing installation writes the stubs and nothing else, because a stamp runs
+  where the repos already existed and cannot tell a Vellum seed from somebody's
+  own tree. `owned.for_side()` is the provisioning default; `owned.stub_paths()`
+  is the stamp's.
+
+**A file is ownable when the checkout alone can reproduce it.** That is the rule
+`owned.table()` encodes and it is what decides every row. Verbatim package data
+(the config, the release ledger, the harness machinery) qualifies; a one-value
+template whose value the checkout still carries qualifies (the product repo's
+memory map names the intent repo, and `.vellum/product.yaml` names it too); the
+stubs qualify because `install.render()` rebuilds them from the ref, the host
+and the branch, all three readable out of what is installed
+(`install.installed_shape()`). `harness/README.md` does **not** — it names the
+product, and a workspace mapping two products has no single title to re-render
+it from. Neither does `.vellum/workspace.yaml` (the repo map an installation
+edits) or `.vellum/product.yaml` (it IS the pin). `owned.py`'s docstring carries
+the table of what is not owned and why, one row at a time; keep it there.
+
+**`harness/README.md` draws the harness line itself and the table reads it
+rather than inventing one.** "The machinery — `run.py`, `support/runner.py`,
+`support/registry.py`, `support/report.py`, `support/world.py` — is generic ...
+Two files are yours: `steps/` ... and `support/adapter.py`." So `steps/` and
+`adapter.py` are not owned. If that sentence ever changes, `HARNESS_MACHINERY`
+changes with it — `test_the_files_the_seeded_readme_calls_yours_are_not_owned`
+is the link.
+
+**`ledger/releases.yaml` is the uncomfortable row and it is owned deliberately.**
+The seed ships its *shape* and a release that changes that shape has no other
+way to deliver it. The consequence is real: an installation that has cut a
+release has written to the file, so its FIRST upgrade refuses it by name and the
+operator takes it back or drops the line. That is the mechanism working — once,
+visibly — and it is the row most worth re-opening if the refusal proves to be
+noise in practice.
+
+**The templates moved out of `provision.py` into files, and the reason is
+`git show`.** `upgrade` reads a release's templates either from a `--from`
+checkout (`git show <ref>:src/vellum/seeds/…`) or from this CLI's package data.
+A template that is a Python string constant can be read back at a ref only by
+parsing the module that holds it, and executing another release's code to get at
+it is worse. So `CONFIG_YAML`, `RELEASES_YAML` and `MEMORY_MAP` are now
+`seeds/templates/{config.yaml,releases.yaml,memory-map.md}`, byte for byte what
+they were — the config's one interpolation went with them, because the seeded
+`divergence_cap` was always the constant 3. **`pyproject.toml` declares them as
+package data**: a `.yaml` under a package is not shipped the way a `.py` is, and
+without the declaration a wheel seeds an installation with no config. `seeds`
+raises `SeedsMissing` rather than returning an empty string for that reason.
+
+**Two refs are needed, not one, and that is why `--from` is usually required.**
+The manifest's release proves the file is unedited; `--to` writes it. A checkout
+serves any ref it carries; this CLI serves exactly one, its own version. Exit 2
+naming `--from` is the answer when either cannot be served, and **skipping the
+check is the one thing this command must never do** — it is the whole safety
+property.
+
+**The stubs are re-stamped by THIS CLI's renderer, not copied out of the new
+release.** Stated in `upgrade.py`'s docstring and in the README because it is the
+one place the command's answer is narrower than its sentence: a release that
+changed what a stub *contains* delivers that when a CLI at that release stamps
+it. Doctor's caller-half compare asks for that, and doctor's new
+local-CLI-against-the-stubs line makes the gap visible. The stub's
+"is it edited?" render uses `installed_shape()` so an installation on `trunk`,
+or one pointed at a fork, is not reported as having edited all three.
+
+**The whole comparison happens before a single byte is written.** `compare()`
+returns the entire list and `_apply()` runs only when nothing is `EDITED` or
+`UNVERIFIABLE`. "Exit 1 and nothing is written" has to mean nothing, not "some
+of it"; a half-applied upgrade leaves an installation at two releases at once,
+which is the state the manifest exists to make impossible.
+
+**A missing owned file is skipped, not recreated** (`--restore` asks for it
+back). waviisoft/vellum-intent carries no `harness-ci.yml` stub by design, and
+recreating it would make an upgrade undo a decision nobody re-opened, inside a
+pull request about something else.
+
+**`CHANGES.yaml` is read from the release being ADOPTED, not from this CLI.** A
+release describes its own installation-shape changes; a CLI older than the
+release would describe them from before they were written. `--plan` prints
+`(manifest release, --to]`, ordered as version tuples like everything else that
+orders releases. A `config_keys_added` entry without a `default:` is refused by
+`changes._entry` — the decision says "always with a default; never required
+without one", and the reason is what an upgrade IS: a pull request nobody is
+standing next to, so a release that needs an answer has added a prompt to a
+command that has none. `EveryReleaseTagHasAShapeEntry` fails when a `v*` tag in
+this repo has no entry, which is the alarm for cutting a release and forgetting;
+`template:` is the shape to copy, and it is deliberately not a release.
+
+**Doctor's two new lines are on opposite sides of the verdict, on purpose.** A
+missing or malformed manifest is a **finding** (exit 1): it is a fact about the
+checkout — nothing in it says what Vellum may rewrite, so `upgrade` cannot run.
+The local CLI against the stubs' `vellum-ref` is **reported and never failed
+on**: the two drift apart by design, and neither is wrong for it. It reads the
+`vellum-ref` input rather than the `@<ref>` because that input is what the
+shipped workflow actually installs; `ref-mismatch` is the finding for the two
+coming apart.
+
+**A stamp that left a stub alone refreshes NOTHING.** The release line is a
+claim that the installation *was brought to* that ref. A run that declined to
+rewrite a stub did not bring it anywhere, and recording the release anyway would
+leave the next upgrade comparing that stub against the wrong release's template.
+
+**A malformed manifest is never overwritten.** `init` exits 2. Replacing an
+unreadable one with a default would silently take back ownership of every file
+the operator had removed from it.
+
+**Every owned path is validated on the way in, because `upgrade` writes it.**
+`manifest.check_owned_path` refuses an absolute path, a `..` component, a
+backslash, a path that normalises to the checkout itself, and the manifest's own
+path. The list lives in a file anyone who can land a pull request can edit, and
+a bad entry makes the whole manifest malformed rather than one line skipped: a
+manifest that half-works would go on half-working.
+
+**`provision.git` and `provision.default_branch` are public now.** An upgrade
+branches, commits and opens a pull request with exactly an adoption's plumbing —
+same identity fallback, same "a git failure is `I could not answer`" — and two
+spellings of that is how the two come to disagree about which branch they are a
+guest of.
 
 ## Patterns worth keeping
 

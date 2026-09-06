@@ -83,6 +83,8 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from vellum import install
+from vellum import manifest
+from vellum import owned
 from vellum import seeds
 from vellum.lint import lint_tree
 from vellum.specfile import ID_RE
@@ -102,12 +104,20 @@ ADOPTING = (BROWNFIELD, BROWNFIELD_WITH_DOCS)
 
 VISIBILITIES = ("public", "private")
 
-#: Where the adoption pull request's body is written, inside the product
-#: checkout and deliberately **not** committed: the transport passes it to
-#: ``gh pr create --body-file`` and the manual rung's checklist names the same
-#: path, so an operator following the checklist has the body the transport would
-#: have used rather than a placeholder it never filled in.
-ADOPT_PR_RELPATH = ".vellum/ADOPT_PR.md"
+#: Where the adoption pull request's body is written: under the product
+#: checkout's ``.git/``, and so outside the working tree. The transport passes
+#: it to ``gh pr create --body-file`` and the manual rung's checklist names the
+#: same path, so an operator following the checklist has the body the transport
+#: would have used rather than a placeholder it never filled in — which means it
+#: has to survive the command. In the working tree it did that by being left
+#: behind untracked, which is a file the next run's dirty-tree check refuses on.
+#: ``.git/`` is per-checkout, never committed and never in ``git status``.
+ADOPT_PR_RELPATH = ".git/vellum/ADOPT_PR.md"
+#: The same path, relative to the checkout's git directory — which is `.git/`
+#: only when `.git` is a directory. In a worktree it is a FILE pointing at
+#: `<main>/.git/worktrees/<name>`, and a write under `.git/` there fails; so the
+#: body goes under whatever `git rev-parse --git-dir` names (:func:`git_dir`).
+ADOPT_PR_UNDER_GIT = "vellum/ADOPT_PR.md"
 
 #: The branch a brownfield installation's ``.vellum/`` arrives on.
 #: ``spec/features/installation.md``: "its ``.vellum/`` arrives on a branch as a
@@ -723,6 +733,14 @@ the run and exits 2 if the run left a trace.
 """
 
 
+#: The three seeded templates that are no longer string constants here. They
+#: moved to ``src/vellum/seeds/templates/`` — byte for byte — because ``vellum
+#: upgrade`` has to read a *release's* copy of each, and it reads a release with
+#: ``git show <ref>:<path>``: a template that is a Python constant can only be
+#: read back at a ref by parsing the module holding it. What stayed here is what
+#: an upgrade must never rewrite (``vellum.owned``'s table says why for each).
+#: The config's one interpolation went with it: the seeded ``divergence_cap`` was
+#: always the constant 3, so the template is now verbatim rather than formatted.
 WORKSPACE_YAML = """# One intent repo governs one or more product repos; each product repo answers
 # to exactly one intent repo (spec/features/repo-topology.md). Written by
 # `vellum init`; `vellum init` and `vellum doctor` read it back.
@@ -733,90 +751,6 @@ forge: github
 
 products:
   {product}: {{repo: {product_slug}, trees: [src, .vellum/memory]}}
-"""
-
-CONFIG_YAML = """# Vellum installation config. One config governs this intent repo and every
-# product repo under it, because the values in it are installation policy rather
-# than product code.
-#
-# Written by `vellum init` with the installation defaults. Every key the CLI
-# reads today is here with the command that reads it named beside it; the rest
-# is the v1 shape, reserved so a later feature is implementation rather than
-# migration. A key the CLI reads is an error when it is MISSING, never a
-# silent default — a gate that turns itself off when its key is misspelled is
-# not a gate.
-
-# Decorative names for spec versions. A version is a commit; this is the prefix
-# the `spec-v<N>` tag beside it carries.
-version_prefix: spec-v
-
-release:
-  policy: batched            # continuous | batched | train
-  channels: [production]     # canary and lines are reserved
-
-budgets:
-  # read by `vellum budget`
-  per_item_usd: 10
-  period_usd: 250
-  period: monthly            # daily | weekly | monthly
-  # read by `vellum backpressure`: unshipped spec versions before the gate
-  # reports blocked. Start loose — early intent naturally outruns early product.
-  divergence_cap: {divergence_cap}
-  verifier_round_trips: 3
-  concurrent_implementers: 2
-  lease_minutes: 60          # a claim's lifetime before it lapses
-
-questions:
-  # read by `vellum tick`: how long a parked question waits before it escalates
-  timebox_hours: 24
-  delivery: github-native
-
-flake:
-  retries: 2
-  quarantine_label: scenario-bug
-
-labels:
-  spec: [spec:feature, spec:fix, spec:clarify, spec:redefining]
-  escalation: [needs-human, question]
-  ideation: [backlog]
-
-dependency_policy:
-  # read by `vellum verify deps`: the registries a dependency may come from.
-  # A new or changed dependency is a verifier red-flag item
-  # (spec/behaviors/security.md); set this to the registries this product
-  # actually uses before the first dependency lands.
-  registries: [pypi.org]
-  lockfile_required: true
-
-write_boundaries:
-  # read by `vellum verify boundaries <intent-checkout> --role <role>`: the
-  # trees each of THIS repo's roles may write. The same block a product repo
-  # carries in .vellum/product.yaml, here because the intent repo has no
-  # product file (spec/behaviors/write-boundaries.md). Entries are
-  # repo-relative path prefixes matched component-wise; "", ".", "/", an
-  # absolute path and ".." are all refused as tree-widening.
-  harness-engineer: [harness]
-  librarian: [ledger, .vellum/memory]
-
-executors:
-  # Bind roles to executors; first available claims. Reserved until this
-  # installation runs agents.
-  {{}}
-
-roles:
-  {{}}
-"""
-
-RELEASES_YAML = """# The release ledger: what has been cut, and what each channel has conformed.
-# `spec_conformed: null` is the honest starting state — this installation has
-# certified nothing yet, so the armed/enforced partition arms every scenario and
-# enforces none.
-spec_head: null
-channels:
-  production:
-    spec_conformed: null
-cuts: []
-stamps: {}
 """
 
 PRODUCT_YAML = """# Backref from this product repo to the intent repo that governs it.
@@ -856,51 +790,18 @@ write_boundaries:
   implementer: [src, tests, .vellum/memory]
 """
 
-MEMORY_MAP = """# Map
-
-Where things are in this repo, and the standing decisions behind them. Area
-notes live in `.vellum/memory/areas/`; wave worklogs in `.vellum/memory/waves/`.
-
-Seeded by `vellum init`. It is a skeleton on purpose: a map written ahead of the
-repository it describes is a second place for the layout to drift. Fill it in as
-the first wave lands, and keep every claim in it something a reader can grep for.
-
-## Layout
-
-| Path | What |
-|---|---|
-| `src/` | The product. |
-| `.vellum/product.yaml` | Backref to `{intent_slug}`, and the pin of record — `pin.commit`. |
-| `.vellum/memory/` | This map, area notes, and one worklog per wave. |
-
-## Areas
-
-None yet. An area note is the durable answer to "how does this part work and
-why"; exit duty is what keeps them true — a work item is done only when the
-implementer updated the area notes it touched.
-
-## Waves
-
-None yet.
-
-## Technology choice, and why
-
-Not chosen yet. Record it here when it is, with the reasoning, so a later wave
-can re-open the decision knowingly rather than by accident.
-"""
-
-
 def _table_row(cells: Sequence[str]) -> str:
     return "| " + " | ".join(cells) + " |"
 
 
-def intent_seed(answers: Answers) -> dict[str, str]:
+def intent_seed(answers: Answers, *, ref: str | None = None) -> dict[str, str]:
     """``{repo-relative path: text}`` for the intent repo, ordered by path.
 
     One dict, built once: the plan lists its keys and the build writes its
     items, so "every file to be seeded (paths)" in the plan and the files that
     appear in the checkout are the same set by construction rather than by two
-    lists being kept in step.
+    lists being kept in step. The manifest is in it for that reason — a file the
+    plan must name, seeded like any other — rather than written afterwards.
     """
     titles = {slug: " ".join(p.capitalize() for p in slug.split("-")) for slug in answers.areas}
     files: dict[str, str] = {
@@ -951,8 +852,8 @@ def intent_seed(answers: Answers) -> dict[str, str]:
         product=answers.product,
         product_slug=answers.product_slug,
     )
-    files[".vellum/config.yaml"] = CONFIG_YAML.format(divergence_cap=3)
-    files["ledger/releases.yaml"] = RELEASES_YAML
+    files[".vellum/config.yaml"] = seeds.template(owned.CONFIG_TEMPLATE)
+    files["ledger/releases.yaml"] = seeds.template(owned.RELEASES_TEMPLATE)
     files.update(seeds.harness_files())
     # Rendered here rather than shipped beside the modules it describes, on the
     # split `vellum.seeds` states: what is copied verbatim is package data, and
@@ -961,19 +862,38 @@ def intent_seed(answers: Answers) -> dict[str, str]:
     # package data, and `vellum/seeds/harness/__init__.py` explains why that
     # matters.
     files["harness/README.md"] = HARNESS_README.format(title=answers.title)
+    # The manifest, LAST, because its `owned:` list is the default for this side
+    # and not a reading of the dict above: `vellum.owned` states ownership as a
+    # table with a reason per row, and a seed that derived it from "whatever was
+    # written" would own `spec/**` the moment an area was added.
+    files[manifest.MANIFEST_RELPATH.as_posix()] = manifest.dump(
+        ref or install.default_ref(), owned.for_side(owned.INTENT)
+    )
     return dict(sorted(files.items()))
 
 
-def product_seed(answers: Answers, commit: str) -> dict[str, str]:
-    """``{repo-relative path: text}`` for the product repo, at the pin *commit*."""
-    return {
-        ".vellum/memory/map.md": MEMORY_MAP.format(intent_slug=answers.intent_slug),
+def product_seed(
+    answers: Answers, commit: str, *, ref: str | None = None
+) -> dict[str, str]:
+    """``{repo-relative path: text}`` for the product repo, at the pin *commit*.
+
+    The product side gets a manifest too, and that is the decision's "on each
+    side of the pair": a product repo carries a Vellum-seeded file — its memory
+    map — and a side with no manifest is a side no upgrade can reason about.
+    """
+    return dict(sorted({
+        ".vellum/memory/map.md": seeds.template(owned.MEMORY_MAP_TEMPLATE).format(
+            intent_slug=answers.intent_slug
+        ),
         ".vellum/product.yaml": PRODUCT_YAML.format(
             intent_slug=answers.intent_slug,
             commit=commit,
             product=answers.product,
         ),
-    }
+        manifest.MANIFEST_RELPATH.as_posix(): manifest.dump(
+            ref or install.default_ref(), owned.for_side(owned.PRODUCT)
+        ),
+    }.items()))
 
 
 #: Where the local half is built when ``--into`` names nowhere. A placeholder in
@@ -1211,7 +1131,7 @@ class Plan:
             "<intent checkout>": str(self.intent_dir),
             "<product checkout>": product,
             "<product clone>": product if self.cloned else f"{product}-clone",
-            "<adopt PR body>": str(self.product_dir / ADOPT_PR_RELPATH),
+            "<adopt PR body>": str(git_dir(self.product_dir) / ADOPT_PR_UNDER_GIT),
             "<adopt base>": self.adopt_base or self.answers.branch,
         }
 
@@ -1306,8 +1226,8 @@ def build_plan(answers: Answers, *, host: str, ref: str, transport: str,
         host=host,
         ref=ref,
         transport=transport,
-        intent_files=tuple(intent_seed(answers)),
-        product_files=tuple(sorted(product_seed(answers, PIN_PLACEHOLDER))),
+        intent_files=tuple(intent_seed(answers, ref=ref)),
+        product_files=tuple(sorted(product_seed(answers, PIN_PLACEHOLDER, ref=ref))),
         stubs=tuple((workflows / s.filename).as_posix() for s in install.SHIPPED),
         steps=tuple(forge_steps(answers, host=host)),
         intent_dir=intent_dir,
@@ -1396,7 +1316,7 @@ def build_intent(directory: Path, answers: Answers, *, host: str, ref: str) -> t
     """
     directory.mkdir(parents=True, exist_ok=True)
     _git(directory, "init", "-q", "-b", answers.branch, ".")
-    write_files(directory, intent_seed(answers))
+    write_files(directory, intent_seed(answers, ref=ref))
     _git(directory, "add", "-A", "--", ".")
     _git(directory, "commit", "-q", "-m",
          f"seed the {answers.product} spec: product, index, "
@@ -1427,6 +1347,33 @@ def _default_branch(repo: Path, fallback: str) -> str:
     if found.returncode == 0 and ref.startswith("origin/"):
         return ref[len("origin/"):]
     return fallback
+
+
+#: Re-exported for ``vellum.upgrade``. An upgrade branches, commits and opens a
+#: pull request with exactly the plumbing an adoption does — same identity
+#: fallback, same "a failure is `I could not answer`, not a traceback", same
+#: reading of a repository's own default branch — and two spellings of that is
+#: how the two come to disagree about which branch they are a guest of.
+git = _git
+default_branch = _default_branch
+
+
+def git_dir(directory: Path) -> Path:
+    """Where this checkout's git directory is: ``.git/`` or a worktree's.
+
+    ``.git`` is a directory in an ordinary clone and a **file** in a worktree
+    (``gitdir: <main>/.git/worktrees/<name>``), so a path built as
+    ``<checkout>/.git/...`` is one ``mkdir`` from a ``NotADirectoryError`` in
+    exactly the checkouts operators use for a side branch. ``rev-parse
+    --git-dir`` answers for both; relative answers are relative to *directory*.
+    A checkout git cannot read falls back to ``.git/`` so the caller's error is
+    about the write, not about this lookup.
+    """
+    found = _git(directory, "rev-parse", "--git-dir", check=False)
+    if found.returncode != 0 or not found.stdout.strip():
+        return Path(directory) / ".git"
+    where = Path(found.stdout.strip())
+    return where if where.is_absolute() else Path(directory) / where
 
 
 def _check_adoption(directory: Path, answers: Answers) -> str:
@@ -1487,7 +1434,9 @@ def _check_adoption(directory: Path, answers: Answers) -> str:
     return base
 
 
-def build_product(directory: Path, answers: Answers, pin: str) -> str | None:
+def build_product(
+    directory: Path, answers: Answers, pin: str, *, ref: str | None = None
+) -> str | None:
     """Build and commit the product checkout. Returns the adoption's base.
 
     Greenfield creates it. The brownfield shapes put ``.vellum/`` on
@@ -1517,7 +1466,7 @@ def build_product(directory: Path, answers: Answers, pin: str) -> str | None:
         # out — so the pair would silently adopt onto somebody else's feature
         # branch and open a pull request carrying its commits.
         _git(directory, "checkout", "-q", "-b", ADOPT_BRANCH, base)
-    seed = product_seed(answers, pin)
+    seed = product_seed(answers, pin, ref=ref)
     write_files(directory, seed)
     # Exactly the seeded paths, never `add -A`. This directory may be the
     # operator's own checkout, and `-A` sweeps whatever is in it — which is the
@@ -1587,16 +1536,24 @@ class Gh:
     path: str
 
     def run(self, argv: Sequence[str], *, stdin: str | None = None,
-            check: bool = True) -> subprocess.CompletedProcess:
+            check: bool = True, cwd: str | Path | None = None) -> subprocess.CompletedProcess:
         """One ``gh`` (or ``git``) invocation. List arguments, no shell.
 
         *stdin* is the one place a secret value appears, and it appears nowhere
         else: not in ``argv``, not in this object, not in any report. The
         subprocess reads it from a pipe, so it is never in ``/proc/<pid>/cmdline``
         and never in a shell history.
+
+        *cwd* matters for one reason and it is not cosmetic: ``gh`` resolves
+        *which repository* a command is about from the directory it runs in, and
+        the default here is this process's — wherever the operator happened to
+        be standing. A caller acting on a specific checkout passes it, and names
+        the repository with ``--repo`` as well, so neither the directory nor the
+        remote alone decides where a pull request is opened.
         """
         command = [self.path if argv[0] == "gh" else argv[0], *argv[1:]]
-        proc = subprocess.run(command, input=stdin, capture_output=True, text=True)
+        proc = subprocess.run(command, input=stdin, capture_output=True, text=True,
+                              cwd=str(cwd) if cwd is not None else None)
         if check and proc.returncode != 0:
             raise ProvisionError(
                 f"`{' '.join(_quote(a) for a in argv)}` exited {proc.returncode}: "
@@ -1669,15 +1626,16 @@ surveyed areas, so normal work continues while the survey proceeds.
 
 
 def _write_adopt_body(directory: Path, answers: Answers, base: str) -> Path:
-    """The adoption pull request's body, in the product checkout, uncommitted.
+    """The adoption pull request's body, under the checkout's ``.git/``.
 
     In the checkout rather than in a temporary directory that is deleted on the
     way out, because the manual rung's checklist names this path: an operator
-    reaching the ``gh pr create`` line needs the file to still be there. It is
-    written after the adoption commit and never added, so the branch carries the
-    two seeded files and nothing else.
+    reaching the ``gh pr create`` line needs the file to still be there. Under
+    ``.git/`` rather than in the tree, because a file that survives the command
+    and sits in the tree is an untracked file every later dirty-tree check
+    refuses on — and this one lands in a repository Vellum is a guest in.
     """
-    path = directory / ADOPT_PR_RELPATH
+    path = git_dir(directory) / ADOPT_PR_UNDER_GIT
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         ADOPT_PR_BODY.format(shape=answers.shape, intent_slug=answers.intent_slug,
@@ -1880,7 +1838,7 @@ def run(
             # says what to do with it.
             if gh is not None:
                 _take(gh, [s for s in plan.steps if s.before], places, taken=taken)
-            adopt_base = build_product(product_dir, answers, pin)
+            adopt_base = build_product(product_dir, answers, pin, ref=pinned)
             if adopt_base is not None:
                 # Now that the clone is here, the pull request's base is the
                 # repository's own default branch rather than `--branch`, and
@@ -2168,10 +2126,11 @@ def run_provision(args, out=None) -> int:
 
 
 __all__ = [
-    "ADOPT_BRANCH", "ADOPT_PR_RELPATH", "RESERVED_AREAS",
+    "git_dir",
+    "ADOPT_BRANCH", "ADOPT_PR_RELPATH", "ADOPT_PR_UNDER_GIT", "RESERVED_AREAS",
     "Answers", "Console", "ForgeStep", "Gh", "Plan",
     "PRODUCT_SECRET", "INTENT_SECRET", "ProvisionError", "SHAPES",
     "VISIBILITIES", "build_plan", "check_seed", "detect_gh", "first_spec_commit",
-    "forge_steps", "intent_seed", "product_seed", "requested", "resolve", "run",
-    "run_provision",
+    "default_branch", "forge_steps", "git", "intent_seed", "product_seed",
+    "requested", "resolve", "run", "run_provision",
 ]

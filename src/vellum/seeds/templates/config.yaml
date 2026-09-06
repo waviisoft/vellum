@@ -1,0 +1,70 @@
+# Vellum installation config. One config governs this intent repo and every
+# product repo under it, because the values in it are installation policy rather
+# than product code.
+#
+# Written by `vellum init` with the installation defaults. Every key the CLI
+# reads today is here with the command that reads it named beside it; the rest
+# is the v1 shape, reserved so a later feature is implementation rather than
+# migration. A key the CLI reads is an error when it is MISSING, never a
+# silent default — a gate that turns itself off when its key is misspelled is
+# not a gate.
+
+# Decorative names for spec versions. A version is a commit; this is the prefix
+# the `spec-v<N>` tag beside it carries.
+version_prefix: spec-v
+
+release:
+  policy: batched            # continuous | batched | train
+  channels: [production]     # canary and lines are reserved
+
+budgets:
+  # read by `vellum budget`
+  per_item_usd: 10
+  period_usd: 250
+  period: monthly            # daily | weekly | monthly
+  # read by `vellum backpressure`: unshipped spec versions before the gate
+  # reports blocked. Start loose — early intent naturally outruns early product.
+  divergence_cap: 3
+  verifier_round_trips: 3
+  concurrent_implementers: 2
+  lease_minutes: 60          # a claim's lifetime before it lapses
+
+questions:
+  # read by `vellum tick`: how long a parked question waits before it escalates
+  timebox_hours: 24
+  delivery: github-native
+
+flake:
+  retries: 2
+  quarantine_label: scenario-bug
+
+labels:
+  spec: [spec:feature, spec:fix, spec:clarify, spec:redefining]
+  escalation: [needs-human, question]
+  ideation: [backlog]
+
+dependency_policy:
+  # read by `vellum verify deps`: the registries a dependency may come from.
+  # A new or changed dependency is a verifier red-flag item
+  # (spec/behaviors/security.md); set this to the registries this product
+  # actually uses before the first dependency lands.
+  registries: [pypi.org]
+  lockfile_required: true
+
+write_boundaries:
+  # read by `vellum verify boundaries <intent-checkout> --role <role>`: the
+  # trees each of THIS repo's roles may write. The same block a product repo
+  # carries in .vellum/product.yaml, here because the intent repo has no
+  # product file (spec/behaviors/write-boundaries.md). Entries are
+  # repo-relative path prefixes matched component-wise; "", ".", "/", an
+  # absolute path and ".." are all refused as tree-widening.
+  harness-engineer: [harness]
+  librarian: [ledger, .vellum/memory]
+
+executors:
+  # Bind roles to executors; first available claims. Reserved until this
+  # installation runs agents.
+  {}
+
+roles:
+  {}

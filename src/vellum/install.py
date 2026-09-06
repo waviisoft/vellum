@@ -82,6 +82,26 @@ while the ``@<ref>`` half — part of a longer scalar — stayed a string, so a
 *freshly stamped* installation failed its own doctor with ``ref-mismatch``.
 ``REF_RE`` forbids quotes, so nothing a caller passes can escape them.
 
+The manifest, and why a stamp writes one
+----------------------------------------
+``spec/features/installation.md``: the manifest is "written at provisioning and
+by every stamp and upgrade". A stamp's half of that is small and deliberately
+so. It **refreshes the release line** — the installation has just been brought
+to the ref it pinned — and, over an installation that has no manifest at all, it
+writes one whose owned set is **the stubs and nothing else**. Not the rest of a
+seed: a stamp runs in a checkout whose repos already existed and cannot know
+whether that tree came from a Vellum seed or from the installation's own hand,
+and answering anyway would be exactly the inference from history the decision
+refused (``spec/decisions/2026-09-04-vellum-owned-files-and-upgrades.md``). The
+report says so in a line, because an owned set narrower than the operator
+expected is worth one sentence at the moment it is written.
+
+A stamp that left a stub alone refreshes **nothing**. The release line is a
+claim that the installation *was brought to* that ref, and a run that declined
+to rewrite a stub did not bring it anywhere; recording the ref anyway would make
+the next upgrade compare that stub against the wrong release's template — which
+is the one mistake this file exists to make impossible.
+
 What a checkout cannot know
 ---------------------------
 Two things, said rather than passed over (``spec/features/installation.md``):
@@ -106,6 +126,7 @@ from pathlib import Path
 import yaml
 
 from vellum import __version__
+from vellum import manifest
 from vellum.gitver import GitUnavailable, tags
 from vellum.text import one_line
 from vellum.workspace import SLUG_RE, WorkspaceError, forge as workspace_forge
@@ -532,6 +553,29 @@ class Stamp:
     outcome: str
 
 
+#: What a stamp did about ``.vellum/install.yaml``. Four outcomes rather than
+#: two, because the operator needs to tell "written for the first time, and here
+#: is the narrow owned set you got" from "refreshed" from "deliberately not
+#: touched, because a stub was left alone".
+MANIFEST_WROTE = "wrote"
+MANIFEST_REFRESHED = "refreshed"
+MANIFEST_CURRENT = "already current"
+MANIFEST_HELD = "left alone"
+
+
+@dataclass
+class ManifestStamp:
+    """What ``init`` did about the installation manifest, and why."""
+
+    path: Path
+    outcome: str
+    #: The release line the manifest now carries, or None when it was not written.
+    release: str | None = None
+    #: Present on :data:`MANIFEST_WROTE` and :data:`MANIFEST_HELD`: the sentence
+    #: the report prints under the outcome.
+    note: str = ""
+
+
 @dataclass
 class Init:
     """One run of ``vellum init``."""
@@ -545,6 +589,7 @@ class Init:
     branch: str
     currency: Currency
     stamps: list[Stamp]
+    manifest: ManifestStamp | None = None
 
     def report(self) -> str:
         lines = [
@@ -588,6 +633,15 @@ class Init:
                 "difference here and no finding there."
             )
         lines.append("")
+        if self.manifest is not None:
+            lines.append(
+                f"Manifest ({manifest.MANIFEST_RELPATH.as_posix()}): "
+                f"{self.manifest.outcome}"
+                + (f", vellum: {self.manifest.release}" if self.manifest.release else "")
+            )
+            if self.manifest.note:
+                lines.append(f"  {self.manifest.note}")
+            lines.append("")
         lines.append(f"Pinned ref {self.ref}: {self.currency.about(self.ref)}.")
         if self.ref == default_ref() and self.currency.newest is None:
             lines.append(
@@ -690,7 +744,85 @@ def init(
         branch=branch,
         currency=currency(releases_from),
         stamps=stamps,
+        manifest=stamp_manifest(root, ref=pinned, stamps=stamps),
     )
+
+
+def stamp_manifest(root: Path, *, ref: str, stamps: list[Stamp]) -> ManifestStamp:
+    """Write or refresh ``.vellum/install.yaml`` after a stamp.
+
+    The rule is one sentence: **the release line is a claim that the
+    installation was brought to that ref**, so a run that left a stub alone
+    records nothing. Everything else here follows from it — a stamp over an
+    installation with no manifest writes one whose owned set is the stubs and
+    nothing else, because those are the only files this command wrote and the
+    only ones it can honestly say Vellum owns.
+
+    The same sentence is why an owned set wider than the stubs **holds** the
+    release line rather than refreshing it. A stamp writes the stubs and nothing
+    else: it does not read `.vellum/config.yaml` or the harness machinery, let
+    alone bring them to *ref*. Refreshing the line anyway would move the release
+    every owned file is compared against while leaving those files at the
+    release before it — so the next `vellum upgrade --to <ref>` would find every
+    one of them differing from *ref*'s template and refuse the whole set as
+    edits this installation had made. `vellum upgrade` is the command that moves
+    them, and it restamps the stubs itself on the way.
+    """
+    path = manifest.path_for(root)
+    if any(stamp.outcome == LEFT for stamp in stamps):
+        return ManifestStamp(path, MANIFEST_HELD, note=(
+            "a stub exists and differs and was not restamped, so this "
+            "installation has not been brought to " + ref + ". Recording the "
+            "release anyway would leave the next upgrade comparing that stub "
+            "against the wrong release's template. `vellum init --force` "
+            "restamps, and then this is refreshed."
+        ))
+    # A malformed manifest is "I could not answer", not something to overwrite:
+    # the file records which files are the INSTALLATION'S, and replacing an
+    # unreadable one with a default would silently take back ownership of every
+    # file the operator had removed from it.
+    existing = manifest.read(root)
+    owned = (
+        existing.owned if existing is not None
+        else tuple(sorted(
+            stamp.path.relative_to(root).as_posix() for stamp in stamps
+        ))
+    )
+    # Compared as DATA, not as text. A manifest an operator has reflowed or
+    # commented carries the same two claims, and rewriting it to canonicalise
+    # them would make this command edit a file it had nothing to say about —
+    # which is the same rule that leaves a hand-edited stub alone.
+    if existing is not None and existing.release == ref and existing.owned == owned:
+        return ManifestStamp(path, MANIFEST_CURRENT, release=ref)
+    # The release line is a claim about the FILES, and a stamp only ever wrote
+    # the stubs. So it may refresh the line only for an installation whose owned
+    # set is stubs and nothing else; anything wider is `vellum upgrade`'s to
+    # move, and moving it here would arm a refusal for every other owned file.
+    # "The files a stamp writes" is not a table to consult: it is the stamps
+    # this run just made.
+    stubs = {stamp.path.relative_to(root).as_posix() for stamp in stamps}
+    if existing is not None and existing.release != ref and not set(owned) <= stubs:
+        outside = sorted(set(owned) - stubs)
+        return ManifestStamp(path, MANIFEST_HELD, release=existing.release, note=(
+            f"this installation owns {len(outside)} file(s) a stamp does not "
+            f"write ({one_line(', '.join(outside))}), so the release line stays "
+            f"at {existing.release}. A stamp brings the STUBS to {ref} and "
+            f"nothing else; recording {ref} would leave `vellum upgrade` "
+            f"comparing those files against {ref}'s templates and refusing every "
+            f"one of them as an edit. `vellum upgrade --to {ref}` moves the "
+            f"files and the line together, and restamps the stubs on the way."
+        ))
+    manifest.write(root, ref, owned)
+    if existing is not None:
+        return ManifestStamp(path, MANIFEST_REFRESHED, release=ref)
+    return ManifestStamp(path, MANIFEST_WROTE, release=ref, note=(
+        f"this installation had no manifest, so one was written with the "
+        f"{len(owned)} caller stub(s) as the owned set and nothing else. A stamp "
+        f"runs in a checkout whose repos already existed and cannot know whether "
+        f"the rest of the tree came from a Vellum seed or from your own hand — "
+        f"add the seeded files you want upgrades to rewrite "
+        f"(`{manifest.OWNED_KEY}:`), or leave it as it is and they stay yours."
+    ))
 
 
 def run_init(
@@ -784,30 +916,38 @@ def _comparable_on(block):
 
 def inspect(
     path: Path, shipped: Shipped, *, host: str, forge: str, relative: str
-) -> tuple[list[Finding], str | None]:
-    """Read one installed stub. Returns its findings and the ref it pins."""
+) -> tuple[list[Finding], str | None, str | None]:
+    """Read one installed stub: its findings, the ref it pins, the CLI it installs.
+
+    Two refs come back and they answer two different questions. The first is the
+    ``@<ref>`` on the ``uses:`` line — which *workflow file* runs. The second is
+    the ``vellum-ref:`` input — which *CLI* that workflow installs, and the one
+    the compatibility line compares against the CLI running doctor. They are
+    stamped equal and ``ref-mismatch`` reports when they have come apart, so
+    reading whichever was handy would have been right until the day it was not.
+    """
     found: list[Finding] = []
     try:
         text = path.read_text(encoding="utf-8")
     except UnicodeDecodeError as exc:
         # A ValueError, not an OSError. Uncaught it left the command exiting 1
         # with a traceback, which is the one code that must mean "a finding".
-        return [Finding(relative, "unparseable", f"is not UTF-8 text: {one_line(exc)}")], None
+        return [Finding(relative, "unparseable", f"is not UTF-8 text: {one_line(exc)}")], None, None
     except OSError:
         return [Finding(relative, "missing", (
             f"no stub for the shipped workflow {shipped.name!r}. `vellum init` "
             f"stamps one; without it that half of the pipeline never runs."
-        ))], None
+        ))], None, None
     try:
         data = yaml.safe_load(text)
     except yaml.YAMLError as exc:
-        return [Finding(relative, "unparseable", f"not valid YAML: {one_line(exc)}")], None
+        return [Finding(relative, "unparseable", f"not valid YAML: {one_line(exc)}")], None, None
     if not isinstance(data, dict):
-        return [Finding(relative, "unparseable", "not a YAML mapping, so not a workflow")], None
+        return [Finding(relative, "unparseable", "not a YAML mapping, so not a workflow")], None, None
 
     jobs = _jobs(data)
     if jobs is None:
-        return [Finding(relative, "unparseable", "declares no `jobs:` mapping")], None
+        return [Finding(relative, "unparseable", "declares no `jobs:` mapping")], None, None
 
     # ------------------------------------------------------------------
     # The caller half, compared against what ships.
@@ -890,7 +1030,7 @@ def inspect(
             f"{one_line(', '.join(named)) or '(nothing)'}. "
             f"A stub names the shipped workflow it stands for."
         )))
-        return found, None
+        return found, None, None
 
     # ------------------------------------------------------------------
     # The delegating job's OWN keys.
@@ -1019,7 +1159,81 @@ def inspect(
             + ". One installation runs one version of both; `vellum init --ref "
               "<ref> --force` restamps them together."
         )))
-    return found, ref
+    return found, ref, (passed if isinstance(passed, str) else None)
+
+
+def installed_shape(root: Path, forge: str) -> tuple[str, str]:
+    """The host and the branch the stubs already installed in *root* carry.
+
+    Read back rather than assumed, because both are the **installation's** and
+    not this product's. ``--branch`` exists for exactly that reason (see
+    ``_comparable_on``): an installation whose default branch is ``trunk`` is not
+    a drifted one. ``--from`` is the same claim about the host — a fork, or an
+    internal mirror. ``vellum upgrade`` re-renders these stubs to ask whether the
+    installation has edited them, and rendering them with this product's
+    defaults instead of the installation's would report every such installation
+    as having edited all three.
+
+    Best effort by design: an unreadable or unparseable stub falls back to the
+    defaults, because the caller is about to compare against the render either
+    way and ``doctor`` is the command whose job is saying a stub is unreadable.
+    """
+    host, branch = HOST_REPO, DEFAULT_BRANCH
+    directory = root / WORKFLOWS_DIR[forge]
+    for shipped in SHIPPED:
+        try:
+            text = (directory / shipped.filename).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        found_host, _, found_branch = stub_shape(text, forge)
+        if found_host is not None:
+            host = found_host
+        # The branch list lives on `on-spec-merge` alone; the other two carry no
+        # branch at all, so reading "the first stub with an `on:`" would find
+        # nothing and quietly keep the default.
+        if found_branch is not None:
+            branch = found_branch
+    return host, branch
+
+
+def stub_shape(text: str, forge: str) -> tuple[str | None, str | None, str | None]:
+    """The host, the pinned ref and the watched branch ONE caller stub carries.
+
+    Split out of :func:`installed_shape` because ``vellum upgrade`` needs the
+    third value per file rather than the first two across the set: it compares
+    each stub against a render **at the ref that stub itself pins**, so that an
+    installation whose three stubs were restamped at different times is not
+    reported as having edited the ones that moved.
+
+    None for a value this stub does not carry, and None all round for text that
+    is not a parseable workflow: the caller is comparing against a render either
+    way, and ``doctor`` is the command whose job is saying a stub is unreadable.
+    """
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return None, None, None
+    if not isinstance(data, dict):
+        return None, None, None
+    prefix = f"/{WORKFLOWS_DIR[forge].as_posix()}/"
+    host = ref = branch = None
+    for job in (_jobs(data) or {}).values():
+        uses = job.get("uses") if isinstance(job, dict) else None
+        if not isinstance(uses, str) or prefix not in uses:
+            continue
+        candidate, _, rest = uses.partition(prefix)
+        if SLUG_RE.match(candidate):
+            host = candidate
+        pinned = rest.partition("@")[2]
+        if REF_RE.match(pinned):
+            ref = pinned
+    push = (_caller_half(data).get("on") or {})
+    branches = push.get("push", {}).get("branches") if isinstance(push, dict) else None
+    if isinstance(branches, list) and branches:
+        first = str(branches[0])
+        if REF_RE.match(first):
+            branch = first
+    return host, ref, branch
 
 
 def strays(directory: Path, *, host: str, known: set[str], relative_to: Path) -> list[Finding]:
@@ -1092,29 +1306,56 @@ class Doctor:
     host: str
     intent: str
     currency: Currency
-    #: ``(relative path, findings, pinned ref)`` per shipped workflow, in the
-    #: order they ship. No ``Shipped`` beside the path: nothing reads one.
-    stubs: list[tuple[str, list[Finding], str | None]]
+    #: ``(relative path, findings, pinned ref, installed CLI ref)`` per shipped
+    #: workflow, in the order they ship. No ``Shipped`` beside the path: nothing
+    #: reads one.
+    stubs: list[tuple[str, list[Finding], str | None, str | None]]
     #: Findings about files under the workflows directory that are not stubs.
     strays: list[Finding] = field(default_factory=list)
+    #: Findings about ``.vellum/install.yaml``: absent, or malformed.
+    manifest: list[Finding] = field(default_factory=list)
 
     @property
     def findings(self) -> list[Finding]:
-        return [f for _, found, _ in self.stubs for f in found] + self.strays
+        return (
+            [f for _, found, _, _ in self.stubs for f in found]
+            + self.strays
+            + self.manifest
+        )
+
+    @property
+    def manifest_line(self) -> str:
+        """The manifest's two claims, for the header. Read once, in `doctor`."""
+        if self.manifest:
+            return f"[{self.manifest[0].code}] — see the findings below"
+        try:
+            found = manifest.read(self.checkout)
+        except manifest.ManifestError:  # pragma: no cover - `manifest` holds it
+            return "unreadable"
+        return (
+            f"brought to {found.release}; Vellum owns {len(found.owned)} path(s)"
+            if found is not None else "none"
+        )
 
     def report(self) -> str:
         lines = [
             f"vellum doctor — {self.forge} caller stubs in {self.checkout}",
             f"  intent repo:  {self.intent}",
             f"  shipped from: {self.host}",
+            f"  manifest:     {self.manifest_line}",
             "",
         ]
-        for relative, found, ref in self.stubs:
+        for relative, found, ref, _ in self.stubs:
             mark = "FINDING" if found else "ok"
             lines.append(f"  {mark:<8} {relative}"
                          + (f"  @{ref}" if ref else ""))
             for finding in found:
                 lines.append(f"           - [{finding.code}] {finding.detail}")
+        for finding in self.manifest:
+            lines.append(f"  {'FINDING':<8} {finding.file}")
+            lines.append(f"           - [{finding.code}] {finding.detail}")
+        if not self.manifest:
+            lines.append(f"  {'ok':<8} {manifest.MANIFEST_RELPATH.as_posix()}")
         for finding in self.strays:
             lines.append(f"  {'FINDING':<8} {finding.file}")
             lines.append(f"           - [{finding.code}] {finding.detail}")
@@ -1148,18 +1389,103 @@ class Doctor:
             # findings above it.
             lines.append(f"  not checked: {self.currency.unknown}")
         else:
-            for relative, _, ref in self.stubs:
+            for relative, _, ref, _ in self.stubs:
                 if ref is None:
                     continue
                 lines.append(f"  {relative}: {self.currency.about(ref)}")
-        lines.append(
-            "  An installation behind the newest release is divergence to "
-            "summarise, not a broken install; upgrading is `vellum init --ref "
-            "<newer> --force`."
-        )
+        lines += self.upgrade_advice()
+        lines.append("")
+        lines += self.compatibility()
         lines.append("")
         lines += CANNOT_KNOW
         return "\n".join(lines)
+
+    def upgrade_advice(self) -> list[str]:
+        """How THIS installation moves to a newer release — not how one does.
+
+        The distinction is the whole line. ``vellum init --ref <newer> --force``
+        moves the stubs, and for an installation that owns only stubs that is
+        the whole of an upgrade. For one that owns seeded files too it is half
+        of it, and the wrong half to advertise: a stamp writes the stubs and
+        does not touch `.vellum/config.yaml` or the harness machinery, so
+        ``stamp_manifest`` deliberately holds the release line for such an
+        installation rather than moving it out from under files nobody rewrote.
+        Advice that named `--force` anyway would send an operator to a command
+        that cannot do what they asked for.
+        """
+        head = (
+            "  An installation behind the newest release is divergence to "
+            "summarise, not a broken install; upgrading an installation's FILES "
+            "is `vellum upgrade --to <newer>`"
+        )
+        stubs_only = (
+            head + ", and its stubs alone is `vellum init --ref <newer> --force`."
+        )
+        try:
+            found = manifest.read(self.checkout)
+        except manifest.ManifestError:
+            return [stubs_only]
+        if found is None:
+            return [stubs_only]
+        stubs = {(WORKFLOWS_DIR[self.forge] / s.filename).as_posix() for s in SHIPPED}
+        outside = sorted(set(found.owned) - stubs)
+        if not outside:
+            return [stubs_only]
+        return [
+            head + ".",
+            f"  `vellum init --ref <newer> --force` is NOT the second half of "
+            f"that here: this installation owns {len(outside)} file(s) a stamp "
+            f"does not write ({one_line(', '.join(outside))}), so a stamp "
+            f"restamps the stubs and leaves the manifest's release line where it "
+            f"is. Moving the line without the files would make the next upgrade "
+            f"refuse every one of them as an edit.",
+        ]
+
+    def compatibility(self) -> list[str]:
+        """The third pin: this CLI against the CLI the stubs install in CI.
+
+        ``spec/features/installation.md``: "`doctor` also reports — never fails
+        on — the operator's local CLI version against the ref the stubs install
+        in CI, beside the ref-currency line." The two drift apart by design and
+        neither is wrong for it: a stub's ``vellum-ref`` moves when somebody
+        restamps the installation, and the operator's ``pip install`` moves when
+        they say so. What costs an afternoon is not knowing they had — a command
+        that behaves one way here and another in the run it is supposed to
+        reproduce — so this is printed on a green run too, like everything else
+        under "reported, never failed on".
+
+        It compares ``vellum-ref``, not the ``@<ref>``: that input is what the
+        shipped workflow actually installs the CLI from, and it is the one this
+        line is about. ``ref-mismatch`` is the finding for the two coming apart.
+        """
+        local = default_ref()
+        lines = [
+            "Local CLI against the CLI the stubs install (reported, never failed on):",
+            f"  this CLI: {local} (`vellum --version` reports {__version__})",
+        ]
+        seen = False
+        for relative, _, _, cli_ref in self.stubs:
+            if cli_ref is None:
+                continue
+            seen = True
+            lines.append(
+                f"  {relative}: installs {cli_ref}"
+                + (" — the same" if cli_ref == local else
+                   f" — NOT this CLI. Runs of that stub execute {cli_ref}; this "
+                   f"checkout's `vellum` is {local}.")
+            )
+        if not seen:
+            lines.append(
+                f"  no stub names a `{REF_INPUT}`, so there is nothing to compare "
+                f"this CLI against."
+            )
+        lines.append(
+            "  Neither is wrong for being different — a stub moves when somebody "
+            "restamps and a local CLI moves when somebody installs — so this is "
+            "reported and never failed on. `pip install` the ref above, or "
+            "`vellum init --ref <this CLI> --force`, to make them one."
+        )
+        return lines
 
 
 def doctor(
@@ -1193,11 +1519,11 @@ def doctor(
     stubs = []
     for shipped in SHIPPED:
         relative = (directory / shipped.filename).as_posix()
-        found, ref = inspect(
+        found, ref, cli_ref = inspect(
             root / directory / shipped.filename, shipped,
             host=host, forge=chosen, relative=relative,
         )
-        stubs.append((relative, found, ref))
+        stubs.append((relative, found, ref, cli_ref))
     return Doctor(
         checkout=root, forge=chosen, host=host, intent=intent_slug,
         currency=currency(releases_from), stubs=stubs,
@@ -1205,7 +1531,49 @@ def doctor(
             root / directory, host=host,
             known={s.filename for s in SHIPPED}, relative_to=directory,
         ),
+        manifest=manifest_findings(root, chosen),
     )
+
+
+def manifest_findings(root: Path, forge: str = "github") -> list[Finding]:
+    """Findings about ``.vellum/install.yaml``: absent, or malformed.
+
+    A finding rather than a report, and the difference from ref currency beside
+    it is the point. Currency is a fact about the *world* — what the newest
+    release is — which an installation can be behind without being broken. A
+    missing manifest is a fact about the *checkout*: nothing in it says which
+    files Vellum may rewrite, so ``vellum upgrade`` cannot run at all and the
+    next release lands by hand. That is installed-not-matching-shipped, which is
+    what this command's exit code means (``spec/features/installation.md``).
+
+    Every installation provisioned before the release that introduced the
+    manifest sees this finding exactly once, so the detail names the fix and
+    spells out what that fix will mark owned — an operator reading "run `vellum
+    init`" without the second half has to run it to find out what it claimed.
+    """
+    relative = manifest.MANIFEST_RELPATH.as_posix()
+    stubs = sorted((WORKFLOWS_DIR[forge] / s.filename).as_posix() for s in SHIPPED)
+    try:
+        found = manifest.read(root)
+    except manifest.ManifestError as exc:
+        return [Finding(relative, "manifest-malformed", (
+            f"{one_line(str(exc))} Until it reads, `vellum upgrade` has no "
+            f"ownership data and refuses to guess at any."
+        ))]
+    if found is None:
+        return [Finding(relative, "no-manifest", (
+            f"this installation carries no manifest, so nothing says which files "
+            f"Vellum owns and `vellum upgrade` cannot run. The fix is `vellum "
+            f"init {root}`, which writes one recording this CLI's ref and these "
+            f"{len(stubs)} caller stub(s) as the owned set: {', '.join(stubs)}. "
+            f"It marks nothing else — a stamp cannot know whether the rest of "
+            f"the tree came from a Vellum seed or from your own hand — so the "
+            f"seeded files you want upgrades to rewrite are yours to add to "
+            f"`{manifest.OWNED_KEY}:` afterwards. Every installation provisioned "
+            f"before the manifest existed sees this once "
+            f"(spec/features/installation.md)."
+        ))]
+    return []
 
 
 def run_doctor(
