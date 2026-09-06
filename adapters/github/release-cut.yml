@@ -1,0 +1,61 @@
+# release-cut — the caller stub. Stamped by `vellum init`; edit the ref, not the body.
+#
+# The logic is a reusable workflow in waviisoft/vellum, pinned below. A stub holds
+# no logic, so it has nothing to drift: upgrading this installation is bumping
+# the ref on the two lines that carry it — `vellum init --ref <new> --force` —
+# and `vellum doctor` checks that what is installed is what ships. A `run:` or a
+# second job here is a finding, not a customisation
+# (spec/features/installation.md).
+#
+# The release tag a version bump mints, pushed by the forge and never by hand
+# (spec/features/release-tags.md). `vellum release tag` reads the `release:`
+# block in `.vellum/product.yaml` — the version source, and the changelog that
+# must describe it — and names the tag and the commit; this workflow is what
+# creates and pushes it. A used name is reported and left alone, so a merge
+# that does not bump the version is a no-op.
+#
+# THE PRODUCT SIDE'S STUB. The other three run in the intent repo; this one
+# runs here, in the repo whose version it is.
+#
+# NO `paths:` FILTER, DELIBERATELY. A version bump is a change to whatever file
+# the `release:` block names, and an installation may name any file at all — so
+# a filter written here would be this product guessing at that declaration.
+# `vellum release tag` is what decides there is nothing to do, and it decides it
+# in a few seconds.
+
+name: release-cut
+
+on:
+  push:
+    branches: ["main"]
+
+# Granted here because a called workflow's token can only be narrowed by the
+# callee, never widened. `contents: write` is what pushes the tag; nothing else
+# in the called workflow writes anything. Tag protection on `v*` — a forge
+# setting, not a repository one — withholds this from the workflow token, and
+# nothing in either checkout can see that it has.
+permissions:
+  contents: write
+
+# Serialised, and never cancelled. Two runs racing on the same push would
+# both compute the same name and both try to create it; the loser fails a push
+# nobody needed. Cancelling in progress would be worse — a run cancelled
+# between `git tag` and `git push` leaves the name minted nowhere.
+concurrency:
+  group: release-cut
+  cancel-in-progress: false
+
+jobs:
+  release-cut:
+    uses: waviisoft/vellum/.github/workflows/release-cut.yml@v0.3.0
+    with:
+      # The ref the CLI itself is checked out and installed from, kept equal to
+      # the ref above so one installation runs one version of both. QUOTED: a
+      # bare `1.10`, `010`, `null`, `true` or `on` is not a string to a YAML
+      # reader, and an installation stamped with one failed its own doctor.
+      vellum-ref: "v0.3.0"
+    # By name, never `secrets: inherit`: the reusable workflow holds exactly the
+    # credential its jobs name and nothing else in this installation
+    # (spec/features/installation.md).
+    secrets:
+      VELLUM_TOKEN: ${{ secrets.VELLUM_TOKEN }}

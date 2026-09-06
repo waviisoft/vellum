@@ -753,20 +753,27 @@ def _add_install(sub) -> None:
     """
     init = sub.add_parser(
         "init",
-        help="stamp the forge's caller stubs into an intent checkout",
+        help="stamp the forge's caller stubs into either side of a pair",
         description=(
-            "Run in an intent checkout whose repos already exist. Reads the intent "
-            "slug, the products and the forge from `.vellum/workspace.yaml` and "
-            "writes one caller stub per shipped workflow, pinned to --ref or, by "
-            "default, this CLI's own version. Idempotent: over an installed "
-            "checkout it writes nothing and says so. A stub that exists and "
-            "differs is reported and left alone unless --force is given. Exits 0 "
-            "whether it wrote or had nothing to do, and 2 when it cannot answer — "
-            "no workspace file, a forge it has no stubs for."
+            "Run in an intent or product checkout whose repos already exist. "
+            "Which side it is, is read off the checkout and never given: an "
+            "INTENT checkout (`.vellum/workspace.yaml`) gets the three stubs "
+            "that run there — spec-ci, on-spec-merge, harness-ci — and the "
+            "intent slug, products and forge are read from that file; a PRODUCT "
+            "checkout (`.vellum/product.yaml`) gets `release-cut`, the stub that "
+            "tags a version bump. Each is pinned to --ref or, by default, this "
+            "CLI's own version. Idempotent: over an installed checkout it writes "
+            "nothing and says so. A stub that exists and differs is reported and "
+            "left alone unless --force is given. Exits 0 whether it wrote or had "
+            "nothing to do, and 2 when it cannot answer — a checkout that is "
+            "neither side, a forge it has no stubs for."
         ),
     )
     init.add_argument(
-        "checkout", nargs="?", default=".", help="the intent repo checkout (default: .)"
+        "checkout", nargs="?", default=".",
+        help="the installation checkout, either side of the pair (default: .). "
+             "An intent checkout gets the three stubs that run there; a product "
+             "checkout gets `release-cut`",
     )
     init.add_argument(
         "--ref",
@@ -817,7 +824,18 @@ def _add_install(sub) -> None:
         ),
     )
     doctor.add_argument(
-        "checkout", nargs="?", default=".", help="the intent repo checkout (default: .)"
+        "checkout", nargs="?", default=".",
+        help="the installation checkout, either side of the pair (default: .)",
+    )
+    doctor.add_argument(
+        "--product",
+        dest="product_checkout",
+        help="a product checkout of the same pair, so ONE report covers both "
+             "halves — the intent repo's three stubs and the product repo's "
+             "`release-cut`. A local path is the one fact a checkout cannot "
+             "hold: `.vellum/workspace.yaml` names the product REPOSITORY, not "
+             "where it is checked out here, so this is an input rather than "
+             "something the command finds (as `--releases-from` is)",
     )
     _add_install_common(doctor)
 
@@ -1050,6 +1068,7 @@ def main(argv: list[str] | None = None) -> int:
                 host=args.host,
                 forge=args.forge,
                 releases_from=args.releases_from,
+                product_checkout=args.product_checkout,
             )
     except SpecTreeError as exc:
         print(f"vellum: {exc}", file=sys.stderr)

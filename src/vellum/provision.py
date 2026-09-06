@@ -1067,7 +1067,8 @@ def forge_steps(answers: Answers, *, host: str) -> list[ForgeStep]:
         f"(spec/behaviors/security.md); branch protection stays the operator's "
         f"(spec/features/installation.md, out of scope). Required checks, once "
         f"the stubs have run once, are: "
-        + ", ".join(f"`{s.name} / <job>`" for s in install.SHIPPED),
+        + ", ".join(f"`{s.name} / <job>`"
+                    for s in install.shipped_for(install.INTENT)),
         manual=True,
     ))
     steps.append(ForgeStep(
@@ -1228,7 +1229,11 @@ def build_plan(answers: Answers, *, host: str, ref: str, transport: str,
         transport=transport,
         intent_files=tuple(intent_seed(answers, ref=ref)),
         product_files=tuple(sorted(product_seed(answers, PIN_PLACEHOLDER, ref=ref))),
-        stubs=tuple((workflows / s.filename).as_posix() for s in install.SHIPPED),
+        # The INTENT side's, because provisioning stamps that half: the product
+        # half a seed writes carries no `.github/workflows/` at all, and its
+        # `release-cut` stub arrives when somebody runs `vellum init` in it.
+        stubs=tuple((workflows / s.filename).as_posix()
+                    for s in install.shipped_for(install.INTENT)),
         steps=tuple(forge_steps(answers, host=host)),
         intent_dir=intent_dir,
         product_dir=product_dir,
@@ -2065,10 +2070,25 @@ def _report(plan: Plan, answers: Answers, pin: str, stubs: list[str],
         f"    {product_dir}"
         + (f"  (on {ADOPT_BRANCH})" if answers.adopting else ""),
         "",
-        f"  caller stubs stamped at {plan.ref}:",
+        f"  caller stubs stamped at {plan.ref}, in the intent repo:",
     ]
     lines += [f"    {path}" for path in stubs]
     lines.append("")
+    # The product half's stub is NOT stamped here, and saying so is the point.
+    # `spec/features/release-tags.md` has it "stamped by `vellum init` on the
+    # product side" — a run in that checkout — so provisioning leaves the
+    # product repo with no `.github/workflows/` at all and the operator makes
+    # the second stamp. Left silent, `vellum doctor` in the product checkout
+    # would report a missing stub for a file nobody was told to write.
+    lines += [
+        f"  the product repo's stub is a second stamp, in that checkout:",
+        f"    vellum init {product_dir} --ref {plan.ref}",
+        f"    writes {(install.WORKFLOWS_DIR['github'] / install.RELEASE_CUT.filename).as_posix()},"
+        f" which tags a version bump (spec/features/release-tags.md).",
+        f"    It needs a `release:` block in .vellum/product.yaml naming where"
+        f" the version lives.",
+        "",
+    ]
     if taken:
         lines.append(f"Forge steps taken ({plan.transport}):")
         for number, step in enumerate(taken, start=1):

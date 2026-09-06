@@ -14,6 +14,7 @@ merge back together.
 
 from __future__ import annotations
 
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -25,10 +26,26 @@ from support import (
     make_releases_repo,
     run_cli,
     run_cli_streams,
+    write_product,
     write_workspace,
 )
 from vellum import manifest, owned
-from vellum.install import SHIPPED, WORKFLOWS_DIR, default_ref, render
+from vellum.install import (
+    INTENT,
+    SHIPPED,
+    WORKFLOWS_DIR,
+    default_ref,
+    render,
+    shipped_for,
+)
+
+#: The stubs an INTENT checkout carries. Most of the cases below stamp one and
+#: read its `.github/workflows/` back, and `SHIPPED` is the whole pair's table
+#: now that `release-cut` is stamped on the product side — so an assertion made
+#: over `SHIPPED` here would be asking an intent repo for a stub that is not
+#: its to carry. `SHIPPED` stays where the subject really is the whole table:
+#: the render-drift check over `adapters/github/`, and the ownership table.
+INTENT_SHIPPED = shipped_for(INTENT)
 
 WORKFLOWS = WORKFLOWS_DIR["github"]
 
@@ -53,19 +70,19 @@ class InitStampsTheStubs(InstallCase):
         checkout = self.intent()
         code, out = run_cli(["init", str(checkout)])
         self.assertEqual(code, 0, out)
-        for shipped in SHIPPED:
+        for shipped in INTENT_SHIPPED:
             self.assertTrue(self.stub(checkout, shipped.name).is_file(), shipped.name)
         # Exactly the shipped set: a stub for something that does not ship is a
         # file with no reusable workflow behind it.
         self.assertEqual(
             sorted(p.name for p in (checkout / WORKFLOWS).iterdir()),
-            sorted(s.filename for s in SHIPPED),
+            sorted(s.filename for s in INTENT_SHIPPED),
         )
 
     def test_each_stub_delegates_at_a_pinned_ref(self):
         checkout = self.intent()
         run_cli(["init", str(checkout), "--ref", "v9.9.9"])
-        for shipped in SHIPPED:
+        for shipped in INTENT_SHIPPED:
             text = self.stub(checkout, shipped.name).read_text(encoding="utf-8")
             self.assertIn(
                 f"uses: waviisoft/vellum/{WORKFLOWS.as_posix()}/{shipped.filename}@v9.9.9",
@@ -85,7 +102,7 @@ class InitStampsTheStubs(InstallCase):
         """
         checkout = self.intent()
         run_cli(["init", str(checkout)])
-        for shipped in SHIPPED:
+        for shipped in INTENT_SHIPPED:
             data = yaml.safe_load(self.stub(checkout, shipped.name).read_text("utf-8"))
             (job,) = data["jobs"].values()
             self.assertEqual(
@@ -126,7 +143,7 @@ class InitStampsTheStubs(InstallCase):
         run_cli(["init", str(checkout), "--ref", "v0.1.0"])
         code, out = run_cli(["init", str(checkout), "--ref", "v0.2.0", "--force"])
         self.assertEqual(code, 0, out)
-        for shipped in SHIPPED:
+        for shipped in INTENT_SHIPPED:
             text = self.stub(checkout, shipped.name).read_text(encoding="utf-8")
             self.assertIn("@v0.2.0", text)
             self.assertNotIn("@v0.1.0", text)
@@ -243,7 +260,7 @@ class DoctorOverAFreshCheckout(InstallCase):
         checkout = self.intent()
         code, out = run_cli(["doctor", str(checkout)])
         self.assertEqual(code, 1, out)
-        for shipped in SHIPPED:
+        for shipped in INTENT_SHIPPED:
             self.assertIn(shipped.filename, out)
         self.assertIn("missing", out)
 
@@ -758,7 +775,7 @@ class TheDelegatingJobCarriesNothingOfItsOwn(InstallCase):
     def test_a_freshly_stamped_job_carries_only_the_three(self):
         """The allowlist is what `render` writes, checked from the other side."""
         checkout = self.install()
-        for shipped in SHIPPED:
+        for shipped in INTENT_SHIPPED:
             data = yaml.safe_load(self.stub(checkout, shipped.name).read_text("utf-8"))
             (job,) = data["jobs"].values()
             self.assertEqual(sorted(job), sorted(["uses", "with", "secrets"]))
@@ -837,7 +854,7 @@ class TheRefSurvivesBeingReadBack(InstallCase):
     def test_the_stamped_input_is_quoted_and_reads_back_as_a_string(self):
         checkout = self.intent()
         run_cli(["init", str(checkout), "--ref", "1.10"])
-        for shipped in SHIPPED:
+        for shipped in INTENT_SHIPPED:
             data = yaml.safe_load(self.stub(checkout, shipped.name).read_text("utf-8"))
             (job,) = data["jobs"].values()
             self.assertEqual(job["with"]["vellum-ref"], "1.10")
@@ -1073,6 +1090,172 @@ class DoctorReportsAStaleRef(InstallCase):
         self.assertIn("no v* release tags", out)
 
 
+class TheProductSideIsTheOtherHalf(InstallCase):
+    """@id:release-cut-stub-is-stamped-on-the-product-side
+
+    `spec/features/release-tags.md`: "`release-cut` is a reusable workflow in
+    the Vellum product repo; a product repo carries one caller stub for it,
+    stamped by `vellum init` on the product side, pinned to a Vellum release,
+    verified by `vellum doctor` and re-stamped by `vellum upgrade`."
+
+    Which side a run is, is read off the checkout and never given, so every
+    case here points the same command line at the other half of a pair.
+    """
+
+    def product(self) -> Path:
+        checkout = self.root / "product"
+        checkout.mkdir(parents=True, exist_ok=True)
+        write_product(checkout)
+        return checkout
+
+    def test_a_product_checkout_gets_exactly_the_release_cut_stub(self):
+        checkout = self.product()
+        code, out = run_cli(["init", str(checkout), "--ref", "v0.1.0"])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(
+            sorted(p.name for p in (checkout / WORKFLOWS).iterdir()),
+            ["release-cut.yml"],
+        )
+        text = self.stub(checkout, "release-cut").read_text(encoding="utf-8")
+        self.assertIn(
+            f"uses: waviisoft/vellum/{WORKFLOWS.as_posix()}/release-cut.yml@v0.1.0",
+            text,
+        )
+        self.assertIn('vellum-ref: "v0.1.0"', text)
+
+    def test_the_intent_repos_stubs_are_not_stamped_there(self):
+        # The failure this is really about: three workflows in a product repo
+        # with no reusable workflow behind them for that half, each running on
+        # every PR and failing at a spec tree that is not there.
+        checkout = self.product()
+        run_cli(["init", str(checkout)])
+        for shipped in INTENT_SHIPPED:
+            self.assertFalse(self.stub(checkout, shipped.name).exists(), shipped.name)
+
+    def test_the_report_names_the_side_and_the_intent_repo_of_the_pair(self):
+        checkout = self.product()
+        code, out = run_cli(["init", str(checkout)])
+        self.assertEqual(code, 0, out)
+        self.assertIn("product-side", out)
+        # An installation is the PAIR, so both halves' reports are headed with
+        # the intent repo; a product report headed with its own slug would make
+        # two reports about one installation look like two installations.
+        self.assertIn("waviisoft/vellum-intent", out)
+
+    def test_a_checkout_that_is_neither_side_is_two(self):
+        bare = self.root / "bare"
+        bare.mkdir()
+        for argv in (["init", str(bare)], ["doctor", str(bare)]):
+            code, out = run_cli(argv)
+            self.assertEqual(code, 2, out)
+            self.assertIn("neither", out)
+
+    def test_a_checkout_that_is_both_sides_is_two(self):
+        # A repository made into two things. Refused rather than picked: the
+        # side decides which stubs belong there at all.
+        both = self.intent()
+        write_product(both)
+        for argv in (["init", str(both)], ["doctor", str(both)]):
+            code, out = run_cli(argv)
+            self.assertEqual(code, 2, out)
+            self.assertIn("carries both", out)
+
+    def test_doctor_over_the_product_side_verifies_that_stub_alone(self):
+        checkout = self.product()
+        run_cli(["init", str(checkout)])
+        code, out = run_cli(["doctor", str(checkout)])
+        self.assertEqual(code, 0, out)
+        self.assertIn("release-cut.yml", out)
+        for shipped in INTENT_SHIPPED:
+            self.assertNotIn(shipped.filename, out)
+
+    def test_an_unstamped_product_checkout_is_a_finding_naming_the_stub(self):
+        # What a pair looks like straight out of provisioning, which stamps the
+        # intent half only. The finding is the operator's cue to make the second
+        # stamp; a doctor that passed over it would leave a product repo that
+        # never tags a release and says nothing about why.
+        checkout = self.product()
+        code, out = run_cli(["doctor", str(checkout)])
+        self.assertEqual(code, 1, out)
+        self.assertIn("release-cut.yml", out)
+        self.assertIn("missing", out)
+
+
+class DoctorCoversBothHalvesInOneReport(InstallCase):
+    """@id:release-cut-stub-is-stamped-on-the-product-side, the last Then.
+
+    "vellum doctor verifies it beside the intent repo's stubs" — and "beside" is
+    the word that needs an instrument. A `doctor` over the product checkout
+    alone verifies the stub and says nothing about the claim, which is that ONE
+    installation's report covers both halves of the pair.
+    """
+
+    def pair(self) -> tuple[Path, Path]:
+        intent = self.intent()
+        product = self.root / "product"
+        product.mkdir(parents=True, exist_ok=True)
+        write_product(product)
+        run_cli(["init", str(intent), "--ref", "v0.1.0"])
+        run_cli(["init", str(product), "--ref", "v0.1.0"])
+        return intent, product
+
+    def marks(self, out: str) -> dict[str, str]:
+        """`{path: verdict}` out of a report, the way the harness reads one."""
+        found = {}
+        for line in out.splitlines():
+            match = re.match(r"^ {2}(ok|FINDING) +(\S+)", line)
+            if match:
+                found[match.group(2)] = match.group(1)
+        return found
+
+    def test_one_report_carries_a_verdict_for_all_four_stubs(self):
+        intent, product = self.pair()
+        code, out = run_cli(["doctor", str(intent), "--product", str(product)])
+        self.assertEqual(code, 0, out)
+        marks = self.marks(out)
+        for shipped in SHIPPED:
+            path = (WORKFLOWS / shipped.filename).as_posix()
+            self.assertEqual(marks.get(path), "ok", f"{path}: {marks}")
+
+    def test_a_finding_on_either_half_reddens_the_one_run(self):
+        # An installation is the pair. A run that exited 0 because the intent
+        # half was clean is exactly the failure `--product` exists to stop.
+        for half in ("intent", "product"):
+            with self.subTest(half=half):
+                intent, product = self.pair()
+                stub = (intent if half == "intent" else product) / WORKFLOWS
+                name = "spec-ci.yml" if half == "intent" else "release-cut.yml"
+                (stub / name).unlink()
+                code, out = run_cli(["doctor", str(intent), "--product", str(product)])
+                self.assertEqual(code, 1, out)
+                self.assertEqual(self.marks(out).get(
+                    (WORKFLOWS / name).as_posix()), "FINDING", out)
+                self.setUp()
+
+    def test_the_blind_spots_are_stated_once_for_the_pair(self):
+        # `CANNOT_KNOW` is a list of things no CHECKOUT can see, and a pair has
+        # the same blind spots twice — printing it per half would bury the
+        # second report's verdict under the first's caveats.
+        intent, product = self.pair()
+        _, out = run_cli(["doctor", str(intent), "--product", str(product)])
+        self.assertEqual(out.count("What a checkout cannot tell you"), 1, out)
+
+    def test_product_naming_the_intent_checkout_again_is_two(self):
+        # The report would cover the same three stubs twice, say nothing about
+        # the product side, and exit 0 — which is the "an exit 0 that never
+        # looked at it" failure this option exists to make impossible.
+        intent, _ = self.pair()
+        code, out = run_cli(["doctor", str(intent), "--product", str(intent)])
+        self.assertEqual(code, 2, out)
+        self.assertIn("not a product checkout", out)
+
+    def test_product_from_the_product_half_is_two(self):
+        intent, product = self.pair()
+        code, out = run_cli(["doctor", str(product), "--product", str(intent)])
+        self.assertEqual(code, 2, out)
+        self.assertIn("INTENT checkout", out)
+
+
 class TheCommittedTemplatesAreWhatInitWrites(unittest.TestCase):
     """`adapters/github/` is a rendering, and a rendering that drifts is a copy.
 
@@ -1127,7 +1310,11 @@ class TheStampWritesTheManifest(InstallCase):
         self.assertEqual(code, 0, out)
         found = manifest.load(checkout)
         self.assertEqual(found.release, default_ref())
-        self.assertEqual(list(found.owned), list(owned.stub_paths("github")))
+        # The INTENT side's stubs: a stamp writes the stubs of the side it ran
+        # on, and this ran in an intent checkout.
+        self.assertEqual(
+            list(found.owned), list(owned.stub_paths("github", owned.INTENT))
+        )
 
     def test_it_says_the_owned_set_is_the_stubs_and_nothing_else(self):
         checkout = self.intent()
@@ -1255,7 +1442,7 @@ class DoctorReportsTheManifest(InstallCase):
         code, out = run_cli(["doctor", str(checkout)])
         self.assertEqual(code, 1, out)
         self.assertIn(f"vellum init {checkout}", out)
-        for shipped in SHIPPED:
+        for shipped in INTENT_SHIPPED:
             self.assertIn((WORKFLOWS / shipped.filename).as_posix(), out, shipped.name)
 
     def test_the_advice_stops_naming_force_when_a_seeded_file_is_owned(self):

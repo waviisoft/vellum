@@ -1,0 +1,266 @@
+# Release cut — the REUSABLE workflow behind every installation's `release-cut`
+# stub. It runs in the PRODUCT repo when its default branch advances.
+#
+# This file holds the logic and lives here, in the product repo, because a
+# `workflow_call` workflow is the forge's own answer to "ship once, install
+# thin" (spec/features/installation.md). A product repo carries a caller stub —
+# `adapters/github/release-cut.yml`, stamped by `vellum init` in that checkout —
+# naming this file at a pinned Vellum ref, and passing VELLUM_TOKEN if it has
+# one to pass: that secret is optional (see `secrets:` below). The stub holds no
+# logic, so it has nothing to drift.
+#
+# THE PRODUCT SIDE'S FIRST. The three workflows beside this one all run in an
+# INTENT repo; this one runs in the repo whose version it is, which is why its
+# caller stub is stamped on the other half of the pair.
+#
+# THIS FILE NEVER RUNS FOR THIS REPO THROUGH `workflow_call` FROM ITSELF.
+# `on:` is `workflow_call` and nothing else, so no push here starts it directly;
+# `.github/workflows/release-cut-caller.yml` is this repo's own caller, and it
+# names this file BY LOCAL PATH rather than at a tag — a repo cannot pin the tag
+# it is about to mint (spec/decisions/2026-09-06-release-tags-are-minted-by-the-
+# forge.md).
+#
+# `actions/checkout` with no `repository:` checks out the CALLER — the product
+# repo, at the commit its push named. That is the checkout `vellum release tag`
+# reads the declaration out of and the checkout this job tags and pushes. The
+# one checkout of THIS repo names `waviisoft/vellum` and `inputs.vellum-ref`
+# explicitly.
+#
+# Runners are Blacksmith (`blacksmith-2vcpu-ubuntu-2204`). That is a hosting
+# choice made by WAVIISoft, the organisation that publishes this repo, and not
+# a property of Vellum: WAVIISoft routes Actions through Blacksmith, so
+# `ubuntu-latest` is never assigned a runner there. An installation in an
+# organisation without Blacksmith must run these jobs on labels of its own; see
+# adapters/github/README.md.
+#
+# Implements spec/features/release-tags.md: "when its default branch advances to
+# a commit whose declared version names a tag that does not exist, the forge tags
+# that commit `v<version>` ... It runs on every push to the default branch,
+# installs the CLI at the stub's ref, runs `vellum release tag`, and tags and
+# pushes only when the command names a tag to mint."
+#
+# ---------------------------------------------------------------------------
+# The decision is `vellum release tag`, not a shell script in this file.
+#
+# Reading the `release:` block, selecting a version reader, checking the
+# changelog and deciding whether the name is used are all the CLI's, for the
+# reason spec/features/spec-pipeline.md gives about the other workflows: logic
+# in a workflow body can only be tested by running this forge, and the same
+# logic in a command is driven in a sandbox. What is left here is the part that
+# is genuinely the forge's — checking out, tagging, pushing — and the
+# translation of three exit codes into what this job does about each.
+#
+# The three codes are the guards' contract and they are handled separately on
+# purpose. 0 is an answer about a name (mint it, or leave a used one alone), 1
+# is the changelog refusal (fail, naming the file and the entry an operator has
+# to write), and anything else is "could not answer" (fail, saying so). Folding
+# 1 and 2 together would tell an operator to write a changelog entry when what
+# actually happened is that this could not read their repository.
+# ---------------------------------------------------------------------------
+
+name: release-cut
+
+# Triggers live in the CALLER's stub: `push` to the product repo's default
+# branch. `concurrency: release-cut` lives there too — it serialises runs
+# against each other in ONE installation, and a group shared between
+# installations would serialise unrelated repositories against one another.
+on:
+  workflow_call:
+    inputs:
+      vellum-ref:
+        description: >-
+          The ref of waviisoft/vellum the CLI is checked out and installed
+          from. Stamped by `vellum init` to the same ref the stub pins this
+          file at; `vellum doctor` reports when the two have come apart.
+        required: true
+        type: string
+    secrets:
+      VELLUM_TOKEN:
+        description: >-
+          A token that can read waviisoft/vellum, the repo the CLI is installed
+          from. OPTIONAL: `required: false`, because once that repo is public
+          the caller's own `github.token` reads it and an installation that
+          passes nothing here still runs. Supply it while the repo is private,
+          or to reach a fork that is not public. When it IS passed it is passed
+          BY NAME — a stub never uses `secrets: inherit`, so this workflow holds
+          exactly the credential its jobs name and nothing else in the
+          installation (spec/features/installation.md).
+        required: false
+
+# Granted by the caller and consumed here — a called workflow's token can only
+# be narrowed by the callee, never widened. `contents: write` is what pushes the
+# tag, and it is THE CALLER'S TO GRANT: the stub carries the block, because a
+# grant made here could only take away from what the caller allowed. An
+# installation whose stub grants less than this fails at the push, and `vellum
+# doctor` reports a narrowed `permissions:` as drift for that reason.
+#
+# A tag protection rule on `v*` — a forge setting on the caller's repository,
+# not anything in either checkout — withholds this from the workflow token even
+# when the grant is right. Nothing here can see that setting; the push step says
+# so when it is refused.
+permissions:
+  contents: write
+
+jobs:
+  release-cut:
+    name: Tag the commit its declared version names
+    runs-on: blacksmith-2vcpu-ubuntu-2204
+    steps:
+      - name: Check out the product repo
+        uses: actions/checkout@v4
+        with:
+          # Full history AND tags. "A used name is left alone" is a claim about
+          # the names this repository already carries, and a shallow clone
+          # carries none of them: `vellum release tag` would report every name
+          # as unused and this job would try to push one that exists on every
+          # run. The credential is kept — unlike the CLI checkout below, this is
+          # the checkout that pushes.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # A NOTICE, NOT A GATE. VELLUM_TOKEN is optional: the CLI checkout below
+      # falls back to the caller's own `github.token`, which reads
+      # waviisoft/vellum once that repo is public. What is worth saying is WHICH
+      # of the two the run used, because a checkout that 404s against a repo
+      # that is still private is otherwise an opaque failure two steps down.
+      #
+      # The secret reaches this body through `env:` and is only ever tested for
+      # emptiness — never echoed, never interpolated.
+      - name: Say whether VELLUM_TOKEN was supplied
+        env:
+          VELLUM_TOKEN: ${{ secrets.VELLUM_TOKEN }}
+        run: |
+          if [ -z "$VELLUM_TOKEN" ]; then
+            echo "::notice title=No VELLUM_TOKEN::no VELLUM_TOKEN — checking out waviisoft/vellum without a token; this works once the repo is public"
+          else
+            echo "VELLUM_TOKEN was supplied; the CLI checkout uses it rather than the caller's github.token."
+          fi
+
+      # Checked out rather than pip-installed from the git URL, for the reason
+      # the other shipped workflows give: it takes a ref directly, so the
+      # `vellum-ref` input pins the CLI in one obvious place, and it is the one
+      # shape that works whether or not a token is supplied.
+      - name: Check out the vellum CLI
+        uses: actions/checkout@v4
+        with:
+          repository: waviisoft/vellum
+          ref: ${{ inputs.vellum-ref }}
+          # The secret when the caller passed one, the caller's own job token
+          # otherwise. `actions/checkout` reads `token` as a REQUIRED input, so
+          # an empty value is not "fall back to the default" — it is "Input
+          # required and not supplied", before the clone is attempted. The `||`
+          # supplies the default explicitly. Both values are registered as
+          # secrets and masked in the log.
+          token: ${{ secrets.VELLUM_TOKEN || github.token }}
+          path: vellum-cli
+          # Nothing here pushes to waviisoft/vellum, so whichever credential the
+          # line above resolved to has no reason to outlive this step in
+          # `.git/config`. (The product checkout above is the one that must keep
+          # its credential — it pushes the tag.)
+          persist-credentials: false
+
+      - name: Install the vellum CLI
+        run: pip install --quiet ./vellum-cli
+
+      # `--plan` because that is what this is asking for, and `--json` because
+      # the next steps are a machine. The command never applies a tag either
+      # way; `--plan` states it.
+      #
+      # Written under `$RUNNER_TEMP`, not into the checkout: the product repo's
+      # working tree is what gets tagged, and dropping a file into it would make
+      # `git status` in a later step report a change this job invented.
+      - name: What tag would this commit's declared version mint?
+        id: plan
+        run: |
+          set +e
+          vellum release tag . --plan --json \
+            > "$RUNNER_TEMP/release-tag.json" 2> "$RUNNER_TEMP/release-tag.err"
+          code=$?
+          set -e
+          cat "$RUNNER_TEMP/release-tag.err" >&2
+          # The refusal, on one line, for the annotation. A `::error` is one
+          # line by construction, and the message is the operator's next step.
+          said="$(tr '\n' ' ' < "$RUNNER_TEMP/release-tag.err")"
+          if [ "$code" = "1" ]; then
+            echo "::error title=No changelog entry for this version::${said}"
+            exit 1
+          fi
+          if [ "$code" != "0" ]; then
+            echo "::error title=Cannot compute a release tag::${said}"
+            exit 1
+          fi
+          python - >> "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import os
+
+          plan = json.load(open(os.environ["RUNNER_TEMP"] + "/release-tag.json"))
+          print(f"tag={plan['tag']}")
+          print(f"used={'yes' if plan['used'] else 'no'}")
+          PY
+          cat "$RUNNER_TEMP/release-tag.json"
+
+      # The common case, on which nothing happens: a merge that does not bump
+      # the version, and a re-run of this workflow over one that did. The CLI
+      # calls it an answer and exits 0; the annotation is how a no-op shows up
+      # in the run summary rather than only in a log nobody opens.
+      - name: Leave a used name alone
+        if: steps.plan.outputs.used == 'yes'
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: |
+          echo "::notice title=Name already used::${TAG} exists; leaving it alone. Nothing to mint on this push."
+
+      # =================================================================
+      # The forge's half: the name applied, and pushed with the job token.
+      #
+      # Decoration only. Nothing reads a release tag to decide anything —
+      # versions are commits (spec/decisions/2026-08-28-versions-are-commits.md)
+      # — so this step names a commit and changes no other fact about it.
+      #
+      # Idempotent, twice over. The `rev-parse` below catches a name that
+      # appeared between the plan step and this one, and a push refused because
+      # the remote already carries the name is read back and reported rather
+      # than failed on. Both matter because `concurrency` serialises this
+      # installation's runs against each other and not against a person pushing
+      # a tag by hand.
+      # =================================================================
+      - name: Tag the commit and push the name
+        if: steps.plan.outputs.used != 'yes'
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+          SHA: ${{ github.sha }}
+          # Through `env`, never `${{ }}` inside the script. A commit message is
+          # attacker-supplied text: anyone who can land a commit on the default
+          # branch writes it, and `${{ }}` pastes it into the script *before*
+          # the shell parses the line, so a message containing a quote and a `;`
+          # runs as this step's own code — on a runner holding `contents: write`
+          # on the caller's repository. As an `env` value it is data the shell
+          # reads out of the environment and never source it executes. This is
+          # also why the message never reached the CLI: `vellum release tag`
+          # does not read it.
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "::notice title=Name already used::${TAG} appeared while this run was working; leaving it alone"
+            exit 0
+          fi
+          git config user.name  "vellum-orchestrator"
+          git config user.email "orchestrator@vellum.invalid"
+          # The first line only. A tag message's subject is a subject, and an
+          # annotated tag carrying a whole squash-merge body is one nobody reads.
+          subject="$(printf '%s\n' "${HEAD_COMMIT_MESSAGE}" | head -n 1)"
+          git tag -a "${TAG}" -m "${TAG}: ${subject}" "${SHA}"
+          if git push origin "${TAG}"; then
+            echo "::notice title=Release tagged::${TAG} names ${SHA}"
+            exit 0
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::notice title=Name already used::${TAG} was pushed while this run was working; leaving it alone"
+            exit 0
+          fi
+          echo "::error title=Tag push refused::${TAG} could not be pushed, and the remote does not carry it. A tag protection rule on 'v*' withholds this from the workflow token; that is a setting on the calling repository and nothing in either checkout can see it."
+          exit 1

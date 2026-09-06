@@ -127,9 +127,11 @@ import yaml
 
 from vellum import __version__
 from vellum import manifest
+from vellum import product
 from vellum.gitver import GitUnavailable, tags
 from vellum.text import one_line
-from vellum.workspace import SLUG_RE, WorkspaceError, forge as workspace_forge
+from vellum.workspace import WORKSPACE_RELPATH, SLUG_RE, WorkspaceError
+from vellum.workspace import forge as workspace_forge
 from vellum.workspace import intent as workspace_intent
 from vellum.workspace import products as workspace_products
 from vellum.workspace import workspace_path
@@ -151,6 +153,22 @@ WORKFLOWS_DIR = {"github": Path(".github") / "workflows"}
 #: GitLab's ``include:`` as the same core's other emission; until that emission
 #: exists, a workspace naming it is "I cannot answer", not "GitHub will do".
 FORGES = tuple(sorted(WORKFLOWS_DIR))
+
+#: The two sides of a pair, and the file that defines each. An intent repo
+#: carries ``.vellum/workspace.yaml`` — the repo map ``init`` and ``doctor``
+#: both start from — and a product repo carries ``.vellum/product.yaml``, the
+#: pin. Declared HERE rather than in ``vellum.owned`` (which re-exports them)
+#: because a shipped workflow now names the side it is stamped on, and this is
+#: the module that holds the table.
+INTENT, PRODUCT = "intent", "product"
+SIDES = (INTENT, PRODUCT)
+
+#: The forge a PRODUCT checkout's stubs are stamped for. A product repo has no
+#: ``.vellum/workspace.yaml`` and so declares no forge — the workspace is the
+#: intent side's file, and the pair's forge is stated there — so this is the
+#: default the product side stamps with and ``--forge`` is how an installation
+#: says otherwise. Guessing is bounded: there is exactly one forge with stubs.
+PRODUCT_FORGE = "github"
 
 #: A pinnable ref: a tag, a branch, or a sha. Narrow because it is pasted into
 #: a ``uses:`` line the forge then resolves — a value carrying whitespace, a
@@ -231,7 +249,15 @@ def default_ref() -> str:
 
 @dataclass(frozen=True)
 class Shipped:
-    """One reusable workflow and the caller stub that invokes it."""
+    """One reusable workflow and the caller stub that invokes it.
+
+    ``side`` is which half of the pair carries the stub, and it defaults to
+    :data:`INTENT` because the first three shipped workflows all run in the
+    intent repo — spec CI, the merge bookkeeping, the harness gate — and there
+    was no other half to name. ``release-cut`` is the product side's first, and
+    the field is what keeps ``init``, ``doctor``, ``upgrade`` and the ownership
+    table from each carrying their own list of which is which.
+    """
 
     name: str
     #: Prose for the top of the stub, after the generated banner.
@@ -245,6 +271,8 @@ class Shipped:
     permissions: str
     #: The stub's ``concurrency:`` block, verbatim.
     concurrency: str
+    #: :data:`INTENT` or :data:`PRODUCT`: which half of the pair carries it.
+    side: str = INTENT
 
     @property
     def filename(self) -> str:
@@ -334,8 +362,61 @@ permissions:
   cancel-in-progress: true""",
 )
 
-#: Everything this repo ships, in the order a report lists it.
-SHIPPED: tuple[Shipped, ...] = (SPEC_CI, ON_SPEC_MERGE, HARNESS_CI)
+RELEASE_CUT = Shipped(
+    name="release-cut",
+    side=PRODUCT,
+    about="""# The release tag a version bump mints, pushed by the forge and never by hand
+# (spec/features/release-tags.md). `vellum release tag` reads the `release:`
+# block in `.vellum/product.yaml` — the version source, and the changelog that
+# must describe it — and names the tag and the commit; this workflow is what
+# creates and pushes it. A used name is reported and left alone, so a merge
+# that does not bump the version is a no-op.
+#
+# THE PRODUCT SIDE'S STUB. The other three run in the intent repo; this one
+# runs here, in the repo whose version it is.
+#
+# NO `paths:` FILTER, DELIBERATELY. A version bump is a change to whatever file
+# the `release:` block names, and an installation may name any file at all — so
+# a filter written here would be this product guessing at that declaration.
+# `vellum release tag` is what decides there is nothing to do, and it decides it
+# in a few seconds.""",
+    triggers="""on:
+  push:
+    branches: ["{branch}"]""",
+    permissions="""# Granted here because a called workflow's token can only be narrowed by the
+# callee, never widened. `contents: write` is what pushes the tag; nothing else
+# in the called workflow writes anything. Tag protection on `v*` — a forge
+# setting, not a repository one — withholds this from the workflow token, and
+# nothing in either checkout can see that it has.
+permissions:
+  contents: write""",
+    concurrency="""# Serialised, and never cancelled. Two runs racing on the same push would
+# both compute the same name and both try to create it; the loser fails a push
+# nobody needed. Cancelling in progress would be worse — a run cancelled
+# between `git tag` and `git push` leaves the name minted nowhere.
+concurrency:
+  group: release-cut
+  cancel-in-progress: false""",
+)
+
+#: Everything this repo ships, in the order a report lists it. The intent side's
+#: three first, in the order they ran before there was a second side, and the
+#: product side's one after them — so a pair's report reads intent-then-product
+#: without anything sorting it.
+SHIPPED: tuple[Shipped, ...] = (SPEC_CI, ON_SPEC_MERGE, HARNESS_CI, RELEASE_CUT)
+
+
+def shipped_for(side: str) -> tuple[Shipped, ...]:
+    """The workflows one side of a pair carries a stub for.
+
+    Every caller that used to iterate :data:`SHIPPED` wants this instead, and
+    the ones that do not — the render-drift check over ``adapters/github/``, and
+    ``installed_shape``, which reads back whichever stubs happen to be there —
+    are the two that are genuinely about the whole table.
+    """
+    if side not in SIDES:
+        raise ValueError(f"{side!r} is not one of {SIDES}")
+    return tuple(shipped for shipped in SHIPPED if shipped.side == side)
 
 BANNER = """# {name} — the caller stub. Stamped by `vellum init`; edit the ref, not the body.
 #
@@ -424,6 +505,72 @@ def render(
     )
 
 
+def side_of(root: Path) -> str:
+    """``intent`` or ``product``, from the file that defines each. Never guessed.
+
+    An intent checkout carries ``.vellum/workspace.yaml`` and a product checkout
+    carries ``.vellum/product.yaml``. A checkout with neither is not an
+    installation, and one with both is a repository that has been made into two
+    things; either way this refuses rather than picking, because the side
+    decides which stubs belong there at all — and stamping an intent repo's
+    three into a product repo would install three workflows with nothing behind
+    them.
+
+    Lives here rather than in ``vellum.upgrade``, which had it first: ``init``
+    and ``doctor`` now ask the same question, and three commands reading one
+    fact through two implementations is how they come to disagree about a
+    checkout that carries both files. ``vellum.upgrade.side_of`` calls this and
+    re-raises in its own error type.
+    """
+    has_intent = (root / WORKSPACE_RELPATH).is_file()
+    has_product = (root / product.PRODUCT_RELPATH).is_file()
+    if has_intent and not has_product:
+        return INTENT
+    if has_product and not has_intent:
+        return PRODUCT
+    if has_intent and has_product:
+        raise InstallError(
+            f"{root} carries both {WORKSPACE_RELPATH.as_posix()} and "
+            f"{product.PRODUCT_RELPATH.as_posix()}, so this cannot tell which "
+            f"side of the pair it is. An intent repo governs product repos and a "
+            f"product repo answers to one intent repo "
+            f"(spec/features/repo-topology.md); one checkout is one of the two."
+        )
+    raise InstallError(
+        f"{root} carries neither {WORKSPACE_RELPATH.as_posix()} nor "
+        f"{product.PRODUCT_RELPATH.as_posix()}, so it is not an installation. "
+        f"Run this in an intent checkout or a product checkout."
+    )
+
+
+def installation_name(root: Path, side: str) -> str:
+    """The intent repo this installation answers to, whichever side it is read from.
+
+    One sentence at the top of both reports, and it has to say the same thing on
+    both halves of a pair — an installation is the pair, and a report headed
+    with the product repo's own slug would make two reports about one thing look
+    like two things.
+    """
+    if side == INTENT:
+        try:
+            return workspace_intent(root)
+        except WorkspaceError as exc:
+            raise InstallError(str(exc)) from exc
+    try:
+        declared = product.load(root)
+    except product.ProductFileError as exc:
+        raise InstallError(str(exc)) from exc
+    slug = (declared.get("intent") or {}).get("repo")
+    if not isinstance(slug, str) or not slug.strip():
+        raise InstallError(
+            f"{product.product_path(root)} declares no `intent.repo`, so this "
+            f"cannot name the installation the checkout belongs to. A product "
+            f"repo answers to exactly one intent repo and the pin file is where "
+            f"it says which (spec/features/repo-topology.md)."
+        )
+    return slug.strip()
+
+
 def check_forge(forge: str) -> str:
     if forge not in WORKFLOWS_DIR:
         raise InstallError(
@@ -435,10 +582,21 @@ def check_forge(forge: str) -> str:
     return forge
 
 
-def read_forge(checkout: str | Path, override: str | None = None) -> str:
-    """The forge to stamp for: ``--forge`` if given, else the workspace's."""
+def read_forge(checkout: str | Path, override: str | None = None,
+               side: str = INTENT) -> str:
+    """The forge to stamp for: ``--forge`` if given, else the workspace's.
+
+    A PRODUCT checkout declares no forge — ``.vellum/workspace.yaml`` is the
+    intent side's file and the pair's forge is stated there — so the product
+    side takes :data:`PRODUCT_FORGE` and ``--forge`` is how an installation says
+    otherwise. That is bounded guessing rather than the open kind: there is
+    exactly one forge this CLI has stubs for, and a workspace naming another is
+    already "I cannot answer" on the side that does declare one.
+    """
     if override is not None:
         return check_forge(override.strip().lower())
+    if side == PRODUCT:
+        return check_forge(PRODUCT_FORGE)
     try:
         return check_forge(workspace_forge(checkout))
     except WorkspaceError as exc:
@@ -590,22 +748,30 @@ class Init:
     currency: Currency
     stamps: list[Stamp]
     manifest: ManifestStamp | None = None
+    #: Which half of the pair was stamped. The stubs differ per side and so does
+    #: what the header can honestly say: a product checkout carries no product
+    #: map, and its branch is watched by `release-cut` rather than
+    #: `on-spec-merge`.
+    side: str = INTENT
 
     def report(self) -> str:
+        watcher = "on-spec-merge" if self.side == INTENT else "release-cut"
         lines = [
-            f"vellum init — {self.forge} caller stubs in {self.checkout}",
+            f"vellum init — {self.forge} {self.side}-side caller stubs "
+            f"in {self.checkout}",
             f"  intent repo:  {self.intent}",
-            f"  branch:       {self.branch} (what on-spec-merge watches)",
+            f"  branch:       {self.branch} (what {watcher} watches)",
             f"  workflows:    {self.host} at {self.ref}",
-            "  products:     " + ", ".join(
+        ]
+        if self.side == INTENT:
+            lines.append("  products:     " + ", ".join(
                 # Read out of `.vellum/workspace.yaml`, which anyone who can
                 # land a merge in the intent repo writes, and printed into a
                 # report a caller may pipe into a forge step summary.
                 f"{one_line(name)} ({one_line(repo) or 'no repo declared'})"
                 for name, repo in sorted(self.products.items())
-            ),
-            "",
-        ]
+            ))
+        lines.append("")
         for stamp in self.stamps:
             lines.append(f"  {stamp.outcome:<11} {stamp.path}")
         lines.append("")
@@ -687,21 +853,34 @@ def init(
     releases_from: str | Path | None = None,
     branch: str = DEFAULT_BRANCH,
 ) -> Init:
-    """Stamp the caller stubs into an intent checkout. Idempotent."""
+    """Stamp the caller stubs into either side of a pair. Idempotent.
+
+    Which side is read off the checkout (:func:`side_of`) and never given: an
+    intent checkout gets the three that run there, a product checkout gets
+    ``release-cut``, and a directory that is neither is refused. That refusal is
+    the same one this command always made — it used to be spelled "is this an
+    intent checkout?" — and it is still exit 2; what changed is that the other
+    half of the pair is now an answer rather than a case of it.
+    """
     root = Path(checkout)
     if not root.is_dir():
-        raise InstallError(f"{root}: not a directory; is this an intent checkout?")
-    chosen = read_forge(root, forge)
-    try:
-        intent_slug = workspace_intent(root)
-        declared = workspace_products(root)
-    except WorkspaceError as exc:
-        raise InstallError(str(exc)) from exc
+        raise InstallError(
+            f"{root}: not a directory; is this an intent or product checkout?"
+        )
+    side = side_of(root)
+    chosen = read_forge(root, forge, side=side)
+    intent_slug = installation_name(root, side)
+    declared: dict[str, str] = {}
+    if side == INTENT:
+        try:
+            declared = workspace_products(root)
+        except WorkspaceError as exc:
+            raise InstallError(str(exc)) from exc
     pinned = ref if ref is not None else default_ref()
 
     directory = root / WORKFLOWS_DIR[chosen]
     stamps: list[Stamp] = []
-    for shipped in SHIPPED:
+    for shipped in shipped_for(side):
         path = directory / shipped.filename
         text = render(shipped, host=host, ref=pinned, forge=chosen, branch=branch)
         existing: str | None = None
@@ -745,6 +924,7 @@ def init(
         currency=currency(releases_from),
         stamps=stamps,
         manifest=stamp_manifest(root, ref=pinned, stamps=stamps),
+        side=side,
     )
 
 
@@ -1314,14 +1494,24 @@ class Doctor:
     strays: list[Finding] = field(default_factory=list)
     #: Findings about ``.vellum/install.yaml``: absent, or malformed.
     manifest: list[Finding] = field(default_factory=list)
+    #: Which half of the pair this report is about.
+    side: str = INTENT
+    #: The other half, when ``--product`` named one. ONE report covers the pair
+    #: (``spec/features/release-tags.md``: "vellum doctor verifies it beside the
+    #: intent repo's stubs"), because "beside" is a claim about one installation
+    #: and two reports run separately cannot make it: an exit 0 with the
+    #: product's stub never looked at is exactly the failure the sentence is
+    #: about.
+    paired: "Doctor | None" = None
 
     @property
     def findings(self) -> list[Finding]:
-        return (
+        own = (
             [f for _, found, _, _ in self.stubs for f in found]
             + self.strays
             + self.manifest
         )
+        return own + (self.paired.findings if self.paired is not None else [])
 
     @property
     def manifest_line(self) -> str:
@@ -1338,8 +1528,22 @@ class Doctor:
         )
 
     def report(self) -> str:
+        """The whole report: this half, the other half when there is one, and
+        the blind spots once at the end.
+
+        ``CANNOT_KNOW`` is printed once rather than per half because it is a
+        list of things no CHECKOUT can see — forge state, an Actions setting on
+        a third repository — and a pair has the same blind spots twice.
+        """
+        lines = self.body()
+        if self.paired is not None:
+            lines += ["", "=" * 72, ""] + self.paired.body()
+        return "\n".join(lines + [""] + CANNOT_KNOW)
+
+    def body(self) -> list[str]:
         lines = [
-            f"vellum doctor — {self.forge} caller stubs in {self.checkout}",
+            f"vellum doctor — {self.forge} {self.side}-side caller stubs "
+            f"in {self.checkout}",
             f"  intent repo:  {self.intent}",
             f"  shipped from: {self.host}",
             f"  manifest:     {self.manifest_line}",
@@ -1396,9 +1600,7 @@ class Doctor:
         lines += self.upgrade_advice()
         lines.append("")
         lines += self.compatibility()
-        lines.append("")
-        lines += CANNOT_KNOW
-        return "\n".join(lines)
+        return lines
 
     def upgrade_advice(self) -> list[str]:
         """How THIS installation moves to a newer release — not how one does.
@@ -1427,7 +1629,8 @@ class Doctor:
             return [stubs_only]
         if found is None:
             return [stubs_only]
-        stubs = {(WORKFLOWS_DIR[self.forge] / s.filename).as_posix() for s in SHIPPED}
+        stubs = {(WORKFLOWS_DIR[self.forge] / s.filename).as_posix()
+                 for s in shipped_for(self.side)}
         outside = sorted(set(found.owned) - stubs)
         if not outside:
             return [stubs_only]
@@ -1493,49 +1696,103 @@ def doctor(
     host: str = HOST_REPO,
     forge: str | None = None,
     releases_from: str | Path | None = None,
+    product_checkout: str | Path | None = None,
 ) -> Doctor:
-    """Check installed-matches-shipped from the checkout alone."""
+    """Check installed-matches-shipped from the checkout alone.
+
+    With *product_checkout* the answer covers **both halves of the pair in one
+    report**. That is the shape ``spec/features/release-tags.md`` asks for —
+    "vellum doctor verifies it beside the intent repo's stubs" — and the local
+    path is an input rather than something this finds, for the reason
+    ``--releases-from`` and ``vellum upgrade --from`` take theirs:
+    ``.vellum/workspace.yaml`` names the product **repository**, and where that
+    repository is checked out on this machine is not a fact any checkout holds.
+    """
     root = Path(checkout)
     if not root.is_dir():
-        raise InstallError(f"{root}: not a directory; is this an intent checkout?")
-    chosen = read_forge(root, forge)
+        raise InstallError(
+            f"{root}: not a directory; is this an intent or product checkout?"
+        )
     # Read unconditionally, even when `--forge` made the forge knowable without
     # it. `read_forge` short-circuits on the override, and without this a
     # `doctor --forge github` pointed at any directory at all reported three
     # missing stubs and exited 1 — "a finding" for what is plainly "I could not
     # answer", plus a stderr line naming a workspace file that does not exist.
-    # A checkout with no workspace is not an installation to have findings about.
-    #
-    # Through `workspace.intent()`, the same accessor `init` uses, so the two
-    # commands refuse the same files: a workspace with no `intent:` key is one
-    # neither of them can name the installation from, and doctor reporting it as
-    # three missing stubs was that same "a finding for what is I-cannot-answer"
-    # one key further in.
-    try:
-        intent_slug = workspace_intent(root)
-    except WorkspaceError as exc:
-        raise InstallError(str(exc)) from exc
+    # A checkout that is neither side is not an installation to have findings
+    # about, and `side_of` is where that is decided for both commands.
+    side = side_of(root)
+    chosen = read_forge(root, forge, side=side)
+    # Through the same accessor `init` uses, so the two commands refuse the same
+    # files: a workspace with no `intent:` key is one neither of them can name
+    # the installation from, and doctor reporting it as three missing stubs was
+    # that same "a finding for what is I-cannot-answer" one key further in.
+    intent_slug = installation_name(root, side)
     directory = WORKFLOWS_DIR[chosen]
+    mine = shipped_for(side)
     stubs = []
-    for shipped in SHIPPED:
+    for shipped in mine:
         relative = (directory / shipped.filename).as_posix()
         found, ref, cli_ref = inspect(
             root / directory / shipped.filename, shipped,
             host=host, forge=chosen, relative=relative,
         )
         stubs.append((relative, found, ref, cli_ref))
+
+    paired = None
+    if product_checkout is not None:
+        paired = _paired(
+            root, side, product_checkout,
+            host=host, forge=forge, releases_from=releases_from,
+        )
     return Doctor(
         checkout=root, forge=chosen, host=host, intent=intent_slug,
         currency=currency(releases_from), stubs=stubs,
         strays=strays(
             root / directory, host=host,
-            known={s.filename for s in SHIPPED}, relative_to=directory,
+            # The side's own stubs, not the whole table. A `release-cut.yml`
+            # sitting in an INTENT repo is a workflow with no reusable workflow
+            # behind it for that half, and a `known` set that covered the whole
+            # pair would pass over it in silence.
+            known={s.filename for s in mine}, relative_to=directory,
         ),
-        manifest=manifest_findings(root, chosen),
+        manifest=manifest_findings(root, chosen, side=side),
+        side=side,
+        paired=paired,
     )
 
 
-def manifest_findings(root: Path, forge: str = "github") -> list[Finding]:
+def _paired(root: Path, side: str, product_checkout: str | Path, *,
+            host: str, forge: str | None,
+            releases_from: str | Path | None) -> Doctor:
+    """The product half of a ``doctor <intent> --product <product>`` run.
+
+    Both halves are checked to be the halves they are said to be, and neither
+    check is pedantry. ``--product`` naming the intent checkout again would
+    produce a report that covered the same three stubs twice and said nothing
+    about the product side, at exit 0 — which is precisely the "an exit 0 that
+    never looked at it" failure the pair report exists to make impossible.
+    """
+    if side != INTENT:
+        raise InstallError(
+            f"--product covers the other half of a pair, so it goes with an "
+            f"INTENT checkout; {root} is the {side} half. Run "
+            f"`vellum doctor {root}` on its own, or point this at the intent "
+            f"checkout and pass the product one to --product."
+        )
+    other = Path(product_checkout)
+    if not other.is_dir():
+        raise InstallError(f"--product {other}: not a directory.")
+    if side_of(other) != PRODUCT:
+        raise InstallError(
+            f"--product {other} is not a product checkout: it carries "
+            f"{WORKSPACE_RELPATH.as_posix()} rather than "
+            f"{product.PRODUCT_RELPATH.as_posix()}. A pair is one of each."
+        )
+    return doctor(other, host=host, forge=forge, releases_from=releases_from)
+
+
+def manifest_findings(root: Path, forge: str = "github",
+                      side: str = INTENT) -> list[Finding]:
     """Findings about ``.vellum/install.yaml``: absent, or malformed.
 
     A finding rather than a report, and the difference from ref currency beside
@@ -1552,7 +1809,8 @@ def manifest_findings(root: Path, forge: str = "github") -> list[Finding]:
     init`" without the second half has to run it to find out what it claimed.
     """
     relative = manifest.MANIFEST_RELPATH.as_posix()
-    stubs = sorted((WORKFLOWS_DIR[forge] / s.filename).as_posix() for s in SHIPPED)
+    stubs = sorted((WORKFLOWS_DIR[forge] / s.filename).as_posix()
+                   for s in shipped_for(side))
     try:
         found = manifest.read(root)
     except manifest.ManifestError as exc:
@@ -1581,17 +1839,28 @@ def run_doctor(
     host: str = HOST_REPO,
     forge: str | None = None,
     releases_from: str | None = None,
+    product_checkout: str | None = None,
     out=None,
 ) -> int:
-    """Report the installation. Exit 1 on a finding, 0 when every stub matches."""
+    """Report the installation. Exit 1 on a finding, 0 when every stub matches.
+
+    One code for the pair when ``--product`` named one: an installation is the
+    pair, and a run that exited 0 because the intent half was clean would be the
+    thing this option exists to stop.
+    """
     stream = out if out is not None else sys.stdout
-    result = doctor(checkout, host=host, forge=forge, releases_from=releases_from)
+    result = doctor(checkout, host=host, forge=forge, releases_from=releases_from,
+                    product_checkout=product_checkout)
     print(result.report(), file=stream)
     if result.findings:
+        where = (
+            workspace_path(result.checkout) if result.side == INTENT
+            else product.product_path(result.checkout)
+        )
         print(
             f"vellum: doctor — {len(result.findings)} finding(s); what is installed "
             f"is not what {result.host} ships "
-            f"(see {workspace_path(result.checkout)} for this installation)",
+            f"(see {where} for this installation)",
             file=sys.stderr,
         )
         return 1

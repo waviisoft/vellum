@@ -353,32 +353,20 @@ def _ref_exists(source: Templates, ref: str) -> None:
 def side_of(root: Path) -> str:
     """``intent`` or ``product``, from the file that defines each. Never guessed.
 
-    An intent checkout carries ``.vellum/workspace.yaml`` — the repo map ``init``
-    and ``doctor`` both start from — and a product checkout carries
-    ``.vellum/product.yaml``, the pin. A checkout with neither is not an
-    installation, and one with both is a repository that has been made into two
-    things; either way this refuses rather than picking, because the side
-    decides whether the stubs are re-stamped and which owned set is even legal.
+    ``vellum.install.side_of``'s answer, in this module's error type. The rule
+    is stated there, where the table of which stubs belong to which side lives;
+    what matters here is that the side decides which stubs are re-stamped and
+    which owned set is even legal.
     """
-    has_intent = (root / WORKSPACE_RELPATH).is_file()
-    has_product = (root / product.PRODUCT_RELPATH).is_file()
-    if has_intent and not has_product:
-        return owned.INTENT
-    if has_product and not has_intent:
-        return owned.PRODUCT
-    if has_intent and has_product:
-        raise UpgradeError(
-            f"{root} carries both {WORKSPACE_RELPATH.as_posix()} and "
-            f"{product.PRODUCT_RELPATH.as_posix()}, so this cannot tell which "
-            f"side of the pair it is. An intent repo governs product repos and a "
-            f"product repo answers to one intent repo "
-            f"(spec/features/repo-topology.md); one checkout is one of the two."
-        )
-    raise UpgradeError(
-        f"{root} carries neither {WORKSPACE_RELPATH.as_posix()} nor "
-        f"{product.PRODUCT_RELPATH.as_posix()}, so it is not an installation to "
-        f"upgrade. Run this in an intent checkout or a product checkout."
-    )
+    try:
+        return install.side_of(root)
+    except install.InstallError as exc:
+        # Re-raised rather than reimplemented. `init` and `doctor` ask the same
+        # question now, and three commands reading one fact through two
+        # implementations is how they come to disagree about a checkout that
+        # carries both files — which is the case that decides whether an
+        # upgrade rewrites an intent repo's stubs or a product repo's.
+        raise UpgradeError(str(exc)) from exc
 
 
 def _values(root: Path, side: str) -> dict[str, str]:

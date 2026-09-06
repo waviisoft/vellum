@@ -42,7 +42,12 @@ import yaml
 
 from support import run_cli, run_cli_streams, write_workspace
 from vellum import manifest, owned, provision
-from vellum.install import SHIPPED, WORKFLOWS_DIR, default_ref
+from vellum.install import INTENT, WORKFLOWS_DIR, default_ref, shipped_for
+
+#: The stubs provisioning stamps. Provisioning writes the INTENT half's
+#: `.github/workflows/`; the product half it seeds carries none at all, and its
+#: `release-cut` stub arrives when somebody runs `vellum init` in that checkout.
+INTENT_SHIPPED = shipped_for(INTENT)
 
 WORKFLOWS = WORKFLOWS_DIR["github"]
 
@@ -239,7 +244,7 @@ class ThePlanIsCompleteAndCreatesNothing(ProvisionCase):
 
     def test_it_names_every_stub(self):
         out = self.plan()
-        for shipped in SHIPPED:
+        for shipped in INTENT_SHIPPED:
             self.assertIn((WORKFLOWS / shipped.filename).as_posix(), out)
 
     def test_it_names_every_file_it_would_seed(self):
@@ -446,13 +451,44 @@ class AGreenfieldSeedIsGreen(ProvisionCase):
             self.assertNotIn(relative, listed, relative)
         self.assertNotIn(".vellum/product.yaml", manifest.load(self.product).owned)
 
+    #: The one owned path a seed does not write, and the reason it is exempt.
+    #: `release-cut` is stamped by `vellum init` run in the PRODUCT checkout —
+    #: "stamped by `vellum init` on the product side"
+    #: (spec/features/release-tags.md) — and provisioning stamps the intent
+    #: half only. So the seeded product manifest names a file that arrives with
+    #: that stamp: it is owned from the start, because owning it is what lets
+    #: `vellum upgrade` re-stamp it later, and it is absent until somebody
+    #: stamps it. `vellum doctor` in the product checkout is what says so.
+    STAMPED_SEPARATELY = (WORKFLOWS / "release-cut.yml").as_posix()
+
     def test_every_owned_path_is_a_file_the_seed_actually_wrote(self):
         # The manifest is written from `vellum.owned`'s table and the seed from
         # `intent_seed`; a row that named a file the seed does not write would
         # be an installation whose first upgrade reports a missing owned file.
+        # The one exception is named above rather than left to be discovered.
         for checkout in (self.intent, self.product):
             for relative in manifest.load(checkout).owned:
+                if relative == self.STAMPED_SEPARATELY:
+                    continue
                 self.assertTrue((checkout / relative).is_file(), relative)
+
+    def test_the_product_half_carries_no_workflows_until_it_is_stamped(self):
+        # The other half of the exemption above, asserted rather than implied:
+        # provisioning writes no `.github/workflows/` into the product repo at
+        # all, so a stub found there afterwards was stamped by a `vellum init`
+        # run in that checkout and by nothing else.
+        self.assertFalse((self.product / WORKFLOWS).exists())
+
+    def test_stamping_the_product_checkout_writes_exactly_that_stub(self):
+        code, out = run_cli(["init", str(self.product), "--ref", default_ref()])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(
+            sorted(p.name for p in (self.product / WORKFLOWS).iterdir()),
+            ["release-cut.yml"],
+        )
+        # And the manifest that named it before it existed now names a file
+        # that does, so `vellum upgrade` has something to re-stamp.
+        self.assertIn(self.STAMPED_SEPARATELY, manifest.load(self.product).owned)
 
     def test_the_shipped_skeleton_is_exactly_this_set_of_files(self):
         # The seed comes out of package data, and a wheel carries it only
@@ -743,7 +779,7 @@ class ProvisioningOverAnInstallationIsRefused(ProvisionCase):
         write_workspace(self.cwd)
         code, out = run_cli(["init", str(self.cwd)])
         self.assertEqual(code, 0, out)
-        for shipped in SHIPPED:
+        for shipped in INTENT_SHIPPED:
             self.assertTrue((self.cwd / WORKFLOWS / shipped.filename).is_file())
 
     def test_the_refusal_is_reached_before_any_prompt(self):
