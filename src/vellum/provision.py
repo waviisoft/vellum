@@ -113,6 +113,11 @@ VISIBILITIES = ("public", "private")
 #: behind untracked, which is a file the next run's dirty-tree check refuses on.
 #: ``.git/`` is per-checkout, never committed and never in ``git status``.
 ADOPT_PR_RELPATH = ".git/vellum/ADOPT_PR.md"
+#: The same path, relative to the checkout's git directory — which is `.git/`
+#: only when `.git` is a directory. In a worktree it is a FILE pointing at
+#: `<main>/.git/worktrees/<name>`, and a write under `.git/` there fails; so the
+#: body goes under whatever `git rev-parse --git-dir` names (:func:`git_dir`).
+ADOPT_PR_UNDER_GIT = "vellum/ADOPT_PR.md"
 
 #: The branch a brownfield installation's ``.vellum/`` arrives on.
 #: ``spec/features/installation.md``: "its ``.vellum/`` arrives on a branch as a
@@ -1126,7 +1131,7 @@ class Plan:
             "<intent checkout>": str(self.intent_dir),
             "<product checkout>": product,
             "<product clone>": product if self.cloned else f"{product}-clone",
-            "<adopt PR body>": str(self.product_dir / ADOPT_PR_RELPATH),
+            "<adopt PR body>": str(git_dir(self.product_dir) / ADOPT_PR_UNDER_GIT),
             "<adopt base>": self.adopt_base or self.answers.branch,
         }
 
@@ -1351,6 +1356,24 @@ def _default_branch(repo: Path, fallback: str) -> str:
 #: how the two come to disagree about which branch they are a guest of.
 git = _git
 default_branch = _default_branch
+
+
+def git_dir(directory: Path) -> Path:
+    """Where this checkout's git directory is: ``.git/`` or a worktree's.
+
+    ``.git`` is a directory in an ordinary clone and a **file** in a worktree
+    (``gitdir: <main>/.git/worktrees/<name>``), so a path built as
+    ``<checkout>/.git/...`` is one ``mkdir`` from a ``NotADirectoryError`` in
+    exactly the checkouts operators use for a side branch. ``rev-parse
+    --git-dir`` answers for both; relative answers are relative to *directory*.
+    A checkout git cannot read falls back to ``.git/`` so the caller's error is
+    about the write, not about this lookup.
+    """
+    found = _git(directory, "rev-parse", "--git-dir", check=False)
+    if found.returncode != 0 or not found.stdout.strip():
+        return Path(directory) / ".git"
+    where = Path(found.stdout.strip())
+    return where if where.is_absolute() else Path(directory) / where
 
 
 def _check_adoption(directory: Path, answers: Answers) -> str:
@@ -1612,7 +1635,7 @@ def _write_adopt_body(directory: Path, answers: Answers, base: str) -> Path:
     and sits in the tree is an untracked file every later dirty-tree check
     refuses on — and this one lands in a repository Vellum is a guest in.
     """
-    path = directory / ADOPT_PR_RELPATH
+    path = git_dir(directory) / ADOPT_PR_UNDER_GIT
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         ADOPT_PR_BODY.format(shape=answers.shape, intent_slug=answers.intent_slug,
@@ -2103,7 +2126,8 @@ def run_provision(args, out=None) -> int:
 
 
 __all__ = [
-    "ADOPT_BRANCH", "ADOPT_PR_RELPATH", "RESERVED_AREAS",
+    "git_dir",
+    "ADOPT_BRANCH", "ADOPT_PR_RELPATH", "ADOPT_PR_UNDER_GIT", "RESERVED_AREAS",
     "Answers", "Console", "ForgeStep", "Gh", "Plan",
     "PRODUCT_SECRET", "INTENT_SECRET", "ProvisionError", "SHAPES",
     "VISIBILITIES", "build_plan", "check_seed", "detect_gh", "first_spec_commit",

@@ -595,7 +595,7 @@ back.
 **An `owned:` line is not permission to write wherever the tree points.** Before
 anything is written, every path it would write is walked component by component:
 a symlink among them, a parent that is a regular file, or a directory that
-resolves outside the checkout is a refusal (exit 2, nothing written, no branch).
+resolves outside the checkout is a refusal (exit 1, nothing written, no branch).
 The manifest is a file anyone who can land a pull request can edit, and
 `.git/hooks/` — where a file written by this command would be executed by this
 command's own commit — is one `mkdir -p` away through a symlink. Paths under
@@ -606,11 +606,12 @@ the branch is cut, the tree is restored, the branch is deleted and the checkout
 returns to the branch it started on; the error says so. On success, the checkout
 is left **on** `vellum/upgrade-<release>` and the report says that too.
 
-**The pull request body is written under `.git/`, not into the working tree.**
+**The pull request body is written under the checkout's git directory, not into the working tree.**
 It has to outlive the command — the printed `gh pr create` names it with
 `--body-file` — and a file that outlives the command in the tree is an untracked
-file the next run's dirty-tree check refuses on. `--yes` deletes it once `gh`
-has taken it.
+file the next run's dirty-tree check refuses on. In a worktree, where `.git` is
+a file, it goes under that worktree's own git directory. `--yes` deletes it once
+`gh` has taken it.
 
 **The repository is named, not inferred.** `gh pr create` resolves a repository
 from the directory it runs in, which for this command is wherever you were
@@ -627,10 +628,10 @@ and changes to what the caller stubs pass. Those come from
 `src/vellum/seeds/CHANGES.yaml`, one entry per release, read out of the release
 being adopted so a release describes itself.
 
-Exit codes: 0 done or planned, 1 an owned file this installation has edited, 2
-it could not answer (no manifest, no reachable templates, a dirty tree, a
-checkout not on its default branch, an upgrade branch that already exists here
-or on `origin`, a path it will not write into).
+Exit codes: 0 done or planned, 1 a refusal about this installation's tree (an
+owned file it has edited, a path it will not write into), 2 it could not answer
+(no manifest, no reachable templates, a dirty tree, a checkout not on its
+default branch, an upgrade branch that already exists here or on `origin`).
 
 #### Making an existing installation own its seeded files
 

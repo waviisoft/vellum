@@ -810,7 +810,7 @@ class APathTheTreeRedirectsIsNeverWritten(UpgradeCase):
         self.assertFalse(hook.exists())
 
         code, out = self.upgrade("--restore")
-        self.assertEqual(code, 2, out)
+        self.assertEqual(code, 1, out)
         self.assertIn("symlink", out)
         self.assertIn(relative, out)
         # The hook was not installed, so the commit this run would have made
@@ -828,7 +828,7 @@ class APathTheTreeRedirectsIsNeverWritten(UpgradeCase):
         memory.symlink_to(outside, target_is_directory=True)
 
         code, out = self.upgrade("--restore", checkout=self.product)
-        self.assertEqual(code, 2, out)
+        self.assertEqual(code, 1, out)
         self.assertIn("symlink", out)
         self.assertEqual(list(outside.iterdir()), [])
         self.assertEqual(self.branches(self.product), ["main"])
@@ -865,7 +865,7 @@ class AHalfWrittenUpgradeIsWoundBack(UpgradeCase):
         self.git(self.intent, "add", "-A")
         self.git(self.intent, "commit", "-qm", "harness/support is a file now")
         code, out = self.upgrade("--restore")
-        self.assertEqual(code, 2, out)
+        self.assertEqual(code, 1, out)
         self.assertIn("harness/support is a file", out)
         self.assertEqual(self.branches(self.intent), ["main"])
         self.assertEqual(self.git(self.intent, "rev-parse", "--abbrev-ref", "HEAD"),
@@ -895,6 +895,27 @@ class AHalfWrittenUpgradeIsWoundBack(UpgradeCase):
             text = (self.intent / install.WORKFLOWS_DIR["github"]
                     / shipped.filename).read_text(encoding="utf-8")
             self.assertIn(f"@{BASE}", text, shipped.name)
+
+
+class TheBodyLivesInTheGitDirectory(UpgradeCase):
+    """`.git` is a file in a worktree; the body still has somewhere to go."""
+
+    def test_an_upgrade_run_in_a_worktree_writes_its_body_under_that_git_dir(self):
+        from vellum.provision import git_dir
+        from vellum.upgrade import PR_BODY_UNDER_GIT
+        # Free `main` so a worktree can hold it: the upgrade runs on the default
+        # branch and refuses anywhere else.
+        self.git(self.intent, "checkout", "-q", "--detach")
+        worktree = self.root / "intent-worktree"
+        self.git(self.intent, "worktree", "add", "-q", str(worktree), "main")
+        self.assertTrue((worktree / ".git").is_file())
+
+        code, out = self.upgrade(checkout=worktree)
+        self.assertEqual(code, 0, out)
+        body = git_dir(worktree) / PR_BODY_UNDER_GIT
+        self.assertTrue(body.is_file(), out)
+        self.assertIn(str(body), out)
+        self.assertNotEqual(body, worktree / ".git" / PR_BODY_UNDER_GIT)
 
 
 class TheForgeHalfNamesTheRepository(UpgradeCase):

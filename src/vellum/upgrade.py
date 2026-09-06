@@ -111,7 +111,7 @@ from pathlib import Path, PurePosixPath
 
 from vellum import changes, install, manifest, owned, product, seeds
 from vellum.gitver import GitUnavailable, blob_at, resolve, show
-from vellum.provision import Gh, ProvisionError, default_branch, detect_gh, git
+from vellum.provision import Gh, ProvisionError, default_branch, detect_gh, git, git_dir
 from vellum.text import one_line
 from vellum.workspace import SLUG_RE, WORKSPACE_RELPATH
 
@@ -130,6 +130,10 @@ BRANCH_PREFIX = "vellum/upgrade-"
 #: second upgrade on the leavings of the first. ``.git/`` is the one directory
 #: that is per-checkout, never committed and never in ``git status``.
 PR_BODY_RELPATH = ".git/vellum/UPGRADE_PR.md"
+#: The same path relative to the checkout's git directory, which is what the
+#: write actually uses: `.git` is a directory in a clone and a FILE in a
+#: worktree, and ``provision.git_dir`` answers for both.
+PR_BODY_UNDER_GIT = "vellum/UPGRADE_PR.md"
 
 #: What happened to one owned file. Every one of these is decided *before*
 #: anything is written, so a run that refuses has computed the whole list and
@@ -996,7 +1000,7 @@ def _apply(result: Upgrade, *, yes: bool) -> None:
         except ProvisionError as exc:
             raise UpgradeError(str(exc)) from exc
 
-    body = Path(root) / PR_BODY_RELPATH
+    body = git_dir(root) / PR_BODY_UNDER_GIT
     body.parent.mkdir(parents=True, exist_ok=True)
     body.write_text(_body(result), encoding="utf-8")
     result.pr_body_path = body
@@ -1305,7 +1309,10 @@ def run_upgrade(
             f"(spec/features/installation.md)",
             file=sys.stderr,
         )
-        return 2
+        # Exit 1, the same as an edited file: both are refusals about the
+        # installation's tree that the operator has to act on, and the spec
+        # names them together. Exit 2 is for a question this could not answer.
+        return 1
     if result.refused:
         print(
             f"vellum: upgrade — {len(result.refused)} owned file(s) this "
@@ -1328,6 +1335,6 @@ def run_upgrade(
 
 __all__ = [
     "BRANCH_PREFIX", "Change", "PR_BODY_RELPATH", "Templates", "Upgrade",
-    "UpgradeError", "compare", "run_upgrade", "side_of", "slug_of",
+    "UpgradeError", "PR_BODY_UNDER_GIT", "compare", "run_upgrade", "side_of", "slug_of",
     "unsafe_write", "upgrade",
 ]
