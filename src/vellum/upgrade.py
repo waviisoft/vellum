@@ -84,7 +84,7 @@ The manifest lives in the repository, so its list is written by anyone who can
 land a pull request there — and this command writes every path on it, after a
 ``mkdir -p``. ``vellum.manifest`` holds the lexical half of that (no absolute
 path, no ``..``, nothing under ``.git/``, nothing unprintable) and
-:func:`unsafe_write` holds the half that needs a filesystem: a symlink among a
+:func:`vellum.paths.unsafe_write` holds the half that needs a filesystem: a symlink among a
 path's components, a parent that is a regular file, a directory that resolves
 outside the checkout. All of them are refusals computed with the rest of the
 list, before a byte is written — and the one that matters most is the first,
@@ -107,10 +107,11 @@ import re
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 from vellum import changes, install, manifest, owned, product, seeds
 from vellum.gitver import GitUnavailable, blob_at, resolve, show
+from vellum.paths import unsafe_write
 from vellum.provision import Gh, ProvisionError, default_branch, detect_gh, git, git_dir
 from vellum.text import one_line
 from vellum.workspace import SLUG_RE, WORKSPACE_RELPATH
@@ -353,32 +354,20 @@ def _ref_exists(source: Templates, ref: str) -> None:
 def side_of(root: Path) -> str:
     """``intent`` or ``product``, from the file that defines each. Never guessed.
 
-    An intent checkout carries ``.vellum/workspace.yaml`` — the repo map ``init``
-    and ``doctor`` both start from — and a product checkout carries
-    ``.vellum/product.yaml``, the pin. A checkout with neither is not an
-    installation, and one with both is a repository that has been made into two
-    things; either way this refuses rather than picking, because the side
-    decides whether the stubs are re-stamped and which owned set is even legal.
+    ``vellum.install.side_of``'s answer, in this module's error type. The rule
+    is stated there, where the table of which stubs belong to which side lives;
+    what matters here is that the side decides which stubs are re-stamped and
+    which owned set is even legal.
     """
-    has_intent = (root / WORKSPACE_RELPATH).is_file()
-    has_product = (root / product.PRODUCT_RELPATH).is_file()
-    if has_intent and not has_product:
-        return owned.INTENT
-    if has_product and not has_intent:
-        return owned.PRODUCT
-    if has_intent and has_product:
-        raise UpgradeError(
-            f"{root} carries both {WORKSPACE_RELPATH.as_posix()} and "
-            f"{product.PRODUCT_RELPATH.as_posix()}, so this cannot tell which "
-            f"side of the pair it is. An intent repo governs product repos and a "
-            f"product repo answers to one intent repo "
-            f"(spec/features/repo-topology.md); one checkout is one of the two."
-        )
-    raise UpgradeError(
-        f"{root} carries neither {WORKSPACE_RELPATH.as_posix()} nor "
-        f"{product.PRODUCT_RELPATH.as_posix()}, so it is not an installation to "
-        f"upgrade. Run this in an intent checkout or a product checkout."
-    )
+    try:
+        return install.side_of(root)
+    except install.InstallError as exc:
+        # Re-raised rather than reimplemented. `init` and `doctor` ask the same
+        # question now, and three commands reading one fact through two
+        # implementations is how they come to disagree about a checkout that
+        # carries both files — which is the case that decides whether an
+        # upgrade rewrites an intent repo's stubs or a product repo's.
+        raise UpgradeError(str(exc)) from exc
 
 
 def _values(root: Path, side: str) -> dict[str, str]:
@@ -723,70 +712,6 @@ def compare(
         if refusal is not None:
             change.action, change.detail, change.text = UNSAFE, refusal, None
     return found
-
-
-def unsafe_write(root: Path, relative: str) -> str | None:
-    """Why *relative* is not a path this may write into *root*, or None.
-
-    ``vellum.manifest.check_owned_path`` holds the *lexical* half of this — no
-    absolute path, no ``..``, nothing under ``.git/`` — and cannot hold any of
-    the rest, because the rest is about a filesystem it never looks at. A
-    manifest entry is a line in a repository that anybody who can land a pull
-    request can write, and ``upgrade`` writes every path on that list after a
-    ``mkdir(parents=True)``. Three ways that becomes a write somewhere else:
-
-    * **a symlink among the components.** ``.github/workflows`` a symlink to
-      ``../.git/hooks``, or the file itself a dangling symlink pointing there,
-      and an owned path becomes a hook — one this command's own ``git commit``
-      then executes, in the operator's shell, in the same run.
-    * **a parent that is a regular file.** ``mkdir(parents=True)`` fails
-      halfway, which is a traceback out of a half-written tree rather than a
-      refusal before one exists (see :func:`_apply`).
-    * **a parent that resolves outside the checkout.** The backstop for the
-      first: whatever the components are, the directory written into has to be
-      inside ``root``.
-
-    A reason, never a boolean, because the report names the path and says which
-    of the three it is: an operator has to be able to look at the tree and see
-    the same thing this saw.
-    """
-    settled_root = root.resolve()
-    parts = PurePosixPath(relative).parts
-    walked = root
-    for index, part in enumerate(parts):
-        walked = walked / part
-        if walked.is_symlink():
-            return (
-                f"{'/'.join(parts[:index + 1])} is a symlink, and this writes "
-                f"through no symlink: an owned path whose components can be "
-                f"redirected is a write wherever the link points — `.git/hooks/` "
-                f"among the reachable places, where it would run during this "
-                f"upgrade's own commit. Nothing was written. Replace the link "
-                f"with the real path, or take the line out of "
-                f"`{manifest.OWNED_KEY}:`."
-            )
-        if index < len(parts) - 1 and walked.exists() and not walked.is_dir():
-            return (
-                f"{'/'.join(parts[:index + 1])} is a file, and this path needs "
-                f"it to be a directory. Writing would have to create a directory "
-                f"where a file already is, which fails part way through a run "
-                f"that has already written other files — so it is refused here, "
-                f"before anything is written."
-            )
-    try:
-        settled = (root / relative).parent.resolve()
-    except OSError as exc:  # a symlink loop, or a component that cannot be read
-        return (
-            f"its directory could not be resolved ({one_line(str(exc))}), so "
-            f"nothing can say that writing it writes inside this checkout."
-        )
-    if settled != settled_root and settled_root not in settled.parents:
-        return (
-            f"its directory resolves to {settled}, which is outside {settled_root}. "
-            f"Vellum owns files in the installation, and an `{manifest.OWNED_KEY}:` "
-            f"line cannot claim one anywhere else."
-        )
-    return None
 
 
 # =====================================================================

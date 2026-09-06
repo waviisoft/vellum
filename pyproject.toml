@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vellum"
-version = "0.3.0"
+version = "0.4.0"
 description = "Spec-driven product engineering tooling: lint, suite extraction, ledger."
 readme = "README.md"
 # SPDX, per PEP 639. No `License :: OSI Approved :: MIT License` classifier
@@ -25,6 +25,13 @@ requires-python = ">=3.10"
 dependencies = [
     "PyYAML>=6.0,<7",
     "gherkin-official>=29,<43",
+    # `vellum release tag` reads a `pyproject.toml` version source. `tomllib` is
+    # in the standard library from 3.11 and the floor above is 3.10, so on 3.10
+    # the reader is `tomli` — the same module `tomllib` was adopted from, so the
+    # two are one reader spelled twice. Conditional rather than unconditional
+    # because installing a backport of a stdlib module beside the stdlib module
+    # is how a wheel comes to carry two of them.
+    'tomli>=1.1.0,<3; python_version < "3.11"',
 ]
 
 [project.scripts]

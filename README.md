@@ -29,13 +29,17 @@ and auto-merge are v0.2 and are stubbed, loudly, in the reusable workflows
 under `.github/workflows/`.
 
 **The forge adapters ship once and install thin.** This repo hosts the real
-logic of each adapter workflow — `spec-ci`, `on-spec-merge`, `harness-ci` — as
-a `workflow_call` workflow under `.github/workflows/`, and an intent repo
-carries one caller stub per workflow naming it at a pinned ref. `vellum init`
-stamps the stubs; `vellum doctor` checks that what is installed is what ships;
-and `vellum upgrade` brings an installation's Vellum-owned files to a newer
-release as a reviewable pull request, rewriting only what
-`.vellum/install.yaml` names as Vellum's.
+logic of each adapter workflow — `spec-ci`, `on-spec-merge`, `harness-ci` and
+`release-cut` — as a `workflow_call` workflow under `.github/workflows/`, and
+an installation carries one caller stub per workflow naming it at a pinned ref.
+The first three run in the **intent** repo and their stubs are stamped there;
+`release-cut` runs in the **product** repo and its stub is stamped there, which
+is the one shipped workflow that is not the intent side's. `vellum init` stamps
+whichever side it is run in — it reads that off the checkout — `vellum doctor`
+checks that what is installed is what ships (and, given `--product`, covers
+both halves in one report); and `vellum upgrade` brings an installation's
+Vellum-owned files to a newer release as a reviewable pull request, rewriting
+only what `.vellum/install.yaml` names as Vellum's.
 Installing them **renames the required status checks** — a job calling a
 reusable workflow reports as `<calling job>/<called job name>` — so branch
 protection has to be updated with them. See
@@ -316,7 +320,7 @@ vellum pin advance . --to 0e9f3f57fd94fa0cbbda6602da9a79c609e1c231 \
 An intent checkout is required and there is no `--force`: a pin naming a
 non-version is the failure this command exists to prevent.
 
-### `vellum init [<intent-checkout>]`
+### `vellum init [<checkout>]`
 
 Two commands behind one name, and **which one a run is, is decided by the
 command line alone**: with any of the provisioning arguments below it
@@ -324,23 +328,58 @@ provisions a repo pair; with none of them it is the stub-stamping command
 described here. Nothing is ever inferred from the directory — the shape of an
 installation is the operator's to choose.
 
-Stamps the forge's caller stubs into an intent checkout whose repos already
-exist. Reads the intent slug, the products and the forge from
-`.vellum/workspace.yaml`, and writes one stub per shipped workflow into
-`.github/workflows/`, pinned to `--ref` or, by default, this CLI's own version.
+Stamps the forge's caller stubs into a checkout whose repos already exist.
+**Which side of the pair it is, is read off the checkout and never given:**
+
+| The checkout carries | It is | It gets |
+|---|---|---|
+| `.vellum/workspace.yaml` | the intent half | `spec-ci`, `on-spec-merge`, `harness-ci` |
+| `.vellum/product.yaml` | the product half | `release-cut` |
+| both, or neither | not one installation | exit 2 |
+
+On the intent side the intent slug, the products and the forge come from
+`.vellum/workspace.yaml`; on the product side the intent slug comes from
+`.vellum/product.yaml` and the forge is GitHub unless `--forge` says otherwise
+— a product repo declares no forge, because the workspace is where a pair
+states one. Each stub is pinned to `--ref` or, by default, this CLI's own
+version.
 
 ```sh
 cd ../vellum-intent
-vellum init .                            # pins v<this CLI's version>
+vellum init .                            # the three intent-side stubs
 vellum init . --ref main                 # or pin something else
 vellum init . --branch trunk             # if the default branch is not `main`
 vellum init . --ref v0.2.0 --force       # move the STUBS to another ref
+
+cd ../my-product
+vellum init . --ref v0.4.0               # the product side's release-cut stub
 ```
 
-`--branch` is the branch `on-spec-merge` watches, and it is installation *data*,
-not this product's shape: an installation whose default branch is not `main` is
+**Provisioning stamps the intent half only, so the product half is a second
+stamp.** `vellum init --shape …` leaves the product repo with no
+`.github/workflows/` at all and its report names the command that writes one —
+`vellum doctor` in that checkout is the other half of the reminder, reporting
+the stub as missing until it is stamped. That split is the spec's: the stub is
+"stamped by `vellum init` on the product side", a run in that checkout.
+
+A seeded manifest names the files that seed **wrote**, so the product side's
+`owned:` starts as its memory map alone; the stub joins it when the stamp
+writes it, and the stamp's report says so. That is the general rule and not a
+special case for this one file: a stamp owns the files it writes, and nothing
+else — see `vellum upgrade` below.
+
+`--branch` is the branch `on-spec-merge` watches on the intent side and
+`release-cut` watches on the product side, and it is installation *data*, not
+this product's shape: an installation whose default branch is not `main` is
 not a drifted one, and `doctor` exempts the branch list from its `on:`
-comparison for exactly that reason.
+comparison for exactly that reason. **Given nothing, a product checkout is
+stamped for the branch it is on** (`git rev-parse --abbrev-ref HEAD`, falling
+back to `main` when git cannot say) — a product repo on `trunk` would
+otherwise get a `release-cut` watching a branch it never pushes, which never
+runs and which doctor calls installed, since the branch list is the one thing
+it does not compare. An intent checkout keeps `main`: provisioning creates
+that repo with the branch the conversation named and passes it explicitly. The
+report says which of the three answers a run took.
 
 Idempotent: run again over an installed checkout it writes nothing and says so.
 A stub that exists and *differs* is reported and left alone — writing is this
@@ -678,7 +717,7 @@ release that changed what a stub *contains* delivers that when a CLI at that
 release stamps it (`vellum init --ref <new> --force`), which `doctor` asks for by
 comparing the caller half against what ships.
 
-### `vellum doctor [<intent-checkout>]`
+### `vellum doctor [<checkout>] [--product <product-checkout>]`
 
 Verifies installed-matches-shipped from the checkout alone: every shipped
 workflow has a stub, each stub parses, names the shipped workflow, pins a ref,
@@ -719,10 +758,23 @@ a body of its own — the place a retired full copy (`spec-ci-legacy.yml`) could
 go on running on every PR unseen, which is the shape this installer exists to
 replace.
 
+Like `init`, it reads which side of the pair a checkout is and checks that
+side's stubs: three in an intent checkout, `release-cut` in a product one.
+
 ```sh
 vellum doctor .                                     # 1 on a finding, 0 when every stub matches
 vellum doctor . --releases-from ../vellum           # + compare the pinned ref to the newest release
+vellum doctor ../my-intent --product .              # ONE report over both halves of the pair
 ```
+
+**`--product` covers the pair in one report and one exit code**, with a
+per-file verdict for the intent repo's three stubs and the product repo's one.
+An installation is the pair, so a run that exited 0 because the intent half was
+clean is the thing this option exists to stop. The path is an *input* rather
+than something the command finds: `.vellum/workspace.yaml` names the product
+**repository**, and where that repository is checked out on this machine is in
+no file — the same reason `--releases-from` takes a path. It goes with an
+intent checkout and a product checkout, one of each; anything else is exit 2.
 
 A **missing or malformed `.vellum/install.yaml` is a finding.** Currency is a
 fact about the world that an installation can be behind without being broken; a
@@ -871,6 +923,70 @@ the report. Certification does not exist yet, so `--projected` takes the next
 item's cost from a caller that knows — the same shape as `backpressure
 --pending`.
 
+## Release tags
+
+**A release tag is a decorative name the forge mints, on both sides of the
+pair.** The intent side has always had one — every spec merge is tagged
+`spec-vN` by `on-spec-merge`. A product repo gets the same treatment from
+`release-cut`: when its default branch advances to a commit whose declared
+version names a tag that does not exist, the workflow tags that commit
+`v<version>` and pushes it with the job token. Nobody pushes a release tag by
+hand.
+
+**The tag is decoration, and the cut is a different thing.** Versions are
+commits (`spec/decisions/2026-08-28-versions-are-commits.md`), and nothing reads
+a release tag to decide anything — a missing, late or wrong one changes no
+behavior. The *cut* is `vellum release cut`, which pins the merged waves and
+per-repo versions into `ledger/releases.yaml` on the intent side; the tag is the
+friendly stamp such a cut may carry, never the cut.
+
+### Declaring where the version lives
+
+A product repo's `.vellum/product.yaml` carries a `release:` block. It is
+**data**: nothing infers a version from tags, commits or files the block does
+not name.
+
+```yaml
+release:
+  version_source: pyproject.toml          # or package.json, or any other path
+  changelog: src/vellum/seeds/CHANGES.yaml # optional
+```
+
+`version_source` is read by the file's **name**: a `pyproject.toml` yields its
+`[project] version`, a `package.json` its `version`, and any other path yields
+that file's trimmed contents. `changelog`, when given, must carry an entry for
+the version: a YAML changelog with a `releases:` list (this repo's own
+`CHANGES.yaml`, and every seeded one) needs an entry whose `release` is
+`v<version>` or `<version>` — a mention in a comment is not an entry — and any
+other file needs the version at a line or heading boundary (`## 0.4.0`,
+`## [0.4.0] - 2026-09-06`), so `10.4.0` and `0.4.0-rc1` do not describe `0.4.0`.
+
+This repo declares its own block, so its release tag cuts itself.
+
+### `vellum release tag <product-checkout> [--plan]`
+
+Reports the name the declared version mints and the commit it would name. It
+**computes and never applies**: no tag is created, nothing is pushed, and not a
+byte is written into the checkout — `release-cut` is what writes the ref, with
+the forge's own credential. `--plan` is the same answer, stated as one, and
+`--json` is the same answer for a caller that parses it.
+
+| Exit | When | What the report says |
+|---|---|---|
+| `0` | the name is unused | the tag it would mint, and the commit |
+| `0` | the name is **used** | that it is used; the name is not moved, so re-runs and merges that do not bump the version are no-ops |
+| `1` | a declared changelog carries no entry for the version | the file, and the entry it expected; nothing is tagged |
+| `2` | there is no answer | no `release:` block, an unreadable source or changelog, a checkout that is not a product checkout, a version the source cannot yield |
+
+The 1/2 split is load-bearing for the workflow: on `1` it fails the job telling
+an operator which entry to write, and it must never say that about a repository
+it could not read.
+
+```sh
+vellum release tag .                # what would be minted, and on what commit
+vellum release tag . --plan --json  # the same, for the workflow
+```
+
 ## Cutting a release
 
 A release is a tag on this repo, and an installation pins one. Four steps, and
@@ -887,11 +1003,15 @@ anybody has to remember:
    `releases:`, and leave a fresh `template:` behind. The same test fails when
    `v<the version>` has no entry, so the entry goes in *before* the tag rather
    than being remembered after it. This is what `vellum upgrade --plan` prints
-   for the range an installation crosses.
+   for the range an installation crosses. It is no longer only a test: this repo
+   names `CHANGES.yaml` as its changelog, so a version with no entry is one
+   `vellum release tag` refuses and the forge does not name.
 3. **Run the suite.** Beyond the two alarms above, `adapters/github/` is a
    rendering of the stubs at this CLI's version and a test holds it byte-identical
-   — a version bump means re-rendering those three files.
-4. **The owner tags `v<the version>`** and pushes the tag. Only then does
+   — a version bump means re-rendering those four files.
+4. **Merge, and the workflow tags.** `release-cut` tags `v<the version>` on the
+   merge that bumps the version and pushes it; **`v0.3.0` was the last hand-cut
+   tag**, because the workflow ships inside it. Only after the tag exists does
    `EveryReleaseTagHasAShapeEntry`, which reads the repository's real tags, have
    anything to say — which is why steps 1–3 carry their own alarm: a
    tag-reading test cannot fail for a tag nobody has cut yet.
@@ -904,6 +1024,8 @@ anybody has to remember:
 | `tests/` | The `unittest` suite plus fixture spec trees, including failing ones. |
 | `.github/workflows/ci.yml` | CI for **this** repo: tests, plus a conformance check on the pin. |
 | `.github/workflows/{spec-ci,on-spec-merge,harness-ci}.yml` | The **reusable** (`workflow_call`) workflows every installation's intent repo calls. No trigger of their own, so they never run for this repo. |
+| `.github/workflows/release-cut.yml` | The reusable workflow every installation's **product** repo calls, to tag a version bump. Same shape, other side of the pair. |
+| `.github/workflows/release-cut-caller.yml` | This repo's own caller for it, naming the file by **local path** — a repo cannot pin the tag it is about to mint. Not a stub, and not compared against `adapters/`. |
 | `adapters/github/` | The **caller stubs** those installations carry, and their README — see [`adapters/github/README.md`](adapters/github/README.md). |
 | `.vellum/memory/` | Area notes, wave worklogs, and the map. Start at [`.vellum/memory/map.md`](.vellum/memory/map.md). |
 | `.vellum/product.yaml` | Backref to the intent repo, and **the pin of record**. |

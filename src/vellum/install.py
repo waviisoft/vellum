@@ -127,9 +127,12 @@ import yaml
 
 from vellum import __version__
 from vellum import manifest
-from vellum.gitver import GitUnavailable, tags
+from vellum import paths
+from vellum import product
+from vellum.gitver import GitUnavailable, branch as checkout_branch, tags
 from vellum.text import one_line
-from vellum.workspace import SLUG_RE, WorkspaceError, forge as workspace_forge
+from vellum.workspace import WORKSPACE_RELPATH, SLUG_RE, WorkspaceError
+from vellum.workspace import forge as workspace_forge
 from vellum.workspace import intent as workspace_intent
 from vellum.workspace import products as workspace_products
 from vellum.workspace import workspace_path
@@ -151,6 +154,22 @@ WORKFLOWS_DIR = {"github": Path(".github") / "workflows"}
 #: GitLab's ``include:`` as the same core's other emission; until that emission
 #: exists, a workspace naming it is "I cannot answer", not "GitHub will do".
 FORGES = tuple(sorted(WORKFLOWS_DIR))
+
+#: The two sides of a pair, and the file that defines each. An intent repo
+#: carries ``.vellum/workspace.yaml`` — the repo map ``init`` and ``doctor``
+#: both start from — and a product repo carries ``.vellum/product.yaml``, the
+#: pin. Declared HERE rather than in ``vellum.owned`` (which re-exports them)
+#: because a shipped workflow now names the side it is stamped on, and this is
+#: the module that holds the table.
+INTENT, PRODUCT = "intent", "product"
+SIDES = (INTENT, PRODUCT)
+
+#: The forge a PRODUCT checkout's stubs are stamped for. A product repo has no
+#: ``.vellum/workspace.yaml`` and so declares no forge — the workspace is the
+#: intent side's file, and the pair's forge is stated there — so this is the
+#: default the product side stamps with and ``--forge`` is how an installation
+#: says otherwise. Guessing is bounded: there is exactly one forge with stubs.
+PRODUCT_FORGE = "github"
 
 #: A pinnable ref: a tag, a branch, or a sha. Narrow because it is pasted into
 #: a ``uses:`` line the forge then resolves — a value carrying whitespace, a
@@ -176,6 +195,13 @@ DEFAULT_BRANCH = "main"
 #: ignored rather than refused — the same posture ``gitver.TAG_RE`` takes to
 #: the decorative ``spec-v<N>`` names.
 RELEASE_RE = re.compile(r"^v(\d+(?:\.\d+)*)$")
+
+#: The block `vellum release tag` reads out of `.vellum/product.yaml`, named
+#: here for one warning line in the product side's report. This is NOT a second
+#: reader of that file — `vellum.tag` is the reader, `RELEASE_KEY` is its name
+#: for the same key, and a test holds the two equal — it is `init` being able to
+#: say that the stub it just stamped has nothing to read yet.
+RELEASE_BLOCK = "release"
 
 #: The secret every shipped workflow declares.
 SECRET = "VELLUM_TOKEN"
@@ -231,7 +257,15 @@ def default_ref() -> str:
 
 @dataclass(frozen=True)
 class Shipped:
-    """One reusable workflow and the caller stub that invokes it."""
+    """One reusable workflow and the caller stub that invokes it.
+
+    ``side`` is which half of the pair carries the stub, and it defaults to
+    :data:`INTENT` because the first three shipped workflows all run in the
+    intent repo — spec CI, the merge bookkeeping, the harness gate — and there
+    was no other half to name. ``release-cut`` is the product side's first, and
+    the field is what keeps ``init``, ``doctor``, ``upgrade`` and the ownership
+    table from each carrying their own list of which is which.
+    """
 
     name: str
     #: Prose for the top of the stub, after the generated banner.
@@ -245,6 +279,8 @@ class Shipped:
     permissions: str
     #: The stub's ``concurrency:`` block, verbatim.
     concurrency: str
+    #: :data:`INTENT` or :data:`PRODUCT`: which half of the pair carries it.
+    side: str = INTENT
 
     @property
     def filename(self) -> str:
@@ -334,8 +370,61 @@ permissions:
   cancel-in-progress: true""",
 )
 
-#: Everything this repo ships, in the order a report lists it.
-SHIPPED: tuple[Shipped, ...] = (SPEC_CI, ON_SPEC_MERGE, HARNESS_CI)
+RELEASE_CUT = Shipped(
+    name="release-cut",
+    side=PRODUCT,
+    about="""# The release tag a version bump mints, pushed by the forge and never by hand
+# (spec/features/release-tags.md). `vellum release tag` reads the `release:`
+# block in `.vellum/product.yaml` — the version source, and the changelog that
+# must describe it — and names the tag and the commit; this workflow is what
+# creates and pushes it. A used name is reported and left alone, so a merge
+# that does not bump the version is a no-op.
+#
+# THE PRODUCT SIDE'S STUB. The other three run in the intent repo; this one
+# runs here, in the repo whose version it is.
+#
+# NO `paths:` FILTER, DELIBERATELY. A version bump is a change to whatever file
+# the `release:` block names, and an installation may name any file at all — so
+# a filter written here would be this product guessing at that declaration.
+# `vellum release tag` is what decides there is nothing to do, and it decides it
+# in a few seconds.""",
+    triggers="""on:
+  push:
+    branches: ["{branch}"]""",
+    permissions="""# Granted here because a called workflow's token can only be narrowed by the
+# callee, never widened. `contents: write` is what pushes the tag; nothing else
+# in the called workflow writes anything. Tag protection on `v*` — a forge
+# setting, not a repository one — withholds this from the workflow token, and
+# nothing in either checkout can see that it has.
+permissions:
+  contents: write""",
+    concurrency="""# Serialised, and never cancelled. Two runs racing on the same push would
+# both compute the same name and both try to create it; the loser fails a push
+# nobody needed. Cancelling in progress would be worse — a run cancelled
+# between `git tag` and `git push` leaves the name minted nowhere.
+concurrency:
+  group: release-cut
+  cancel-in-progress: false""",
+)
+
+#: Everything this repo ships, in the order a report lists it. The intent side's
+#: three first, in the order they ran before there was a second side, and the
+#: product side's one after them — so a pair's report reads intent-then-product
+#: without anything sorting it.
+SHIPPED: tuple[Shipped, ...] = (SPEC_CI, ON_SPEC_MERGE, HARNESS_CI, RELEASE_CUT)
+
+
+def shipped_for(side: str) -> tuple[Shipped, ...]:
+    """The workflows one side of a pair carries a stub for.
+
+    Every caller that used to iterate :data:`SHIPPED` wants this instead, and
+    the ones that do not — the render-drift check over ``adapters/github/``, and
+    ``installed_shape``, which reads back whichever stubs happen to be there —
+    are the two that are genuinely about the whole table.
+    """
+    if side not in SIDES:
+        raise ValueError(f"{side!r} is not one of {SIDES}")
+    return tuple(shipped for shipped in SHIPPED if shipped.side == side)
 
 BANNER = """# {name} — the caller stub. Stamped by `vellum init`; edit the ref, not the body.
 #
@@ -424,6 +513,72 @@ def render(
     )
 
 
+def side_of(root: Path) -> str:
+    """``intent`` or ``product``, from the file that defines each. Never guessed.
+
+    An intent checkout carries ``.vellum/workspace.yaml`` and a product checkout
+    carries ``.vellum/product.yaml``. A checkout with neither is not an
+    installation, and one with both is a repository that has been made into two
+    things; either way this refuses rather than picking, because the side
+    decides which stubs belong there at all — and stamping an intent repo's
+    three into a product repo would install three workflows with nothing behind
+    them.
+
+    Lives here rather than in ``vellum.upgrade``, which had it first: ``init``
+    and ``doctor`` now ask the same question, and three commands reading one
+    fact through two implementations is how they come to disagree about a
+    checkout that carries both files. ``vellum.upgrade.side_of`` calls this and
+    re-raises in its own error type.
+    """
+    has_intent = (root / WORKSPACE_RELPATH).is_file()
+    has_product = (root / product.PRODUCT_RELPATH).is_file()
+    if has_intent and not has_product:
+        return INTENT
+    if has_product and not has_intent:
+        return PRODUCT
+    if has_intent and has_product:
+        raise InstallError(
+            f"{root} carries both {WORKSPACE_RELPATH.as_posix()} and "
+            f"{product.PRODUCT_RELPATH.as_posix()}, so this cannot tell which "
+            f"side of the pair it is. An intent repo governs product repos and a "
+            f"product repo answers to one intent repo "
+            f"(spec/features/repo-topology.md); one checkout is one of the two."
+        )
+    raise InstallError(
+        f"{root} carries neither {WORKSPACE_RELPATH.as_posix()} nor "
+        f"{product.PRODUCT_RELPATH.as_posix()}, so it is not an installation. "
+        f"Run this in an intent checkout or a product checkout."
+    )
+
+
+def installation_name(root: Path, side: str) -> str:
+    """The intent repo this installation answers to, whichever side it is read from.
+
+    One sentence at the top of both reports, and it has to say the same thing on
+    both halves of a pair — an installation is the pair, and a report headed
+    with the product repo's own slug would make two reports about one thing look
+    like two things.
+    """
+    if side == INTENT:
+        try:
+            return workspace_intent(root)
+        except WorkspaceError as exc:
+            raise InstallError(str(exc)) from exc
+    try:
+        declared = product.load(root)
+    except product.ProductFileError as exc:
+        raise InstallError(str(exc)) from exc
+    slug = (declared.get("intent") or {}).get("repo")
+    if not isinstance(slug, str) or not slug.strip():
+        raise InstallError(
+            f"{product.product_path(root)} declares no `intent.repo`, so this "
+            f"cannot name the installation the checkout belongs to. A product "
+            f"repo answers to exactly one intent repo and the pin file is where "
+            f"it says which (spec/features/repo-topology.md)."
+        )
+    return slug.strip()
+
+
 def check_forge(forge: str) -> str:
     if forge not in WORKFLOWS_DIR:
         raise InstallError(
@@ -435,10 +590,21 @@ def check_forge(forge: str) -> str:
     return forge
 
 
-def read_forge(checkout: str | Path, override: str | None = None) -> str:
-    """The forge to stamp for: ``--forge`` if given, else the workspace's."""
+def read_forge(checkout: str | Path, override: str | None = None,
+               side: str = INTENT) -> str:
+    """The forge to stamp for: ``--forge`` if given, else the workspace's.
+
+    A PRODUCT checkout declares no forge — ``.vellum/workspace.yaml`` is the
+    intent side's file and the pair's forge is stated there — so the product
+    side takes :data:`PRODUCT_FORGE` and ``--forge`` is how an installation says
+    otherwise. That is bounded guessing rather than the open kind: there is
+    exactly one forge this CLI has stubs for, and a workspace naming another is
+    already "I cannot answer" on the side that does declare one.
+    """
     if override is not None:
         return check_forge(override.strip().lower())
+    if side == PRODUCT:
+        return check_forge(PRODUCT_FORGE)
     try:
         return check_forge(workspace_forge(checkout))
     except WorkspaceError as exc:
@@ -574,6 +740,24 @@ class ManifestStamp:
     #: Present on :data:`MANIFEST_WROTE` and :data:`MANIFEST_HELD`: the sentence
     #: the report prints under the outcome.
     note: str = ""
+    #: Paths this run added to `owned:` — the stubs it WROTE that the manifest
+    #: did not already name. Recorded even when the release line is held, so the
+    #: report can say which files became Vellum's on this run.
+    added: tuple[str, ...] = ()
+
+
+#: Where the branch a stub watches came from, for the one line of the report
+#: that says so. An operator whose stub watches the wrong branch has to be able
+#: to tell "I did not pass `--branch`" from "this checkout is on `trunk`".
+BRANCH_GIVEN, BRANCH_CHECKOUT, BRANCH_DEFAULT = "given", "checkout", "default"
+
+#: How each of those reads in the report. `--branch` is what changes any of
+#: them, so the line says which one this run took rather than only the name.
+_BRANCH_SOURCES = {
+    BRANCH_GIVEN: "given as --branch",
+    BRANCH_CHECKOUT: "the branch this checkout is on",
+    BRANCH_DEFAULT: "the default, since no --branch was given",
+}
 
 
 @dataclass
@@ -590,22 +774,37 @@ class Init:
     currency: Currency
     stamps: list[Stamp]
     manifest: ManifestStamp | None = None
+    #: Which half of the pair was stamped. The stubs differ per side and so does
+    #: what the header can honestly say: a product checkout carries no product
+    #: map, and its branch is watched by `release-cut` rather than
+    #: `on-spec-merge`.
+    side: str = INTENT
+    #: Where :attr:`branch` came from: :data:`BRANCH_GIVEN`,
+    #: :data:`BRANCH_CHECKOUT` or :data:`BRANCH_DEFAULT`.
+    branch_source: str = BRANCH_GIVEN
+    #: Whether the product checkout declares a `release:` block. None on the
+    #: intent side, which carries no such file and no `release-cut` stub.
+    declares_release: bool | None = None
 
     def report(self) -> str:
+        watcher = "on-spec-merge" if self.side == INTENT else "release-cut"
         lines = [
-            f"vellum init — {self.forge} caller stubs in {self.checkout}",
+            f"vellum init — {self.forge} {self.side}-side caller stubs "
+            f"in {self.checkout}",
             f"  intent repo:  {self.intent}",
-            f"  branch:       {self.branch} (what on-spec-merge watches)",
+            f"  branch:       {self.branch} (what {watcher} watches; "
+            f"{_BRANCH_SOURCES[self.branch_source]})",
             f"  workflows:    {self.host} at {self.ref}",
-            "  products:     " + ", ".join(
+        ]
+        if self.side == INTENT:
+            lines.append("  products:     " + ", ".join(
                 # Read out of `.vellum/workspace.yaml`, which anyone who can
                 # land a merge in the intent repo writes, and printed into a
                 # report a caller may pipe into a forge step summary.
                 f"{one_line(name)} ({one_line(repo) or 'no repo declared'})"
                 for name, repo in sorted(self.products.items())
-            ),
-            "",
-        ]
+            ))
+        lines.append("")
         for stamp in self.stamps:
             lines.append(f"  {stamp.outcome:<11} {stamp.path}")
         lines.append("")
@@ -632,6 +831,32 @@ class Init:
                 "secret and the caller half — so a comment somebody added is a "
                 "difference here and no finding there."
             )
+        if self.declares_release is False:
+            # A warning, not a finding: this command's job is the stub, and the
+            # stub is correctly stamped. What is missing is the declaration the
+            # stub's workflow reads, and it is missing in the one place nothing
+            # else will mention it until a push fails — `vellum release tag`
+            # exits 2 for a repo that has not declared where its version lives,
+            # so `release-cut` fails on the next push to this branch rather than
+            # guessing a version out of a file that happens to be lying there.
+            lines += [
+                f"WARNING: {product.PRODUCT_RELPATH.as_posix()} declares no "
+                f"`{RELEASE_BLOCK}:` block, so the stub just stamped has nothing "
+                f"to read.",
+                f"  `release-cut` runs on the next push to {self.branch} and "
+                f"fails at exit 2: a repo that has not declared where its "
+                f"version lives is one `vellum release tag` cannot answer about, "
+                f"and it says so rather than inferring one. Add, in "
+                f"{product.PRODUCT_RELPATH.as_posix()}:",
+                "",
+                f"      {RELEASE_BLOCK}:",
+                "        version_source: pyproject.toml   # or package.json, "
+                "or any path",
+                "        changelog: CHANGELOG.md          # optional; a version "
+                "it does not describe is not tagged",
+                "",
+                "  (spec/features/release-tags.md).",
+            ]
         lines.append("")
         if self.manifest is not None:
             lines.append(
@@ -639,6 +864,17 @@ class Init:
                 f"{self.manifest.outcome}"
                 + (f", vellum: {self.manifest.release}" if self.manifest.release else "")
             )
+            if self.manifest.added:
+                # Said out loud, because it is the one thing a stamp changes
+                # about the manifest that is not the release line: these files
+                # are Vellum's from now on and `vellum upgrade` will rewrite
+                # them. An operator who disagrees takes the line back out.
+                lines.append(
+                    f"  added to {manifest.OWNED_KEY}: "
+                    + ", ".join(self.manifest.added)
+                    + " — written by this stamp, so `vellum upgrade` restamps "
+                      "them from here on."
+                )
             if self.manifest.note:
                 lines.append(f"  {self.manifest.note}")
             lines.append("")
@@ -678,6 +914,55 @@ CANNOT_KNOW = [
 ]
 
 
+def resolve_branch(root: Path, given: str | None, *,
+                   side: str) -> tuple[str, str]:
+    """The branch the stubs watch, and where that answer came from.
+
+    ``--branch`` wins wherever it is given. With nothing given the two sides
+    differ, and the asymmetry is the difference between the two repositories:
+
+    * a **product** checkout is a repository Vellum did not create, stamped by a
+      run in it, and its own ``HEAD`` says what its default branch is called. A
+      product repo on ``trunk`` stamped with no ``--branch`` got a `release-cut`
+      that watches ``main`` — a workflow that never runs, in a file `doctor`
+      calls installed because the branch list is exempt from its comparison
+      (see ``_comparable_on``), which is a silent failure by construction.
+    * an **intent** checkout keeps :data:`DEFAULT_BRANCH`. Provisioning creates
+      that repository with the branch the conversation named and passes it here
+      explicitly, so a run with nothing given is one where nothing else knows
+      either — and `main` stays what it always was.
+
+    ``HEAD`` and not ``origin/HEAD``: the question is which branch this checkout
+    is on, which is answerable in a repository with no remote at all — a
+    ``--into`` staging directory, a fresh ``git init`` — where ``origin/HEAD``
+    says nothing. When git cannot answer (not a repository, a detached HEAD, no
+    commit yet, no git at all) this falls back to :data:`DEFAULT_BRANCH` rather
+    than refusing: `init` stamps a checkout, and a checkout with no branch is
+    still one to stamp.
+    """
+    if given is not None:
+        return given, BRANCH_GIVEN
+    if side == PRODUCT:
+        found = checkout_branch(root)
+        if found is not None:
+            if not REF_RE.match(found):
+                # Refused here rather than in `render`, which would blame a
+                # `--branch` nobody passed. Not fallen back from, either:
+                # stamping `main` for a checkout that is demonstrably on
+                # something else is the silent failure this default exists to
+                # end, and a name this cannot write into a `branches:` list is
+                # one the operator has to name themselves.
+                raise InstallError(
+                    f"{root} is on the branch {one_line(found)!r}, which cannot "
+                    f"be stamped into a trigger's `branches:` list — it is not a "
+                    f"plain branch name of the kind `git check-ref-format` "
+                    f"accepts. Name the branch this installation's `release-cut` "
+                    f"should watch with `--branch`."
+                )
+            return found, BRANCH_CHECKOUT
+    return DEFAULT_BRANCH, BRANCH_DEFAULT
+
+
 def init(
     checkout: str | Path,
     ref: str | None = None,
@@ -685,23 +970,64 @@ def init(
     forge: str | None = None,
     force: bool = False,
     releases_from: str | Path | None = None,
-    branch: str = DEFAULT_BRANCH,
+    branch: str | None = None,
 ) -> Init:
-    """Stamp the caller stubs into an intent checkout. Idempotent."""
+    """Stamp the caller stubs into either side of a pair. Idempotent.
+
+    Which side is read off the checkout (:func:`side_of`) and never given: an
+    intent checkout gets the three that run there, a product checkout gets
+    ``release-cut``, and a directory that is neither is refused. That refusal is
+    the same one this command always made — it used to be spelled "is this an
+    intent checkout?" — and it is still exit 2; what changed is that the other
+    half of the pair is now an answer rather than a case of it.
+
+    ``branch`` None means "nobody said", and what that resolves to differs by
+    side — see :func:`resolve_branch`.
+    """
     root = Path(checkout)
     if not root.is_dir():
-        raise InstallError(f"{root}: not a directory; is this an intent checkout?")
-    chosen = read_forge(root, forge)
-    try:
-        intent_slug = workspace_intent(root)
-        declared = workspace_products(root)
-    except WorkspaceError as exc:
-        raise InstallError(str(exc)) from exc
+        raise InstallError(
+            f"{root}: not a directory; is this an intent or product checkout?"
+        )
+    side = side_of(root)
+    branch, branch_source = resolve_branch(root, branch, side=side)
+    chosen = read_forge(root, forge, side=side)
+    intent_slug = installation_name(root, side)
+    declared: dict[str, str] = {}
+    declares_release: bool | None = None
+    if side == INTENT:
+        try:
+            declared = workspace_products(root)
+        except WorkspaceError as exc:
+            raise InstallError(str(exc)) from exc
+    else:
+        # Read after `installation_name`, which has already turned an unreadable
+        # pin file into an InstallError, so this is a question about a file that
+        # parses.
+        declares_release = isinstance(
+            product.load(root).get(RELEASE_BLOCK), dict
+        )
     pinned = ref if ref is not None else default_ref()
 
     directory = root / WORKFLOWS_DIR[chosen]
+    # Where the stubs go is checked ONCE, before the first one is written. The
+    # path is this product's own constant, so nothing lexical can be wrong with
+    # it — and everything about the *tree* still can: a `.github/workflows` that
+    # is a symlink is a stamp written wherever it points, `.git/hooks/` among the
+    # places a relative link reaches, and a hook written there is run by the next
+    # commit in that checkout. `vellum upgrade` has made this check since it
+    # first wrote an owned path (`vellum.paths`); `init` writes files too, and on
+    # both sides of the pair now.
+    for shipped in shipped_for(side):
+        relative = (WORKFLOWS_DIR[chosen] / shipped.filename).as_posix()
+        refusal = paths.unsafe_stub(root, relative)
+        if refusal is not None:
+            raise InstallError(
+                f"{root / relative}: this is not a path to stamp a stub into — "
+                f"{refusal}"
+            )
     stamps: list[Stamp] = []
-    for shipped in SHIPPED:
+    for shipped in shipped_for(side):
         path = directory / shipped.filename
         text = render(shipped, host=host, ref=pinned, forge=chosen, branch=branch)
         existing: str | None = None
@@ -745,65 +1071,112 @@ def init(
         currency=currency(releases_from),
         stamps=stamps,
         manifest=stamp_manifest(root, ref=pinned, stamps=stamps),
+        side=side,
+        branch_source=branch_source,
+        declares_release=declares_release,
+    )
+
+
+def _held_by_a_left_stub(ref: str) -> str:
+    """The note for a run that left a stub alone. One sentence, said twice."""
+    return (
+        f"a stub exists and differs and was not restamped, so this installation "
+        f"has not been brought to {ref}. Recording the release anyway would "
+        f"leave the next upgrade comparing that stub against the wrong "
+        f"release's template. `vellum init --force` restamps, and then this is "
+        f"refreshed."
     )
 
 
 def stamp_manifest(root: Path, *, ref: str, stamps: list[Stamp]) -> ManifestStamp:
     """Write or refresh ``.vellum/install.yaml`` after a stamp.
 
-    The rule is one sentence: **the release line is a claim that the
-    installation was brought to that ref**, so a run that left a stub alone
-    records nothing. Everything else here follows from it — a stamp over an
-    installation with no manifest writes one whose owned set is the stubs and
-    nothing else, because those are the only files this command wrote and the
-    only ones it can honestly say Vellum owns.
+    Two claims live in this file and they move on different rules.
 
-    The same sentence is why an owned set wider than the stubs **holds** the
-    release line rather than refreshing it. A stamp writes the stubs and nothing
-    else: it does not read `.vellum/config.yaml` or the harness machinery, let
-    alone bring them to *ref*. Refreshing the line anyway would move the release
-    every owned file is compared against while leaving those files at the
-    release before it — so the next `vellum upgrade --to <ref>` would find every
-    one of them differing from *ref*'s template and refuse the whole set as
-    edits this installation had made. `vellum upgrade` is the command that moves
-    them, and it restamps the stubs itself on the way.
+    **The release line** is a claim that the installation was brought to *ref*,
+    so a run that left a stub alone records nothing, and an owned set wider than
+    the stubs **holds** the line rather than refreshing it. A stamp writes the
+    stubs and nothing else: it does not read `.vellum/config.yaml` or the
+    harness machinery, let alone bring them to *ref*. Refreshing the line anyway
+    would move the release every owned file is compared against while leaving
+    those files at the release before it — so the next `vellum upgrade --to
+    <ref>` would find every one of them differing from *ref*'s template and
+    refuse the whole set as edits this installation had made. `vellum upgrade`
+    is the command that moves them, and it restamps the stubs on the way.
+
+    **The owned set** gains the files this run WROTE, and it gains them even
+    when the release line is held. Those files are Vellum's by construction —
+    they are the stubs this command just wrote, which is the same rule ("the
+    files a stamp writes") that decides the set for an installation with no
+    manifest at all. Held back, they were a file Vellum had written into a
+    checkout and would then never rewrite: a pair provisioned before the product
+    side had a stub kept a manifest that did not name it, so `vellum upgrade`
+    passed over the one file `vellum init` had put there, forever. The two
+    claims are independent, and this is where that shows: an installation whose
+    line is held still has the new stub recorded, and the report says which.
+
+    What is NOT added is a stub that was already installed or was left alone. A
+    path missing from `owned:` where the file exists is an operator's edit —
+    "leave it as it is and it stays yours" — and re-adding it on the next run
+    would undo the one edit the refusal exists to invite.
     """
     path = manifest.path_for(root)
-    if any(stamp.outcome == LEFT for stamp in stamps):
-        return ManifestStamp(path, MANIFEST_HELD, note=(
-            "a stub exists and differs and was not restamped, so this "
-            "installation has not been brought to " + ref + ". Recording the "
-            "release anyway would leave the next upgrade comparing that stub "
-            "against the wrong release's template. `vellum init --force` "
-            "restamps, and then this is refreshed."
-        ))
     # A malformed manifest is "I could not answer", not something to overwrite:
     # the file records which files are the INSTALLATION'S, and replacing an
     # unreadable one with a default would silently take back ownership of every
     # file the operator had removed from it.
     existing = manifest.read(root)
-    owned = (
-        existing.owned if existing is not None
-        else tuple(sorted(
-            stamp.path.relative_to(root).as_posix() for stamp in stamps
+    stubs = {stamp.path.relative_to(root).as_posix() for stamp in stamps}
+    written = {
+        stamp.path.relative_to(root).as_posix()
+        for stamp in stamps if stamp.outcome == WROTE
+    }
+    left = any(stamp.outcome == LEFT for stamp in stamps)
+
+    if existing is None:
+        if left:
+            return ManifestStamp(path, MANIFEST_HELD, note=_held_by_a_left_stub(ref))
+        owned = tuple(sorted(stubs))
+        manifest.write(root, ref, owned)
+        return ManifestStamp(path, MANIFEST_WROTE, release=ref, note=(
+            f"this installation had no manifest, so one was written with the "
+            f"{len(owned)} caller stub(s) as the owned set and nothing else. A "
+            f"stamp runs in a checkout whose repos already existed and cannot "
+            f"know whether the rest of the tree came from a Vellum seed or from "
+            f"your own hand — add the seeded files you want upgrades to rewrite "
+            f"(`{manifest.OWNED_KEY}:`), or leave it as it is and they stay "
+            f"yours."
         ))
-    )
+
+    added = tuple(sorted(written - set(existing.owned)))
+    owned = tuple(sorted(set(existing.owned) | written))
+
+    if left:
+        if added:
+            manifest.write(root, existing.release, owned)
+        return ManifestStamp(
+            path, MANIFEST_HELD, release=existing.release if added else None,
+            added=added, note=_held_by_a_left_stub(ref),
+        )
     # Compared as DATA, not as text. A manifest an operator has reflowed or
     # commented carries the same two claims, and rewriting it to canonicalise
     # them would make this command edit a file it had nothing to say about —
     # which is the same rule that leaves a hand-edited stub alone.
-    if existing is not None and existing.release == ref and existing.owned == owned:
+    if existing.release == ref and existing.owned == owned:
         return ManifestStamp(path, MANIFEST_CURRENT, release=ref)
     # The release line is a claim about the FILES, and a stamp only ever wrote
     # the stubs. So it may refresh the line only for an installation whose owned
     # set is stubs and nothing else; anything wider is `vellum upgrade`'s to
     # move, and moving it here would arm a refusal for every other owned file.
     # "The files a stamp writes" is not a table to consult: it is the stamps
-    # this run just made.
-    stubs = {stamp.path.relative_to(root).as_posix() for stamp in stamps}
-    if existing is not None and existing.release != ref and not set(owned) <= stubs:
+    # this run just made. The owned set still gains what this run wrote — that
+    # claim is about the files and not about the release.
+    if existing.release != ref and not set(owned) <= stubs:
         outside = sorted(set(owned) - stubs)
-        return ManifestStamp(path, MANIFEST_HELD, release=existing.release, note=(
+        if added:
+            manifest.write(root, existing.release, owned)
+        return ManifestStamp(path, MANIFEST_HELD, release=existing.release,
+                             added=added, note=(
             f"this installation owns {len(outside)} file(s) a stamp does not "
             f"write ({one_line(', '.join(outside))}), so the release line stays "
             f"at {existing.release}. A stamp brings the STUBS to {ref} and "
@@ -813,16 +1186,7 @@ def stamp_manifest(root: Path, *, ref: str, stamps: list[Stamp]) -> ManifestStam
             f"files and the line together, and restamps the stubs on the way."
         ))
     manifest.write(root, ref, owned)
-    if existing is not None:
-        return ManifestStamp(path, MANIFEST_REFRESHED, release=ref)
-    return ManifestStamp(path, MANIFEST_WROTE, release=ref, note=(
-        f"this installation had no manifest, so one was written with the "
-        f"{len(owned)} caller stub(s) as the owned set and nothing else. A stamp "
-        f"runs in a checkout whose repos already existed and cannot know whether "
-        f"the rest of the tree came from a Vellum seed or from your own hand — "
-        f"add the seeded files you want upgrades to rewrite "
-        f"(`{manifest.OWNED_KEY}:`), or leave it as it is and they stay yours."
-    ))
+    return ManifestStamp(path, MANIFEST_REFRESHED, release=ref, added=added)
 
 
 def run_init(
@@ -832,7 +1196,7 @@ def run_init(
     forge: str | None = None,
     force: bool = False,
     releases_from: str | None = None,
-    branch: str = DEFAULT_BRANCH,
+    branch: str | None = None,
     out=None,
 ) -> int:
     """Report what was stamped. Exit 0: it wrote, or there was nothing to do."""
@@ -1314,14 +1678,24 @@ class Doctor:
     strays: list[Finding] = field(default_factory=list)
     #: Findings about ``.vellum/install.yaml``: absent, or malformed.
     manifest: list[Finding] = field(default_factory=list)
+    #: Which half of the pair this report is about.
+    side: str = INTENT
+    #: The other half, when ``--product`` named one. ONE report covers the pair
+    #: (``spec/features/release-tags.md``: "vellum doctor verifies it beside the
+    #: intent repo's stubs"), because "beside" is a claim about one installation
+    #: and two reports run separately cannot make it: an exit 0 with the
+    #: product's stub never looked at is exactly the failure the sentence is
+    #: about.
+    paired: "Doctor | None" = None
 
     @property
     def findings(self) -> list[Finding]:
-        return (
+        own = (
             [f for _, found, _, _ in self.stubs for f in found]
             + self.strays
             + self.manifest
         )
+        return own + (self.paired.findings if self.paired is not None else [])
 
     @property
     def manifest_line(self) -> str:
@@ -1338,8 +1712,22 @@ class Doctor:
         )
 
     def report(self) -> str:
+        """The whole report: this half, the other half when there is one, and
+        the blind spots once at the end.
+
+        ``CANNOT_KNOW`` is printed once rather than per half because it is a
+        list of things no CHECKOUT can see — forge state, an Actions setting on
+        a third repository — and a pair has the same blind spots twice.
+        """
+        lines = self.body()
+        if self.paired is not None:
+            lines += ["", "=" * 72, ""] + self.paired.body()
+        return "\n".join(lines + [""] + CANNOT_KNOW)
+
+    def body(self) -> list[str]:
         lines = [
-            f"vellum doctor — {self.forge} caller stubs in {self.checkout}",
+            f"vellum doctor — {self.forge} {self.side}-side caller stubs "
+            f"in {self.checkout}",
             f"  intent repo:  {self.intent}",
             f"  shipped from: {self.host}",
             f"  manifest:     {self.manifest_line}",
@@ -1396,9 +1784,7 @@ class Doctor:
         lines += self.upgrade_advice()
         lines.append("")
         lines += self.compatibility()
-        lines.append("")
-        lines += CANNOT_KNOW
-        return "\n".join(lines)
+        return lines
 
     def upgrade_advice(self) -> list[str]:
         """How THIS installation moves to a newer release — not how one does.
@@ -1427,7 +1813,8 @@ class Doctor:
             return [stubs_only]
         if found is None:
             return [stubs_only]
-        stubs = {(WORKFLOWS_DIR[self.forge] / s.filename).as_posix() for s in SHIPPED}
+        stubs = {(WORKFLOWS_DIR[self.forge] / s.filename).as_posix()
+                 for s in shipped_for(self.side)}
         outside = sorted(set(found.owned) - stubs)
         if not outside:
             return [stubs_only]
@@ -1493,49 +1880,103 @@ def doctor(
     host: str = HOST_REPO,
     forge: str | None = None,
     releases_from: str | Path | None = None,
+    product_checkout: str | Path | None = None,
 ) -> Doctor:
-    """Check installed-matches-shipped from the checkout alone."""
+    """Check installed-matches-shipped from the checkout alone.
+
+    With *product_checkout* the answer covers **both halves of the pair in one
+    report**. That is the shape ``spec/features/release-tags.md`` asks for —
+    "vellum doctor verifies it beside the intent repo's stubs" — and the local
+    path is an input rather than something this finds, for the reason
+    ``--releases-from`` and ``vellum upgrade --from`` take theirs:
+    ``.vellum/workspace.yaml`` names the product **repository**, and where that
+    repository is checked out on this machine is not a fact any checkout holds.
+    """
     root = Path(checkout)
     if not root.is_dir():
-        raise InstallError(f"{root}: not a directory; is this an intent checkout?")
-    chosen = read_forge(root, forge)
+        raise InstallError(
+            f"{root}: not a directory; is this an intent or product checkout?"
+        )
     # Read unconditionally, even when `--forge` made the forge knowable without
     # it. `read_forge` short-circuits on the override, and without this a
     # `doctor --forge github` pointed at any directory at all reported three
     # missing stubs and exited 1 — "a finding" for what is plainly "I could not
     # answer", plus a stderr line naming a workspace file that does not exist.
-    # A checkout with no workspace is not an installation to have findings about.
-    #
-    # Through `workspace.intent()`, the same accessor `init` uses, so the two
-    # commands refuse the same files: a workspace with no `intent:` key is one
-    # neither of them can name the installation from, and doctor reporting it as
-    # three missing stubs was that same "a finding for what is I-cannot-answer"
-    # one key further in.
-    try:
-        intent_slug = workspace_intent(root)
-    except WorkspaceError as exc:
-        raise InstallError(str(exc)) from exc
+    # A checkout that is neither side is not an installation to have findings
+    # about, and `side_of` is where that is decided for both commands.
+    side = side_of(root)
+    chosen = read_forge(root, forge, side=side)
+    # Through the same accessor `init` uses, so the two commands refuse the same
+    # files: a workspace with no `intent:` key is one neither of them can name
+    # the installation from, and doctor reporting it as three missing stubs was
+    # that same "a finding for what is I-cannot-answer" one key further in.
+    intent_slug = installation_name(root, side)
     directory = WORKFLOWS_DIR[chosen]
+    mine = shipped_for(side)
     stubs = []
-    for shipped in SHIPPED:
+    for shipped in mine:
         relative = (directory / shipped.filename).as_posix()
         found, ref, cli_ref = inspect(
             root / directory / shipped.filename, shipped,
             host=host, forge=chosen, relative=relative,
         )
         stubs.append((relative, found, ref, cli_ref))
+
+    paired = None
+    if product_checkout is not None:
+        paired = _paired(
+            root, side, product_checkout,
+            host=host, forge=forge, releases_from=releases_from,
+        )
     return Doctor(
         checkout=root, forge=chosen, host=host, intent=intent_slug,
         currency=currency(releases_from), stubs=stubs,
         strays=strays(
             root / directory, host=host,
-            known={s.filename for s in SHIPPED}, relative_to=directory,
+            # The side's own stubs, not the whole table. A `release-cut.yml`
+            # sitting in an INTENT repo is a workflow with no reusable workflow
+            # behind it for that half, and a `known` set that covered the whole
+            # pair would pass over it in silence.
+            known={s.filename for s in mine}, relative_to=directory,
         ),
-        manifest=manifest_findings(root, chosen),
+        manifest=manifest_findings(root, chosen, side=side),
+        side=side,
+        paired=paired,
     )
 
 
-def manifest_findings(root: Path, forge: str = "github") -> list[Finding]:
+def _paired(root: Path, side: str, product_checkout: str | Path, *,
+            host: str, forge: str | None,
+            releases_from: str | Path | None) -> Doctor:
+    """The product half of a ``doctor <intent> --product <product>`` run.
+
+    Both halves are checked to be the halves they are said to be, and neither
+    check is pedantry. ``--product`` naming the intent checkout again would
+    produce a report that covered the same three stubs twice and said nothing
+    about the product side, at exit 0 — which is precisely the "an exit 0 that
+    never looked at it" failure the pair report exists to make impossible.
+    """
+    if side != INTENT:
+        raise InstallError(
+            f"--product covers the other half of a pair, so it goes with an "
+            f"INTENT checkout; {root} is the {side} half. Run "
+            f"`vellum doctor {root}` on its own, or point this at the intent "
+            f"checkout and pass the product one to --product."
+        )
+    other = Path(product_checkout)
+    if not other.is_dir():
+        raise InstallError(f"--product {other}: not a directory.")
+    if side_of(other) != PRODUCT:
+        raise InstallError(
+            f"--product {other} is not a product checkout: it carries "
+            f"{WORKSPACE_RELPATH.as_posix()} rather than "
+            f"{product.PRODUCT_RELPATH.as_posix()}. A pair is one of each."
+        )
+    return doctor(other, host=host, forge=forge, releases_from=releases_from)
+
+
+def manifest_findings(root: Path, forge: str = "github",
+                      side: str = INTENT) -> list[Finding]:
     """Findings about ``.vellum/install.yaml``: absent, or malformed.
 
     A finding rather than a report, and the difference from ref currency beside
@@ -1552,7 +1993,8 @@ def manifest_findings(root: Path, forge: str = "github") -> list[Finding]:
     init`" without the second half has to run it to find out what it claimed.
     """
     relative = manifest.MANIFEST_RELPATH.as_posix()
-    stubs = sorted((WORKFLOWS_DIR[forge] / s.filename).as_posix() for s in SHIPPED)
+    stubs = sorted((WORKFLOWS_DIR[forge] / s.filename).as_posix()
+                   for s in shipped_for(side))
     try:
         found = manifest.read(root)
     except manifest.ManifestError as exc:
@@ -1581,17 +2023,28 @@ def run_doctor(
     host: str = HOST_REPO,
     forge: str | None = None,
     releases_from: str | None = None,
+    product_checkout: str | None = None,
     out=None,
 ) -> int:
-    """Report the installation. Exit 1 on a finding, 0 when every stub matches."""
+    """Report the installation. Exit 1 on a finding, 0 when every stub matches.
+
+    One code for the pair when ``--product`` named one: an installation is the
+    pair, and a run that exited 0 because the intent half was clean would be the
+    thing this option exists to stop.
+    """
     stream = out if out is not None else sys.stdout
-    result = doctor(checkout, host=host, forge=forge, releases_from=releases_from)
+    result = doctor(checkout, host=host, forge=forge, releases_from=releases_from,
+                    product_checkout=product_checkout)
     print(result.report(), file=stream)
     if result.findings:
+        where = (
+            workspace_path(result.checkout) if result.side == INTENT
+            else product.product_path(result.checkout)
+        )
         print(
             f"vellum: doctor — {len(result.findings)} finding(s); what is installed "
             f"is not what {result.host} ships "
-            f"(see {workspace_path(result.checkout)} for this installation)",
+            f"(see {where} for this installation)",
             file=sys.stderr,
         )
         return 1

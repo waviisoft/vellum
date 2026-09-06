@@ -1,6 +1,15 @@
-# Runtime dependencies. Two, both pure-data libraries, both pinned by range:
+# Runtime dependencies. Three, all pure-data libraries, all pinned by range:
 #   PyYAML          - frontmatter and ledger records are YAML; no stdlib parser exists.
 #   gherkin-official - the Cucumber parser itself (decision D5), so lint agrees
 #                      with whatever runs the suite in v0.2.
+#   tomli            - BELOW 3.11 ONLY. `vellum release tag` reads a
+#                      `pyproject.toml` version source, `tomllib` arrives in the
+#                      standard library at 3.11, and the declared floor is 3.10.
+#                      It is the module `tomllib` was adopted from, so the two
+#                      are one reader spelled twice; conditional rather than
+#                      unconditional because installing a backport of a stdlib
+#                      module beside the stdlib module is how a wheel comes to
+#                      carry two of them.
 PyYAML>=6.0,<7
 gherkin-official>=29,<43
+tomli>=1.1.0,<3; python_version < "3.11"

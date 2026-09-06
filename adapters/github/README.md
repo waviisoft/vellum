@@ -1,10 +1,10 @@
 # GitHub adapter — the caller stubs
 
-Three **caller stubs** for an installation's intent repo. Each is a dozen lines
-that name a reusable workflow in this repo at a pinned ref, and pass
-`VELLUM_TOKEN` if the installation has one to pass — that secret is optional
-(see [Prerequisites](#prerequisites)). The logic lives in
-[`.github/workflows/`](../../.github/workflows/) of this repo, as
+Four **caller stubs**, three for an installation's intent repo and one for its
+product repo. Each is a dozen lines that name a reusable workflow in this repo
+at a pinned ref, and pass `VELLUM_TOKEN` if the installation has one to pass —
+that secret is optional (see [Prerequisites](#prerequisites)). The logic lives
+in [`.github/workflows/`](../../.github/workflows/) of this repo, as
 `workflow_call` workflows, and is reviewed there alongside the CLI it calls.
 
 The committed copies here are stamped for **this** repo's own installation,
@@ -13,11 +13,40 @@ it is something `vellum init` restamps for yours. What is not restamped, and
 what a fork has to change by hand, is listed under
 [Prerequisites](#prerequisites).
 
-| Stub | Reusable workflow | Trigger | Does |
-|---|---|---|---|
-| `spec-ci.yml` | [`../../.github/workflows/spec-ci.yml`](../../.github/workflows/spec-ci.yml) | `pull_request` touching `spec/**`, `ledger/**`, `.vellum/config.yaml` or the stub itself | `vellum lint` + `vellum suite extract`, uploads `suite.json`, summarises the scenarios the PR introduces or changes, and runs `vellum backpressure` (reporting, not blocking). The three agent reviews are stubs. |
-| `on-spec-merge.yml` | [`../../.github/workflows/on-spec-merge.yml`](../../.github/workflows/on-spec-merge.yml) | `push` to `main` touching `spec/**` | `vellum mint` opens the ledger record for the merge commit; the workflow tags the decorative name, extracts the suite, files work-item issues from `workplan.yaml`, commits and pushes. The planner is a stub. |
-| `harness-ci.yml` | [`../../.github/workflows/harness-ci.yml`](../../.github/workflows/harness-ci.yml) | `pull_request`, **every** one | `vellum verify boundaries` against the harness engineer's trees on any PR that writes `harness/`, and `python3 harness/run.py` — which fails on an UNDEFINED scenario — plus a check that the committed `harness/conformance.md` matches a fresh run. |
+| Stub | Side | Reusable workflow | Trigger | Does |
+|---|---|---|---|---|
+| `spec-ci.yml` | intent | [`../../.github/workflows/spec-ci.yml`](../../.github/workflows/spec-ci.yml) | `pull_request` touching `spec/**`, `ledger/**`, `.vellum/config.yaml` or the stub itself | `vellum lint` + `vellum suite extract`, uploads `suite.json`, summarises the scenarios the PR introduces or changes, and runs `vellum backpressure` (reporting, not blocking). The three agent reviews are stubs. |
+| `on-spec-merge.yml` | intent | [`../../.github/workflows/on-spec-merge.yml`](../../.github/workflows/on-spec-merge.yml) | `push` to `main` touching `spec/**` | `vellum mint` opens the ledger record for the merge commit; the workflow tags the decorative name, extracts the suite, files work-item issues from `workplan.yaml`, commits and pushes. The planner is a stub. |
+| `harness-ci.yml` | intent | [`../../.github/workflows/harness-ci.yml`](../../.github/workflows/harness-ci.yml) | `pull_request`, **every** one | `vellum verify boundaries` against the harness engineer's trees on any PR that writes `harness/`, and `python3 harness/run.py` — which fails on an UNDEFINED scenario — plus a check that the committed `harness/conformance.md` matches a fresh run. |
+| `release-cut.yml` | **product** | [`../../.github/workflows/release-cut.yml`](../../.github/workflows/release-cut.yml) | `push` to the default branch, no `paths:` filter | `vellum release tag` reads the `release:` block in `.vellum/product.yaml` and names the tag the declared version mints; when that name is unused the workflow creates `v<version>` at the pushed commit and pushes it. A used name is a notice and a no-op. |
+
+## The product side's stub
+
+`release-cut.yml` is the one stub that is **not** the intent repo's, and it is
+the only file Vellum stamps into a product repo. Three things follow from that
+and none of them is guesswork on the command's part:
+
+* **It is stamped by `vellum init` run in the product checkout.** `vellum init`
+  reads which side of the pair a checkout is — `.vellum/workspace.yaml` makes it
+  the intent half, `.vellum/product.yaml` the product half — and stamps that
+  side's stubs. Provisioning (`vellum init --shape …`) stamps the intent half
+  only, so a freshly provisioned pair needs a second stamp; its report names the
+  command, and `vellum doctor` in the product checkout reports the stub as
+  missing until it is made.
+* **It needs a `release:` block to do anything.** The block lives in
+  `.vellum/product.yaml` and names `version_source:` and, optionally,
+  `changelog:` — see [Release tags](../../README.md#release-tags). Without it
+  `vellum release tag` exits 2 and the workflow fails saying so, rather than
+  inferring a version from a file that happens to be lying there.
+* **Its `permissions: contents: write` is the caller's to grant.** A called
+  workflow's token can only be narrowed by the callee, so the grant has to be in
+  the stub; a stub that grants less makes a job refused at the push. A tag
+  protection rule on `v*` withholds it even when the grant is right, and that is
+  forge state no checkout can see.
+
+`vellum doctor <intent-checkout> --product <product-checkout>` verifies all four
+in one report, which is the only way to ask about an installation rather than
+about one of its halves.
 
 ## Installing
 
@@ -31,14 +60,20 @@ cd /path/to/your-intent-repo     # `../vellum-intent`, in this repo's own layout
 vellum init .                    # pins this CLI's own version
 vellum init . --ref main         # or pin something else
 vellum init . --branch trunk     # if the default branch is not `main`
-vellum doctor .                  # what is installed is what ships
+
+cd /path/to/your-product-repo    # the other half of the pair
+vellum init . --ref <same ref>   # the release-cut stub
+
+vellum doctor /path/to/your-intent-repo --product .   # both halves, one report
 ```
 
-`vellum init` reads `.vellum/workspace.yaml` — the intent slug, the products,
-and the forge — and writes one stub per shipped workflow into
-`.github/workflows/`. It is idempotent: run again over an installed checkout it
-writes nothing and says so. A stub that exists and *differs* is reported and
-left alone; `--force` restamps it, which is also how a ref is bumped.
+`vellum init` writes one stub per shipped workflow **for the side the checkout
+is**. In an intent checkout it reads `.vellum/workspace.yaml` — the intent slug,
+the products, and the forge — and writes the three that run there; in a product
+checkout it reads `.vellum/product.yaml` for the intent slug and writes
+`release-cut`. It is idempotent: run again over an installed checkout it writes
+nothing and says so. A stub that exists and *differs* is reported and left
+alone; `--force` restamps it, which is also how a ref is bumped.
 
 **`--branch` is the branch `on-spec-merge` watches**, and it is the one piece of
 a trigger that belongs to the installation rather than to this product. It
@@ -49,8 +84,9 @@ configuration as drift — so the branch list is stamped from `--branch` and
 there, its `paths:` are still compared, and a trigger added beside it is still
 drift.
 
-Copying by hand works too — the three files here are exactly what `init`
-writes, and `tests/test_install.py` asserts that byte for byte. The committed
+Copying by hand works too — the four files here are exactly what `init`
+writes, and `tests/test_install.py` asserts that byte for byte (three into the
+intent repo, `release-cut.yml` into the product repo). The committed
 files pin **this checkout's own version**, which is what `init` pins when it is
 given no `--ref`; a copy taken from a checkout ahead of the newest cut release
 pins a tag that does not exist yet, and resolves to nothing until it does. `git
@@ -132,8 +168,10 @@ is the same failure arrived at from the other direction.
 `vellum` in a `run:` body of its own, is reported as `stray-workflow`. That is
 where a retired full copy hides: rename one aside as `spec-ci-legacy.yml` and it
 goes on running on every PR, holding logic nothing keeps equal to what ships,
-invisible to a check that only opens the three files it stamped. An intent
-repo's own unrelated CI is not reported.
+invisible to a check that only opens the files it stamped. An intent repo's —
+or a product repo's — own unrelated CI is not reported. The set doctor knows
+about is the stubs of the SIDE it is looking at, so a `release-cut.yml` sitting
+in an intent repo is a stray rather than a stub it recognises.
 
 **What a stub does carry, and why none of it can drift into a wrong answer:**
 
@@ -209,9 +247,18 @@ about this.
   including `on-spec-merge`, which runs with `contents: write` and
   `issues: write` on the intent repo. That was true of the copied workflows too;
   what centralising changes is the blast radius, from one hand-copied file to
-  every installation at once. Tag protection on `waviisoft/vellum`, or pinning a
-  sha (`vellum init . --ref <sha>`, which both commands accept), are the two
-  ways to narrow it. Nothing here enforces either.
+  every installation at once. And since `release-cut`, those tags are
+  **machine-pushed**: `v<version>` is created by a workflow holding
+  `contents: write` on the merge that bumps the version, so the set of people
+  who can move an installation's pin is now the set of people who can land a
+  commit on `waviisoft/vellum`'s default branch — no longer only those who can
+  push a tag by hand. The mitigation is a tag protection rule on `v*` **on
+  `waviisoft/vellum` itself**, not on the installations: an installation's own
+  rule protects its own release names and says nothing about the ref its stubs
+  pin. Pinning a sha (`vellum init . --ref <sha>`, which both commands accept)
+  narrows it from the other end. Nothing here enforces either — and a `v*` rule
+  on `waviisoft/vellum` also withholds the tag push from that workflow's own
+  token, which is the trade the decision names.
 - **Runners are Blacksmith** (`blacksmith-2vcpu-ubuntu-2204`), and that is a
   hosting choice rather than something Vellum requires. WAVIISoft — the
   organisation that publishes this repo — schedules its Actions on Blacksmith,
@@ -222,7 +269,7 @@ about this.
   change them from its stub**, because they live in the *shipped* workflows —
   a real limit of hosting the bodies centrally. Today the only ways round it are
   to install the Blacksmith app, or to fork this repo and edit `runs-on:` in the
-  three workflow files and point the stubs at the fork with
+  four workflow files and point the stubs at the fork with
   `vellum init . --from <owner>/<fork>`. Making the label a `workflow_call`
   input with a default is the proper fix; it is not built, because nothing has
   asked for it yet and inventing configuration ahead of the ask is how these
@@ -230,6 +277,13 @@ about this.
 - **`on-spec-merge` needs `contents: write` and `issues: write`** — granted in
   its stub — and branch protection on `main` that lets the workflow token push,
   or the ledger commit step fails.
+- **`release-cut` needs `contents: write`** on the PRODUCT repo — granted in its
+  stub — and no tag protection rule on `v*` that refuses the workflow token. The
+  rule is forge state on the calling repository: nothing in either checkout can
+  see it, so the push step says so when it is refused rather than leaving an
+  operator to guess. It needs one more thing no stub carries: a `release:` block
+  in `.vellum/product.yaml`. Without one the run fails at `vellum release tag`
+  with exit 2, which is the command saying it has nothing to go on.
 - **Both spec-side workflows check out with `fetch-depth: 0`.** The version
   sequence *is* main's history, and `vellum suite extract` dates scenarios by
   walking it. A shallow clone silently re-dates every scenario below its graft

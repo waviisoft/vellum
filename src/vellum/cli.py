@@ -120,6 +120,8 @@ from vellum.provision import run_provision as provision_run
 from vellum.reconcile import DEFAULT_CORPUS_MATCH, DEFAULT_LEASE_MINUTES, TickError
 from vellum.release import SUITE_RESULTS, ReleaseError, ReleaseRefused
 from vellum.release import run_cut, run_partition
+from vellum.tag import TagError, TagRefused
+from vellum.tag import run_tag
 from vellum.reconcile import run as tick_run
 from vellum.specfile import SpecTreeError
 from vellum.suite import run as suite_run
@@ -566,6 +568,45 @@ def _add_release(sub) -> None:
              "<channel>@<at>, so passing one makes a cut replayable",
     )
 
+    # `tag` sits beside `cut` because both are about a release, and the pair is
+    # the spec's own division: the cut records commits in `ledger/releases.yaml`
+    # on the intent side, and the tag is "the friendly stamp a cut may carry"
+    # on the product side. Neither reads the other, and a `vellum release tag`
+    # that had grown out of `cut` would have inherited a ledger it never opens.
+    tag = release_sub.add_parser(
+        "tag",
+        help="name the release tag a product checkout's declared version mints",
+        description=(
+            "Reads the `release:` block in <product-checkout>/.vellum/product.yaml "
+            "— `version_source:` naming pyproject.toml (its [project] version), "
+            "package.json (its version), or any other path read as its trimmed "
+            "contents, and an optional `changelog:` — and reports the tag "
+            "`v<version>` and the commit it would name. COMPUTES AND NEVER "
+            "APPLIES: no tag is created, nothing is pushed, and nothing in the "
+            "checkout is written. The `release-cut` workflow applies the name "
+            "with the forge's own credential. Exit 0 whether the name is unused "
+            "(the report names it and the commit) or already used (reported and "
+            "left alone, so a re-run is a no-op); 1 when a declared changelog "
+            "carries no entry for the version, naming the file and the entry; 2 "
+            "when there is no answer — no `release:` block, an unreadable source, "
+            "a checkout that is not a product checkout."
+        ),
+    )
+    tag.add_argument("checkout", help="the product repo checkout")
+    tag.add_argument(
+        "--plan",
+        action="store_true",
+        dest="plan_only",
+        help="the same answer, stated as one. The command never applies the tag, "
+             "so this changes nothing about what it does; it is here because the "
+             "workflow that calls it says what it is asking for",
+    )
+    tag.add_argument(
+        "--json",
+        action="store_true",
+        help="the same answer as a JSON object, for a caller that parses it",
+    )
+
 
 def _add_budget(sub) -> None:
     b = sub.add_parser(
@@ -712,20 +753,27 @@ def _add_install(sub) -> None:
     """
     init = sub.add_parser(
         "init",
-        help="stamp the forge's caller stubs into an intent checkout",
+        help="stamp the forge's caller stubs into either side of a pair",
         description=(
-            "Run in an intent checkout whose repos already exist. Reads the intent "
-            "slug, the products and the forge from `.vellum/workspace.yaml` and "
-            "writes one caller stub per shipped workflow, pinned to --ref or, by "
-            "default, this CLI's own version. Idempotent: over an installed "
-            "checkout it writes nothing and says so. A stub that exists and "
-            "differs is reported and left alone unless --force is given. Exits 0 "
-            "whether it wrote or had nothing to do, and 2 when it cannot answer — "
-            "no workspace file, a forge it has no stubs for."
+            "Run in an intent or product checkout whose repos already exist. "
+            "Which side it is, is read off the checkout and never given: an "
+            "INTENT checkout (`.vellum/workspace.yaml`) gets the three stubs "
+            "that run there — spec-ci, on-spec-merge, harness-ci — and the "
+            "intent slug, products and forge are read from that file; a PRODUCT "
+            "checkout (`.vellum/product.yaml`) gets `release-cut`, the stub that "
+            "tags a version bump. Each is pinned to --ref or, by default, this "
+            "CLI's own version. Idempotent: over an installed checkout it writes "
+            "nothing and says so. A stub that exists and differs is reported and "
+            "left alone unless --force is given. Exits 0 whether it wrote or had "
+            "nothing to do, and 2 when it cannot answer — a checkout that is "
+            "neither side, a forge it has no stubs for."
         ),
     )
     init.add_argument(
-        "checkout", nargs="?", default=".", help="the intent repo checkout (default: .)"
+        "checkout", nargs="?", default=".",
+        help="the installation checkout, either side of the pair (default: .). "
+             "An intent checkout gets the three stubs that run there; a product "
+             "checkout gets `release-cut`",
     )
     init.add_argument(
         "--ref",
@@ -735,11 +783,13 @@ def _add_install(sub) -> None:
     )
     init.add_argument(
         "--branch",
-        # No argparse default, so `resolve` can tell "the operator said `main`"
-        # from "the operator said nothing" and prompt for the one and not the
-        # other. Stub-stamping substitutes DEFAULT_BRANCH below, so part 1's
-        # behavior with no `--branch` is what it always was.
-        help=f"the default branch on-spec-merge watches (default: {DEFAULT_BRANCH}). "
+        # No argparse default, so both readers can tell "the operator said
+        # `main`" from "the operator said nothing": provisioning prompts for the
+        # one and not the other, and stub-stamping resolves the second by side
+        # (`install.resolve_branch`).
+        help=f"the branch the stubs watch — on-spec-merge on the intent side, "
+             f"release-cut on the product side. Defaults to this checkout's own "
+             f"branch in a product checkout, and to {DEFAULT_BRANCH} otherwise. "
              f"Installation data, not logic: an installation whose default branch "
              f"is not {DEFAULT_BRANCH} is not a drifted one, and `doctor` exempts "
              f"the branch list from its `on:` comparison for that reason",
@@ -776,7 +826,18 @@ def _add_install(sub) -> None:
         ),
     )
     doctor.add_argument(
-        "checkout", nargs="?", default=".", help="the intent repo checkout (default: .)"
+        "checkout", nargs="?", default=".",
+        help="the installation checkout, either side of the pair (default: .)",
+    )
+    doctor.add_argument(
+        "--product",
+        dest="product_checkout",
+        help="a product checkout of the same pair, so ONE report covers both "
+             "halves — the intent repo's three stubs and the product repo's "
+             "`release-cut`. A local path is the one fact a checkout cannot "
+             "hold: `.vellum/workspace.yaml` names the product REPOSITORY, not "
+             "where it is checked out here, so this is an input rather than "
+             "something the command finds (as `--releases-from` is)",
     )
     _add_install_common(doctor)
 
@@ -992,7 +1053,10 @@ def main(argv: list[str] | None = None) -> int:
                 forge=args.forge,
                 force=args.force,
                 releases_from=args.releases_from,
-                branch=args.branch or DEFAULT_BRANCH,
+                # None, not a substituted default: which branch "nobody said"
+                # means differs by side (`install.resolve_branch`), and only
+                # that function can see which side the checkout is.
+                branch=args.branch,
             )
         if args.command == "upgrade":
             return upgrade_run(
@@ -1009,6 +1073,7 @@ def main(argv: list[str] | None = None) -> int:
                 host=args.host,
                 forge=args.forge,
                 releases_from=args.releases_from,
+                product_checkout=args.product_checkout,
             )
     except SpecTreeError as exc:
         print(f"vellum: {exc}", file=sys.stderr)
@@ -1043,8 +1108,8 @@ def main(argv: list[str] | None = None) -> int:
     # could not answer rather than a finding about anybody's spec — and reaching
     # a caller as a traceback would make it look like a crash in the seed.
     except (BoundaryError, ChainError, BudgetError, DependencyError, ExitDutyError,
-            InstallError, ManifestError, ProvisionError, SeedsMissing, TickError,
-            ReleaseError, UpgradeError) as exc:
+            InstallError, ManifestError, ProvisionError, SeedsMissing, TagError,
+            TickError, ReleaseError, UpgradeError) as exc:
         print(f"vellum: {exc}", file=sys.stderr)
         return 2
     # A cut that cannot be made, a pointer that would move backwards, a shallow
@@ -1052,7 +1117,13 @@ def main(argv: list[str] | None = None) -> int:
     # answer is that this cannot proceed. `ReleaseRefused` is a sibling of
     # `ReleaseError` rather than a subclass precisely so this clause's position
     # relative to the one above decides nothing.
-    except ReleaseRefused as exc:
+    # A changelog with no entry for the declared version joins them: `vellum
+    # release tag` answered, and the answer is that a release nobody described
+    # is not one to name. `TagError` above is its "I could not answer" half —
+    # no `release:` block, an unreadable source — and the two must not share a
+    # code, or the `release-cut` workflow would fail a run that could not read
+    # the repository as though the version were undescribed.
+    except (ReleaseRefused, TagRefused) as exc:
         print(f"vellum: {exc}", file=sys.stderr)
         return 1
     return 2
@@ -1198,6 +1269,8 @@ def _suite(args: argparse.Namespace) -> int:
 
 
 def _release(args: argparse.Namespace) -> int:
+    if args.release_command == "tag":
+        return run_tag(args.checkout, as_json=args.json)
     return run_cut(
         args.checkout,
         args.channel,
@@ -1309,3 +1382,7 @@ def _ledger(args: argparse.Namespace) -> int:
     )
     print(path)
     return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - `python -m vellum.cli`
+    sys.exit(main())

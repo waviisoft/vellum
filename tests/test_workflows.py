@@ -49,7 +49,12 @@ OWN_CI = "ci.yml"
 #: The one checkout that keeps its credential: it pushes the tag and the ledger
 #: commit. Named by workflow and step name so adding a checkout is a decision
 #: somebody has to make here too, rather than a default that slips through.
-PUSHES = {("on-spec-merge.yml", "Check out main")}
+PUSHES = {
+    ("on-spec-merge.yml", "Check out main"),
+    # `release-cut` pushes the release tag with the caller's job token, so its
+    # product-repo checkout is the second one that must keep its credential.
+    ("release-cut.yml", "Check out the product repo"),
+}
 
 
 def load(path: Path) -> dict:

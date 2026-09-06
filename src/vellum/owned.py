@@ -79,11 +79,17 @@ from dataclasses import dataclass
 
 from vellum import install, seeds
 
-#: The two sides of a pair. An intent repo carries the stubs, the config, the
-#: release ledger and the harness; a product repo carries its memory map.
-INTENT = "intent"
-PRODUCT = "product"
-SIDES = (INTENT, PRODUCT)
+#: The two sides of a pair. An intent repo carries three caller stubs, the
+#: config, the release ledger and the harness; a product repo carries its memory
+#: map and — since release tags — the ``release-cut`` caller stub.
+#:
+#: Re-exported from ``vellum.install`` rather than declared here: a shipped
+#: workflow states which side it is stamped on, so the table that holds the
+#: workflows is the one place the two names can live without either module
+#: importing the other backwards.
+INTENT = install.INTENT
+PRODUCT = install.PRODUCT
+SIDES = install.SIDES
 
 #: How an owned file's text is produced. A ``SEED`` is read out of a release's
 #: ``src/vellum/seeds/`` — verbatim, or formatted with values the checkout
@@ -159,12 +165,19 @@ def _harness_rows() -> list[Owned]:
 
 
 def _stub_rows(forge: str) -> list[Owned]:
+    """One row per shipped workflow, on the side that workflow's stub is stamped.
+
+    ``shipped.side`` rather than a constant: the product side carries one now
+    (``release-cut``), and a table that went on saying ``INTENT`` here would
+    make ``vellum upgrade`` call it "a product-side file in an intent checkout"
+    on the very half it belongs to.
+    """
     directory = install.WORKFLOWS_DIR[forge]
     return [
         Owned(
             path=(directory / shipped.filename).as_posix(),
             kind=STUB,
-            side=INTENT,
+            side=shipped.side,
             shipped=shipped,
             why=(
                 "a caller stub, which holds no logic of its own — upgrading an "
@@ -225,13 +238,23 @@ def for_side(side: str, forge: str = "github") -> tuple[str, ...]:
     return tuple(path for path, row in table(forge).items() if row.side == side)
 
 
-def stub_paths(forge: str = "github") -> tuple[str, ...]:
-    """Just the caller stubs, sorted.
+def stub_paths(forge: str = "github", side: str | None = None) -> tuple[str, ...]:
+    """Just the caller stubs, sorted; one side's when *side* is given.
 
     What a *stamp* over an installation with no manifest records as owned. Not
     the whole seed: a stamp is run in a checkout whose repos already exist and
     cannot know whether the rest of that tree came from a Vellum seed or from
     the installation's own hand, and guessing would be exactly the inference the
     decision refused.
+
+    *side* matters now that the stubs are not all on one half. A stamp writes
+    the stubs of the side it ran on, so an owned set naming the whole pair's
+    four would claim a file that side does not carry — and `vellum upgrade`
+    would then report it as owned-but-missing on every run.
     """
-    return tuple(sorted(row.path for row in table(forge).values() if row.kind == STUB))
+    if side is not None and side not in SIDES:
+        raise ValueError(f"{side!r} is not one of {SIDES}")
+    return tuple(sorted(
+        row.path for row in table(forge).values()
+        if row.kind == STUB and (side is None or row.side == side)
+    ))

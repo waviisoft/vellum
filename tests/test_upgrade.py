@@ -47,6 +47,11 @@ from vellum import __version__ as vellum_version
 from vellum import changes, install, manifest, owned, seeds, upgrade as upgrade_module
 from vellum.gitver import show, tags
 
+#: The stubs an INTENT checkout carries. Every fixture below upgrades one, and
+#: `install.SHIPPED` is the whole pair's table now that `release-cut` is stamped
+#: on the product side.
+INTENT_SHIPPED = install.shipped_for(install.INTENT)
+
 #: The release the installation is provisioned at, and the one it is upgraded
 #: to. Both are far above anything this product will cut, so a test that started
 #: reading real tags would fail loudly rather than pass by coincidence.
@@ -317,7 +322,7 @@ class AnUpgradeRewritesOnlyOwnedFiles(UpgradeCase):
         )
 
     def test_the_stubs_name_the_newer_release(self):
-        for shipped in install.SHIPPED:
+        for shipped in INTENT_SHIPPED:
             text = (self.intent / install.WORKFLOWS_DIR["github"]
                     / shipped.filename).read_text(encoding="utf-8")
             self.assertIn(f"@{NEWER}", text, shipped.name)
@@ -369,6 +374,51 @@ class TheProductSideUpgradesToo(UpgradeCase):
         code, out = self.upgrade(checkout=elsewhere)
         self.assertEqual(code, 2, out)
         self.assertIn("not an installation", out)
+
+    def test_the_product_sides_stub_is_restamped_like_the_intent_sides(self):
+        """"re-stamped by `vellum upgrade`" (spec/features/release-tags.md).
+
+        A stub is a STUB row in the ownership table wherever it lives, so what
+        this really asserts is that the row's `side` reaches the comparison:
+        with the table still saying every stub is the intent side's, `upgrade`
+        reported this one as "a product-side file in an intent checkout" — on
+        the product checkout, which is the one half it belongs to — and left it
+        at the release before.
+        """
+        relative = install.WORKFLOWS_DIR["github"] / install.RELEASE_CUT.filename
+        # Provisioning stamps the intent half only, so this is the second stamp
+        # an installation makes; the upgrade below is what moves it afterwards.
+        code, out = run_cli(["init", str(self.product), "--ref", BASE])
+        self.assertEqual(code, 0, out)
+        self.git(self.product, "add", "-A")
+        self.git(self.product, "commit", "-qm", "stamp the product side")
+        self.assertIn(f"@{BASE}", (self.product / relative).read_text(encoding="utf-8"))
+
+        code, out = self.upgrade(checkout=self.product)
+        self.assertEqual(code, 0, out)
+        text = (self.product / relative).read_text(encoding="utf-8")
+        self.assertIn(f"@{NEWER}", text)
+        self.assertIn(f'{install.REF_INPUT}: "{NEWER}"', text)
+        self.assertNotRegex(out, rf"retired\s+{re.escape(relative.as_posix())}")
+
+    def test_an_unstamped_product_stub_is_not_owned_until_a_stamp_writes_it(self):
+        # The seeded manifest lists what the seed WROTE, and provisioning stamps
+        # the intent half only — so straight out of provisioning the product
+        # stub is not owned and not missing: it is a file Vellum has not put
+        # there yet. `vellum init <product-checkout>` writes it and adds it to
+        # `owned:` in the same run (`install.stamp_manifest`), which is what
+        # gives `upgrade` something to re-stamp.
+        relative = install.WORKFLOWS_DIR["github"] / install.RELEASE_CUT.filename
+        self.assertNotIn(relative.as_posix(), self.manifest_of(self.product).owned)
+        code, out = self.upgrade("--plan", checkout=self.product)
+        self.assertEqual(code, 0, out)
+        self.assertNotRegex(out, rf"missing\s+{re.escape(relative.as_posix())}")
+        self.assertFalse((self.product / relative).exists())
+
+        code, out = run_cli(["init", str(self.product), "--ref", BASE])
+        self.assertEqual(code, 0, out)
+        self.assertIn(relative.as_posix(), self.manifest_of(self.product).owned)
+        self.assertIn(f"added to {manifest.OWNED_KEY}", out)
 
 
 class AnEditedOwnedFileStopsTheUpgrade(UpgradeCase):
@@ -742,7 +792,7 @@ class AStubIsComparedAtTheRefItItselfPins(UpgradeCase):
 
     def test_the_manifest_is_held_at_the_older_release(self):
         self.assertEqual(self.manifest_of(self.intent).release, BASE)
-        for shipped in install.SHIPPED:
+        for shipped in INTENT_SHIPPED:
             text = (self.intent / install.WORKFLOWS_DIR["github"]
                     / shipped.filename).read_text(encoding="utf-8")
             self.assertIn(f"@{NEWER}", text, shipped.name)
@@ -750,7 +800,7 @@ class AStubIsComparedAtTheRefItItselfPins(UpgradeCase):
     def test_no_stub_is_reported_as_edited(self):
         code, out = self.upgrade("--plan")
         self.assertEqual(code, 0, out)
-        for shipped in install.SHIPPED:
+        for shipped in INTENT_SHIPPED:
             relative = (install.WORKFLOWS_DIR["github"] / shipped.filename).as_posix()
             self.assertNotRegex(out, rf"edited\s+{re.escape(relative)}")
 
@@ -926,7 +976,7 @@ class AHalfWrittenUpgradeIsWoundBack(UpgradeCase):
         self.assertIn("back on 'main'", out)
         # The stubs it had already rewritten before the failure are back as they
         # were, rather than left at the new release on a branch nobody has.
-        for shipped in install.SHIPPED:
+        for shipped in INTENT_SHIPPED:
             text = (self.intent / install.WORKFLOWS_DIR["github"]
                     / shipped.filename).read_text(encoding="utf-8")
             self.assertIn(f"@{BASE}", text, shipped.name)

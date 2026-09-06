@@ -880,8 +880,27 @@ def product_seed(
     The product side gets a manifest too, and that is the decision's "on each
     side of the pair": a product repo carries a Vellum-seeded file — its memory
     map — and a side with no manifest is a side no upgrade can reason about.
+
+    **The manifest names what this seed wrote, and nothing else.** The product
+    side's ownership table has two rows and provisioning writes one of them: the
+    `release-cut` stub is stamped by `vellum init` run in the product checkout —
+    "stamped by `vellum init` on the product side"
+    (``spec/features/release-tags.md``) — which provisioning does not do. Listing
+    it here made a manifest that owned a file nobody had written: ``vellum
+    upgrade`` reported it ``missing`` on every run, and a stamp that later wrote
+    it never added it to a manifest that lacked it. It joins ``owned:`` when the
+    stamp writes it, which is the rule ``install.stamp_manifest`` states as "the
+    files a stamp writes". (``doctor`` in a fresh product checkout still reports
+    the unstamped stub; that is the second stamp's reminder, and vellum#27 is
+    where it becomes opt-in by declaration.)
+
+    Filtered from :func:`vellum.owned.for_side` rather than derived from the
+    dict: ownership stays a table with a reason per row — a seed that owned
+    "whatever was written" would own ``.vellum/product.yaml``, which IS the pin
+    — and what this narrows is only *which* of that table's rows this run can
+    honestly claim.
     """
-    return dict(sorted({
+    files = {
         ".vellum/memory/map.md": seeds.template(owned.MEMORY_MAP_TEMPLATE).format(
             intent_slug=answers.intent_slug
         ),
@@ -890,10 +909,12 @@ def product_seed(
             commit=commit,
             product=answers.product,
         ),
-        manifest.MANIFEST_RELPATH.as_posix(): manifest.dump(
-            ref or install.default_ref(), owned.for_side(owned.PRODUCT)
-        ),
-    }.items()))
+    }
+    files[manifest.MANIFEST_RELPATH.as_posix()] = manifest.dump(
+        ref or install.default_ref(),
+        tuple(path for path in owned.for_side(owned.PRODUCT) if path in files),
+    )
+    return dict(sorted(files.items()))
 
 
 #: Where the local half is built when ``--into`` names nowhere. A placeholder in
@@ -1067,7 +1088,8 @@ def forge_steps(answers: Answers, *, host: str) -> list[ForgeStep]:
         f"(spec/behaviors/security.md); branch protection stays the operator's "
         f"(spec/features/installation.md, out of scope). Required checks, once "
         f"the stubs have run once, are: "
-        + ", ".join(f"`{s.name} / <job>`" for s in install.SHIPPED),
+        + ", ".join(f"`{s.name} / <job>`"
+                    for s in install.shipped_for(install.INTENT)),
         manual=True,
     ))
     steps.append(ForgeStep(
@@ -1228,7 +1250,11 @@ def build_plan(answers: Answers, *, host: str, ref: str, transport: str,
         transport=transport,
         intent_files=tuple(intent_seed(answers, ref=ref)),
         product_files=tuple(sorted(product_seed(answers, PIN_PLACEHOLDER, ref=ref))),
-        stubs=tuple((workflows / s.filename).as_posix() for s in install.SHIPPED),
+        # The INTENT side's, because provisioning stamps that half: the product
+        # half a seed writes carries no `.github/workflows/` at all, and its
+        # `release-cut` stub arrives when somebody runs `vellum init` in it.
+        stubs=tuple((workflows / s.filename).as_posix()
+                    for s in install.shipped_for(install.INTENT)),
         steps=tuple(forge_steps(answers, host=host)),
         intent_dir=intent_dir,
         product_dir=product_dir,
@@ -2065,10 +2091,34 @@ def _report(plan: Plan, answers: Answers, pin: str, stubs: list[str],
         f"    {product_dir}"
         + (f"  (on {ADOPT_BRANCH})" if answers.adopting else ""),
         "",
-        f"  caller stubs stamped at {plan.ref}:",
+        f"  caller stubs stamped at {plan.ref}, in the intent repo:",
     ]
     lines += [f"    {path}" for path in stubs]
     lines.append("")
+    # The product half's stub is NOT stamped here, and saying so is the point.
+    # `spec/features/release-tags.md` has it "stamped by `vellum init` on the
+    # product side" — a run in that checkout — so provisioning leaves the
+    # product repo with no `.github/workflows/` at all and the operator makes
+    # the second stamp. Left silent, `vellum doctor` in the product checkout
+    # would report a missing stub for a file nobody was told to write.
+    lines += [
+        f"  the product repo's stub is a second stamp, in that checkout:",
+        # `--branch`, and it is not decoration: the stub's `on: push:
+        # branches:` is stamped from it, and a `release-cut` watching a branch
+        # this pair does not use never runs — silently, because `doctor` exempts
+        # the branch list from its comparison and calls the stub installed. The
+        # command run in the product checkout would read that checkout's own
+        # branch (`install.resolve_branch`), and this line says it outright so
+        # that pasting it cannot depend on which branch happens to be out.
+        f"    vellum init {product_dir} --ref {plan.ref} --branch {answers.branch}",
+        f"    writes {(install.WORKFLOWS_DIR['github'] / install.RELEASE_CUT.filename).as_posix()},"
+        f" which tags a version bump (spec/features/release-tags.md),",
+        f"    and adds it to that manifest's `{manifest.OWNED_KEY}:` — this seed"
+        f" owns only what it wrote.",
+        f"    It needs a `release:` block in .vellum/product.yaml naming where"
+        f" the version lives.",
+        "",
+    ]
     if taken:
         lines.append(f"Forge steps taken ({plan.transport}):")
         for number, step in enumerate(taken, start=1):

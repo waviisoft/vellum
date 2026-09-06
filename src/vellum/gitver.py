@@ -123,6 +123,56 @@ def tags(repo: Path, pattern: str) -> list[str]:
     ]
 
 
+def branch(repo: Path) -> str | None:
+    """The branch *repo* has checked out, or None when git cannot say.
+
+    None covers every way there is no answer, because they are one answer to the
+    caller: not a git repository, a detached HEAD (``rev-parse --abbrev-ref``
+    says ``HEAD``, which is not a branch name), a repository with no commit yet,
+    or no git on PATH at all. A caller that wants a branch either way supplies
+    its own fallback — this returns what the checkout says and nothing it made
+    up.
+    """
+    try:
+        top = _git(repo, "rev-parse", "--show-toplevel").strip()
+        name = _git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip()
+    except (GitUnavailable, OSError):
+        return None
+    # About THIS directory, not an enclosing repository: `rev-parse` answers
+    # for whatever repo contains *repo*, so a product directory that is a plain
+    # subdirectory of some other checkout would otherwise be stamped for that
+    # checkout's branch. A directory that is not itself the top of a repository
+    # is one git cannot say anything about on its own behalf.
+    try:
+        if Path(top).resolve() != Path(repo).resolve():
+            return None
+    except OSError:
+        return None
+    return name if name and name != "HEAD" else None
+
+
+def ref_format_ok(repo: Path, name: str) -> bool:
+    """Whether git itself would accept *name* as a ref name.
+
+    ``git check-ref-format`` is the only complete statement of what a ref name
+    may be, and it is git's own: the rules run to a dozen clauses (no ``..``, no
+    control character, no trailing ``.``, no ``.lock`` component, no ``@{``, no
+    ``\``, and more), they are the forge's rules too, and a regex kept beside
+    them is a regex that drifts from them. A caller that has already narrowed
+    the value asks this as the last word rather than as the only one — a name
+    git refuses is a tag no ``git tag`` will create and no forge will resolve,
+    which is worth finding here rather than in the middle of a workflow's push.
+
+    False when git refuses the name, and only then: the command reads nothing
+    and needs no repository, so a non-zero exit is an answer about *name*.
+    """
+    try:
+        _git(repo, "check-ref-format", "--allow-onelevel", name)
+    except GitUnavailable:
+        return False
+    return True
+
+
 def markdown_at(repo: Path, ref: str, prefix: str) -> list[str]:
     """Repo-relative paths of every ``.md`` file under *prefix* at *ref*."""
     args = ["ls-tree", "-r", "--name-only", ref]

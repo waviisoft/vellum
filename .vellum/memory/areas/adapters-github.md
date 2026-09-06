@@ -3,16 +3,23 @@
 Two trees, and the split between them changed in the installer wave. Read this
 paragraph before anything else in the file:
 
-- **`.github/workflows/` now holds four workflows, not one.** `ci.yml` runs in
-  *this* repo. The other three — `spec-ci.yml`, `on-spec-merge.yml`,
-  `harness-ci.yml` — hold the logic every installation's INTENT repo runs, as
-  **reusable `workflow_call` workflows**. They have no trigger of their own, so
-  they never run for this repo; a PR here that breaks one is caught by
-  `tests/test_workflows.py` and by review, not by a red check.
-- **`adapters/github/` now holds caller stubs**, one per shipped workflow: a
-  dozen lines naming the reusable workflow at a pinned ref and passing
-  `VELLUM_TOKEN` by name. They are a *rendering* of `vellum.install.SHIPPED`,
-  not a second source; see `areas/cli.md`.
+- **`.github/workflows/` holds six files, and only one of them runs here as
+  itself.** `ci.yml` runs in *this* repo. Four — `spec-ci.yml`,
+  `on-spec-merge.yml`, `harness-ci.yml` and `release-cut.yml` — hold the logic
+  an installation runs, as **reusable `workflow_call` workflows** with no
+  trigger of their own; a PR here that breaks one is caught by
+  `tests/test_workflows.py` and by review, not by a red check. The sixth,
+  `release-cut-caller.yml`, is this repo's own caller for the last of them (see
+  "The product side" below).
+- **The first three run in an installation's INTENT repo; `release-cut` runs in
+  its PRODUCT repo.** That split is new with the release-tags wave and it is the
+  first time a shipped workflow was not the intent side's.
+- **`adapters/github/` holds caller stubs**, one per shipped workflow: a dozen
+  lines naming the reusable workflow at a pinned ref and passing `VELLUM_TOKEN`
+  by name. They are a *rendering* of `vellum.install.SHIPPED`, not a second
+  source; see `areas/cli.md`. Each `Shipped` row now names the side its stub is
+  stamped on, so `adapters/github/release-cut.yml` is the product repo's copy
+  and the other three are the intent repo's.
 
 `spec/features/installation.md` and waviisoft/vellum-intent#23 part 1. What
 replaced full copies is the point of the whole wave, and the reason is two
@@ -133,6 +140,51 @@ own doctor the moment it was stamped, while the `@<ref>` on the `uses:` line —
 part of a longer scalar — stayed a string. **Any workflow value that is a
 version, a ref or a number-like name gets quoted**; this file's runner labels
 and image tags are the other places that rule bites.
+
+## The product side — `release-cut`
+
+`spec/features/release-tags.md`. The workflow runs on every push to the product
+repo's default branch, installs the CLI at its stub's `vellum-ref`, runs `vellum
+release tag . --plan --json`, and turns the three exit codes into three
+outcomes: an unused name is `git tag -a` at `$GITHUB_SHA` and a push; a used
+name is a `::notice` and nothing else; 1 fails the job naming the changelog
+entry an operator has to write; anything else fails saying it could not answer.
+
+**No `paths:` filter, deliberately.** A version bump is a change to whatever
+file the installation's `release:` block names, and it may name any file at all
+— a filter written into the stub would be this product guessing at that
+declaration. `vellum release tag` is what decides there is nothing to do, and it
+decides it in seconds.
+
+**`contents: write` is the caller's to grant**, like every other permission a
+stub carries: a called workflow's token can only be narrowed by the callee. A
+tag protection rule on `v*` withholds it even when the grant is right, and that
+is forge state no checkout can see — so the push step reads the remote back
+before failing and says which of the two happened. "A push was refused" and
+"somebody else got there first" look identical from inside the job.
+
+**Idempotent twice over.** `git rev-parse --verify refs/tags/<name>` catches a
+name that appeared between the plan step and the tag step; a push refused
+because the remote already carries the name is read back and reported rather
+than failed on. `concurrency: release-cut` serialises this installation's runs
+against each other and not against a person pushing a tag by hand.
+
+**`fetch-depth: 0`, and the credential is KEPT.** The tags are the data — "a
+used name is left alone" is a claim about the names this repository already
+carries, and a shallow clone carries none of them, so every name would read as
+unused and every run would try to push one that exists. This is the second
+checkout in these files that must persist its credential (`tests/test_workflows.py`'s
+`PUSHES` is where both are named); the CLI checkout beside it does not.
+
+**This repo calls it by LOCAL PATH.** `release-cut-caller.yml` uses
+`./.github/workflows/release-cut.yml` rather than a pinned tag, because a repo
+cannot pin the tag it is about to mint
+(`spec/decisions/2026-09-06-release-tags-are-minted-by-the-forge.md`). It is not
+a stub, is not stamped by `vellum init`, and is not compared against
+`adapters/`. `vellum-ref: ${{ github.sha }}` for the same reason the path is
+local: the CLI that runs must be the one this commit ships, and `main` is a
+moving target another push can advance between the run starting and the CLI
+checkout.
 
 ## Reusable-workflow mechanics, learned writing these
 
