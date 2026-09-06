@@ -154,7 +154,8 @@ def unsafe_write(root: Path, relative: str) -> str | None:
             f", so nothing can say that writing it writes inside this checkout."
         )
     return (
-        f"its directory resolves to {subject}, which is outside {root.resolve()}. "
+        f"its directory resolves to {one_line(subject)}, which is outside "
+        f"{one_line(root.resolve())}. "
         f"Vellum owns files in the installation, and an `{manifest.OWNED_KEY}:` "
         f"line cannot claim one anywhere else."
     )
@@ -195,9 +196,9 @@ def unsafe_stub(root: Path, relative: str) -> str | None:
             f"it writes inside this checkout. Nothing was written."
         )
     return (
-        f"its directory resolves to {subject}, which is outside "
-        f"{root.resolve()}. A stub is a file in the installation and nowhere "
-        f"else. Nothing was written."
+        f"its directory resolves to {one_line(subject)}, which is outside "
+        f"{one_line(root.resolve())}. A stub is a file in the installation and "
+        f"nowhere else. Nothing was written."
     )
 
 
@@ -246,7 +247,8 @@ def unsafe_read(root: Path, relative: str) -> str | None:
         )
     if settled != settled_root and settled_root not in settled.parents:
         return (
-            f"it resolves to {settled}, which is outside {settled_root}. A "
+            f"it resolves to {one_line(settled)}, which is outside "
+            f"{one_line(settled_root)}. A "
             f"declaration names a file in the repository whose file it is."
         )
     if not path.exists():

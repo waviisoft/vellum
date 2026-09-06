@@ -850,10 +850,10 @@ class Init:
                 f"{product.PRODUCT_RELPATH.as_posix()}:",
                 "",
                 f"      {RELEASE_BLOCK}:",
-                f"        version_source: pyproject.toml   # or package.json, or "
-                f"any path",
-                f"        changelog: CHANGELOG.md          # optional; a version "
-                f"it does not describe is not tagged",
+                "        version_source: pyproject.toml   # or package.json, "
+                "or any path",
+                "        changelog: CHANGELOG.md          # optional; a version "
+                "it does not describe is not tagged",
                 "",
                 "  (spec/features/release-tags.md).",
             ]
@@ -945,6 +945,20 @@ def resolve_branch(root: Path, given: str | None, *,
     if side == PRODUCT:
         found = checkout_branch(root)
         if found is not None:
+            if not REF_RE.match(found):
+                # Refused here rather than in `render`, which would blame a
+                # `--branch` nobody passed. Not fallen back from, either:
+                # stamping `main` for a checkout that is demonstrably on
+                # something else is the silent failure this default exists to
+                # end, and a name this cannot write into a `branches:` list is
+                # one the operator has to name themselves.
+                raise InstallError(
+                    f"{root} is on the branch {one_line(found)!r}, which cannot "
+                    f"be stamped into a trigger's `branches:` list — it is not a "
+                    f"plain branch name of the kind `git check-ref-format` "
+                    f"accepts. Name the branch this installation's `release-cut` "
+                    f"should watch with `--branch`."
+                )
             return found, BRANCH_CHECKOUT
     return DEFAULT_BRANCH, BRANCH_DEFAULT
 

@@ -1235,6 +1235,17 @@ class TheProductSideIsTheOtherHalf(InstallCase):
             self.stub(checkout, "on-spec-merge").read_text(encoding="utf-8"),
         )
 
+    def test_a_branch_that_cannot_be_stamped_is_two_and_names_the_flag(self):
+        # Refused rather than fallen back from: stamping `main` for a checkout
+        # demonstrably on something else is the silent failure the default
+        # exists to end. And the message blames the checkout, not a `--branch`
+        # nobody passed.
+        checkout = self.on_branch("wip/#1")
+        code, out = run_cli(["init", str(checkout), "--ref", "v0.1.0"])
+        self.assertEqual(code, 2, out)
+        self.assertIn("--branch", out)
+        self.assertFalse((checkout / WORKFLOWS).exists())
+
     def test_a_product_checkout_with_no_release_block_is_warned(self):
         # A warning, not a finding: the stub is correctly stamped, and what is
         # missing is the declaration its workflow reads. Nothing else mentions
