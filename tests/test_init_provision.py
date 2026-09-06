@@ -466,7 +466,8 @@ class AGreenfieldSeedIsGreen(ProvisionCase):
     #: only. It is not in the seeded manifest, because a manifest that owned a
     #: file nobody had written made a freshly provisioned pair doctor with a
     #: finding on its first day; it joins `owned:` when the stamp writes it.
-    STAMPED_SEPARATELY = (WORKFLOWS / "release-cut.yml").as_posix()
+    #: There is no exemption hanging off this any more — it is just the path.
+    PRODUCT_STUB = (WORKFLOWS / "release-cut.yml").as_posix()
 
     def test_every_owned_path_is_a_file_the_seed_actually_wrote(self):
         # The manifest is written from `vellum.owned`'s table and the seed from
@@ -480,7 +481,7 @@ class AGreenfieldSeedIsGreen(ProvisionCase):
     def test_the_product_manifest_does_not_own_the_stub_it_did_not_write(self):
         # The other half of the sentence above, asserted rather than implied.
         self.assertNotIn(
-            self.STAMPED_SEPARATELY, manifest.load(self.product).owned
+            self.PRODUCT_STUB, manifest.load(self.product).owned
         )
 
     def test_a_freshly_provisioned_product_checkout_has_one_thing_left_to_do(self):
@@ -532,8 +533,8 @@ class AGreenfieldSeedIsGreen(ProvisionCase):
         )
         # And the stamp that wrote it is what adds it to `owned:`, so `vellum
         # upgrade` has something to re-stamp from here on. It says so, too.
-        self.assertIn(self.STAMPED_SEPARATELY, manifest.load(self.product).owned)
-        self.assertIn(self.STAMPED_SEPARATELY, out)
+        self.assertIn(self.PRODUCT_STUB, manifest.load(self.product).owned)
+        self.assertIn(self.PRODUCT_STUB, out)
 
     def test_the_shipped_skeleton_is_exactly_this_set_of_files(self):
         # The seed comes out of package data, and a wheel carries it only
