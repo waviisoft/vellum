@@ -67,64 +67,138 @@ def symlink_component(root: Path, parts: tuple[str, ...]) -> str | None:
     return None
 
 
+#: The three ways a path is not one to write into a checkout, as the value
+#: :func:`write_refusal` returns beside the component it is about. Codes rather
+#: than sentences because two commands write declared paths and each words its
+#: refusal for the file the path came out of: `vellum upgrade` is answering for
+#: a manifest's `owned:` line, `vellum init` for a stub it is about to stamp.
+SYMLINK, FILE_PARENT, ELSEWHERE = "symlink", "file-parent", "elsewhere"
+
+
+def write_refusal(root: Path, relative: str) -> tuple[str, str] | None:
+    """``(code, subject)`` for why *relative* is not writable in *root*, or None.
+
+    Three ways a ``mkdir(parents=True)`` plus ``write_text`` becomes a write
+    somewhere else, and the codes are :data:`SYMLINK`, :data:`FILE_PARENT` and
+    :data:`ELSEWHERE`:
+
+    * **a symlink among the components.** ``.github/workflows`` a symlink to
+      ``../.git/hooks``, or the file itself a dangling symlink pointing there,
+      and the path written is a hook — one an ``upgrade``'s own ``git commit``
+      then executes, in the operator's shell, in the same run.
+    * **a parent that is a regular file.** ``mkdir(parents=True)`` fails
+      halfway, which is a traceback out of a half-written tree rather than a
+      refusal before one exists.
+    * **a parent that resolves outside the checkout.** The backstop for the
+      first: whatever the components are, the directory written into has to be
+      inside ``root``.
+
+    *subject* is the component the code is about — the joined components for the
+    first two, the resolved directory for the third — so the caller's sentence
+    can name what an operator has to look at.
+    """
+    parts = components(relative)
+    linked = symlink_component(root, parts)
+    if linked is not None:
+        return SYMLINK, linked
+    walked = root
+    for index, part in enumerate(parts):
+        walked = walked / part
+        if index < len(parts) - 1 and walked.exists() and not walked.is_dir():
+            return FILE_PARENT, "/".join(parts[:index + 1])
+    try:
+        settled = (root / relative).parent.resolve()
+    except OSError as exc:  # a symlink loop, or a component that cannot be read
+        return ELSEWHERE, f"unresolvable ({one_line(str(exc))})"
+    settled_root = root.resolve()
+    if settled != settled_root and settled_root not in settled.parents:
+        return ELSEWHERE, str(settled)
+    return None
+
+
 def unsafe_write(root: Path, relative: str) -> str | None:
-    """Why *relative* is not a path this may write into *root*, or None.
+    """Why *relative* is not a path ``vellum upgrade`` may write, or None.
 
     ``vellum.manifest.check_owned_path`` holds the *lexical* half of this — no
     absolute path, no ``..``, nothing under ``.git/`` — and cannot hold any of
     the rest, because the rest is about a filesystem it never looks at. A
     manifest entry is a line in a repository that anybody who can land a pull
     request can write, and ``upgrade`` writes every path on that list after a
-    ``mkdir(parents=True)``. Three ways that becomes a write somewhere else:
-
-    * **a symlink among the components.** ``.github/workflows`` a symlink to
-      ``../.git/hooks``, or the file itself a dangling symlink pointing there,
-      and an owned path becomes a hook — one this command's own ``git commit``
-      then executes, in the operator's shell, in the same run.
-    * **a parent that is a regular file.** ``mkdir(parents=True)`` fails
-      halfway, which is a traceback out of a half-written tree rather than a
-      refusal before one exists (see ``vellum.upgrade._apply``).
-    * **a parent that resolves outside the checkout.** The backstop for the
-      first: whatever the components are, the directory written into has to be
-      inside ``root``.
+    ``mkdir(parents=True)``. :func:`write_refusal` is the walk; this is the
+    sentence, worded for the file the path came out of — its two ways out are
+    the manifest's.
     """
-    settled_root = root.resolve()
-    parts = components(relative)
-    linked = symlink_component(root, parts)
-    if linked is not None:
+    refusal = write_refusal(root, relative)
+    if refusal is None:
+        return None
+    code, subject = refusal
+    if code == SYMLINK:
         return (
-            f"{linked} is a symlink, and this writes through no symlink: an "
+            f"{subject} is a symlink, and this writes through no symlink: an "
             f"owned path whose components can be redirected is a write wherever "
             f"the link points — `.git/hooks/` among the reachable places, where "
             f"it would run during this upgrade's own commit. Nothing was "
             f"written. Replace the link with the real path, or take the line out "
             f"of `{manifest.OWNED_KEY}:`."
         )
-    walked = root
-    for index, part in enumerate(parts):
-        walked = walked / part
-        if index < len(parts) - 1 and walked.exists() and not walked.is_dir():
-            return (
-                f"{'/'.join(parts[:index + 1])} is a file, and this path needs "
-                f"it to be a directory. Writing would have to create a directory "
-                f"where a file already is, which fails part way through a run "
-                f"that has already written other files — so it is refused here, "
-                f"before anything is written."
-            )
-    try:
-        settled = (root / relative).parent.resolve()
-    except OSError as exc:  # a symlink loop, or a component that cannot be read
+    if code == FILE_PARENT:
         return (
-            f"its directory could not be resolved ({one_line(str(exc))}), so "
-            f"nothing can say that writing it writes inside this checkout."
+            f"{subject} is a file, and this path needs it to be a directory. "
+            f"Writing would have to create a directory where a file already is, "
+            f"which fails part way through a run that has already written other "
+            f"files — so it is refused here, before anything is written."
         )
-    if settled != settled_root and settled_root not in settled.parents:
+    if subject.startswith("unresolvable"):
         return (
-            f"its directory resolves to {settled}, which is outside {settled_root}. "
-            f"Vellum owns files in the installation, and an `{manifest.OWNED_KEY}:` "
-            f"line cannot claim one anywhere else."
+            f"its directory could not be resolved {subject[len('unresolvable '):]}"
+            f", so nothing can say that writing it writes inside this checkout."
         )
-    return None
+    return (
+        f"its directory resolves to {subject}, which is outside {root.resolve()}. "
+        f"Vellum owns files in the installation, and an `{manifest.OWNED_KEY}:` "
+        f"line cannot claim one anywhere else."
+    )
+
+
+def unsafe_stub(root: Path, relative: str) -> str | None:
+    """Why *relative* is not a path ``vellum init`` may stamp a stub into.
+
+    The same walk, one command over. A stub's path is not declared by anybody —
+    it is ``.github/workflows/<shipped>.yml``, this product's own constant — so
+    nothing lexical can go wrong with it and everything about the *tree* still
+    can: a ``.github/workflows`` an operator (or a pull request) made a symlink
+    is a stamp written wherever it points, and ``.git/hooks/`` is among the
+    places a relative link reaches. Refused before the first stub is written, so
+    a pair-stamping run leaves nothing half-done.
+    """
+    refusal = write_refusal(root, relative)
+    if refusal is None:
+        return None
+    code, subject = refusal
+    if code == SYMLINK:
+        return (
+            f"{subject} is a symlink, and a stub is stamped through no symlink: "
+            f"the file would be written wherever the link points, with "
+            f"`.git/hooks/` among the places a relative link reaches. Nothing "
+            f"was written. Replace the link with a real directory and run this "
+            f"again."
+        )
+    if code == FILE_PARENT:
+        return (
+            f"{subject} is a file, and the stub's path needs it to be a "
+            f"directory. Nothing was written."
+        )
+    if subject.startswith("unresolvable"):
+        return (
+            f"its directory could not be resolved "
+            f"{subject[len('unresolvable '):]}, so nothing can say that stamping "
+            f"it writes inside this checkout. Nothing was written."
+        )
+    return (
+        f"its directory resolves to {subject}, which is outside "
+        f"{root.resolve()}. A stub is a file in the installation and nowhere "
+        f"else. Nothing was written."
+    )
 
 
 def unsafe_read(root: Path, relative: str) -> str | None:
@@ -185,5 +259,6 @@ def unsafe_read(root: Path, relative: str) -> str | None:
     return None
 
 
-__all__ = ["GIT_DIR", "components", "symlink_component",
-           "unsafe_read", "unsafe_write"]
+__all__ = ["ELSEWHERE", "FILE_PARENT", "GIT_DIR", "SYMLINK", "components",
+           "symlink_component", "unsafe_read", "unsafe_stub", "unsafe_write",
+           "write_refusal"]

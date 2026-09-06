@@ -32,6 +32,7 @@ from support import (
 from vellum import manifest, owned
 from vellum.install import (
     INTENT,
+    PRODUCT,
     SHIPPED,
     WORKFLOWS_DIR,
     default_ref,
@@ -210,13 +211,47 @@ class InitCannotAnswer(InstallCase):
         self.assertIn("products", out)
 
     def test_a_tree_it_cannot_write_is_two_not_a_traceback(self):
-        """This command's whole contract is its exit code."""
+        """This command's whole contract is its exit code.
+
+        Caught by the pre-write walk over the stub's path rather than by the
+        `mkdir` that would fail — the same answer, one step earlier, and the
+        step matters: a run that failed part way would have written the stubs
+        before the one it choked on.
+        """
         checkout = self.intent()
         (checkout / ".github").mkdir()
         (checkout / WORKFLOWS).write_text("not a directory\n", encoding="utf-8")
         code, out = run_cli(["init", str(checkout)])
         self.assertEqual(code, 2, out)
-        self.assertIn("cannot write the stub", out)
+        self.assertIn(WORKFLOWS.as_posix(), out)
+        self.assertIn("directory", out)
+
+    def test_a_workflows_directory_that_is_a_symlink_is_refused(self):
+        """A stub is stamped through no symlink, on either side of the pair.
+
+        `.github/workflows` a symlink is a stamp written wherever it points, and
+        a relative link reaches `.git/hooks/` — where a file this wrote would be
+        run by the next commit in that checkout. `vellum upgrade` has refused
+        this since it first wrote an owned path; `init` writes files too.
+        """
+        for side in (INTENT, PRODUCT):
+            with self.subTest(side=side):
+                if side == INTENT:
+                    checkout = self.intent()
+                else:
+                    checkout = self.root / "product"
+                    checkout.mkdir(parents=True, exist_ok=True)
+                    write_product(checkout)
+                elsewhere = self.root / f"elsewhere-{side}"
+                elsewhere.mkdir()
+                (checkout / ".github").mkdir()
+                (checkout / WORKFLOWS).symlink_to(elsewhere, target_is_directory=True)
+                code, out = run_cli(["init", str(checkout)])
+                self.assertEqual(code, 2, out)
+                self.assertIn("symlink", out)
+                # Nothing written, through the link or beside it.
+                self.assertEqual(list(elsewhere.iterdir()), [])
+                self.assertFalse(manifest.path_for(checkout).exists())
 
     def test_a_host_that_would_reshape_the_uses_line_is_refused(self):
         """`--from` lands in the same `uses:` line `--ref` does.

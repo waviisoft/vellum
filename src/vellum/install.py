@@ -127,6 +127,7 @@ import yaml
 
 from vellum import __version__
 from vellum import manifest
+from vellum import paths
 from vellum import product
 from vellum.gitver import GitUnavailable, tags
 from vellum.text import one_line
@@ -879,6 +880,22 @@ def init(
     pinned = ref if ref is not None else default_ref()
 
     directory = root / WORKFLOWS_DIR[chosen]
+    # Where the stubs go is checked ONCE, before the first one is written. The
+    # path is this product's own constant, so nothing lexical can be wrong with
+    # it — and everything about the *tree* still can: a `.github/workflows` that
+    # is a symlink is a stamp written wherever it points, `.git/hooks/` among the
+    # places a relative link reaches, and a hook written there is run by the next
+    # commit in that checkout. `vellum upgrade` has made this check since it
+    # first wrote an owned path (`vellum.paths`); `init` writes files too, and on
+    # both sides of the pair now.
+    for shipped in shipped_for(side):
+        relative = (WORKFLOWS_DIR[chosen] / shipped.filename).as_posix()
+        refusal = paths.unsafe_stub(root, relative)
+        if refusal is not None:
+            raise InstallError(
+                f"{root / relative}: this is not a path to stamp a stub into — "
+                f"{refusal}"
+            )
     stamps: list[Stamp] = []
     for shipped in shipped_for(side):
         path = directory / shipped.filename
