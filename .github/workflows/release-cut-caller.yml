@@ -24,6 +24,19 @@
 # CLI checkout the called workflow makes reads its own repository with the
 # caller's own `github.token`, and there is no VELLUM_TOKEN to hand over.
 #
+# `vellum doctor .` IN THIS REPO IS RED, AND THAT IS EXPECTED HERE. This
+# repository carries `.vellum/product.yaml`, so doctor run in it grades the
+# PRODUCT side of an installation — and this repo is not one. It looks for a
+# `release-cut` caller stub at `.github/workflows/release-cut.yml`, finds the
+# REUSABLE workflow sitting at that path (this repo is where the logic lives),
+# and reports it `drifted` and `carries-logic`; the three intent-side reusable
+# workflows beside it are `stray-workflow`, since a stray is any other file
+# under the workflows directory that runs `vellum`. Every one of those is the
+# repo that SHIPS the workflows being read as though it installed them. An
+# ordinary product repo carries the one stub and no reusable workflow at all,
+# and doctors green — `vellum doctor <intent> --product <product>` against a
+# real pair is the run whose exit code means anything.
+#
 # `vellum-ref` is `github.sha` for the same reason the path is local: the CLI
 # that runs must be the one this commit ships, not the one the last release
 # did — and not `main` either, which is a moving target that another push can

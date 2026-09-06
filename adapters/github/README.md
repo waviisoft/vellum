@@ -247,9 +247,18 @@ about this.
   including `on-spec-merge`, which runs with `contents: write` and
   `issues: write` on the intent repo. That was true of the copied workflows too;
   what centralising changes is the blast radius, from one hand-copied file to
-  every installation at once. Tag protection on `waviisoft/vellum`, or pinning a
-  sha (`vellum init . --ref <sha>`, which both commands accept), are the two
-  ways to narrow it. Nothing here enforces either.
+  every installation at once. And since `release-cut`, those tags are
+  **machine-pushed**: `v<version>` is created by a workflow holding
+  `contents: write` on the merge that bumps the version, so the set of people
+  who can move an installation's pin is now the set of people who can land a
+  commit on `waviisoft/vellum`'s default branch — no longer only those who can
+  push a tag by hand. The mitigation is a tag protection rule on `v*` **on
+  `waviisoft/vellum` itself**, not on the installations: an installation's own
+  rule protects its own release names and says nothing about the ref its stubs
+  pin. Pinning a sha (`vellum init . --ref <sha>`, which both commands accept)
+  narrows it from the other end. Nothing here enforces either — and a `v*` rule
+  on `waviisoft/vellum` also withholds the tag push from that workflow's own
+  token, which is the trade the decision names.
 - **Runners are Blacksmith** (`blacksmith-2vcpu-ubuntu-2204`), and that is a
   hosting choice rather than something Vellum requires. WAVIISoft — the
   organisation that publishes this repo — schedules its Actions on Blacksmith,

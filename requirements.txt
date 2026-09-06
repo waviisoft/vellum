@@ -12,4 +12,4 @@
 #                      carry two of them.
 PyYAML>=6.0,<7
 gherkin-official>=29,<43
-tomli>=1.1.0; python_version < "3.11"
+tomli>=1.1.0,<3; python_version < "3.11"
