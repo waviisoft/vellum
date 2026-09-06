@@ -1,8 +1,8 @@
 # Area: the `vellum` CLI
 
-`src/vellum/`. Nineteen commands — `lint`, `suite extract|partition`,
-`ledger open|advance|verify`, `certify record|check`, `release cut`, `tick`, the
-three pipeline commands `mint`, `backpressure`, `pin advance`, the five
+`src/vellum/`. Twenty commands — `lint`, `suite extract|partition`,
+`ledger open|advance|verify`, `certify record|check`, `release cut|tag`, `tick`,
+the three pipeline commands `mint`, `backpressure`, `pin advance`, the five
 mechanical guards `verify boundaries|deps|exit-duty`, `ledger verify` and
 `budget`, and the three installer commands `init`, `doctor` and `upgrade` —
 dispatched from `build_parser()` in `src/vellum/cli.py`. `init` is really two
@@ -27,14 +27,15 @@ names a file or symbol you can grep for.
 | `src/vellum/pin.py` | `advance()` -> `Advance`, `verify_version()`, `_rewrite()`. The pin close. |
 | `src/vellum/config.py` | `load()`, `divergence_cap()`, `INTENT_ENV`. Reads `.vellum/config.yaml`. |
 | `src/vellum/workspace.py` | `load()`, `products()`, `intent()`, `forge()`, `WORKSPACE_RELPATH`, `DEFAULT_FORGE`. The one reader of `.vellum/workspace.yaml`. |
-| `src/vellum/install.py` | `init()` -> `Init`, `doctor()` -> `Doctor`, `render()`, `inspect()`, `strays()`, `releases()`, `currency()` -> `Currency`, `stamp_manifest()` -> `ManifestStamp`, `manifest_findings()`, `installed_shape()`, `SHIPPED`, `HOST_REPO`, `JOB_KEYS`, `DEFAULT_BRANCH`, `CANNOT_KNOW`. The adapters install thin (installation, part 1). |
+| `src/vellum/install.py` | `init()` -> `Init`, `doctor()` -> `Doctor`, `render()`, `inspect()`, `strays()`, `releases()`, `currency()` -> `Currency`, `stamp_manifest()` -> `ManifestStamp`, `manifest_findings()`, `installed_shape()`, `side_of()`, `installation_name()`, `shipped_for()`, `SHIPPED`, `INTENT`, `PRODUCT`, `HOST_REPO`, `JOB_KEYS`, `DEFAULT_BRANCH`, `CANNOT_KNOW`. The adapters install thin (installation, part 1). `Shipped.side` says which half of the pair carries each stub, and `side_of()` is the one reader of which half a checkout is — `init`, `doctor` and `upgrade` all go through it. |
 | `src/vellum/provision.py` | `run()`, `resolve()` -> `Answers`, `build_plan()` -> `Plan`, `forge_steps()` -> `[ForgeStep]`, `intent_seed()`, `product_seed()`, `build_intent()`, `build_product()`, `check_seed()` -> `SeedCheck`, `detect_gh()` -> `Gh`, `first_spec_commit()`, `requested()`, `Console`, `SHAPES`, `ADOPT_BRANCH`. Provisioning a repo pair (installation, part 2). |
 | `src/vellum/seeds/` | `harness_files()`, `template()`, `changes_text()`, `read_source()`, `source_path()`, `NOT_SEEDED`, `PACKAGE_PATH`, and the data itself: `seeds/harness/` (the harness skeleton), `seeds/templates/` (the seeded config, release ledger and memory map) and `seeds/CHANGES.yaml` (the installation-shape changelog). Shipped as package data. Every file in it is a module of a real package or is declared in `pyproject.toml`'s `[tool.setuptools.package-data]`; `harness/__init__.py` exists for the first and is not seeded, and the walk reads only `.py` because an installed copy has `__pycache__/` beside it. |
 | `src/vellum/manifest.py` | `read()`, `load()`, `parse()`, `dump()`, `write()`, `check_owned_path()`, `Manifest`, `ManifestError`, `MANIFEST_RELPATH`. The only reader and writer of `.vellum/install.yaml`. |
-| `src/vellum/owned.py` | `table()` -> `{path: Owned}`, `for_side()`, `stub_paths()`, `INTENT`, `PRODUCT`, `SEED`, `STUB`, `HARNESS_MACHINERY`. The ownership table, with a reason per row and the reasons for every row that is NOT there. |
+| `src/vellum/owned.py` | `table()` -> `{path: Owned}`, `for_side()`, `stub_paths()`, `INTENT`, `PRODUCT`, `SEED`, `STUB`, `HARNESS_MACHINERY`. The ownership table, with a reason per row and the reasons for every row that is NOT there. Stub rows take their side from `install.SHIPPED`, so the product side's `release-cut` row is not a second list to keep in step. |
 | `src/vellum/changes.py` | `load()`, `parse()` -> `Changes`, `Entry`, `version_of()`, `render()`, `SECTIONS`, `ChangesError`. Reads `seeds/CHANGES.yaml` and selects `(after, to]`. |
 | `src/vellum/upgrade.py` | `upgrade()` -> `Upgrade`, `run_upgrade()`, `compare()` -> `[Change]`, `Templates`, `side_of()`, `BRANCH_PREFIX`, `UpgradeError`. Rewrites the owned files as a pull request. |
 | `src/vellum/product.py` | `load()`, `write_boundaries()`, `normalise_tree()`, `under()`, `PRODUCT_RELPATH`. Reads `.vellum/product.yaml`. |
+| `src/vellum/tag.py` | `plan()` -> `Plan`, `run_tag()`, `declaration()` -> `Declaration`, `version_from()`, `changelog_names()`, `TagError`, `TagRefused`, `VERSION_RE`. `vellum release tag`: the name a declared version would mint, and the commit it would name. Computes and never applies — nothing here runs `git tag`, pushes, or writes a byte. |
 | `src/vellum/boundaries.py` | `check()` -> `Boundaries`, `run()`. The write-boundary guard. |
 | `src/vellum/exitduty.py` | `check()` -> `ExitDuty`, `run()`, `AREAS_TREE`. The memory-update guard. |
 | `src/vellum/deps.py` | `check()` -> `Policy`, `registries()`, `host_of()`, `_scan_toml_arrays()`. The dependency-registry guard. |
@@ -2040,6 +2041,72 @@ branches, commits and opens a pull request with exactly an adoption's plumbing �
 same identity fallback, same "a git failure is `I could not answer`" — and two
 spellings of that is how the two come to disagree about which branch they are a
 guest of.
+
+## Release tags, and the other side of the pair
+
+`src/vellum/tag.py` and `install.side_of` / `install.shipped_for`.
+`spec/features/release-tags.md` and
+`spec/decisions/2026-09-06-release-tags-are-minted-by-the-forge.md`.
+
+**`vellum release tag` computes and the forge applies.** The same division
+`vellum mint` keeps: the command reads the `release:` block, names `v<version>`
+and the commit HEAD is at, and does nothing else — no `git tag`, no push, not a
+byte written. `.github/workflows/release-cut.yml` is what writes the ref, with
+the caller's own job token. It is a checked property, not a docstring promise:
+`tests/test_tag.py` compares the file bytes, the whole ref table and `HEAD`
+across a run, because a command whose subject is a *tag* can write nothing into
+a working tree and still move a name.
+
+**The declaration is data, with no fallback anywhere.** `release:` names
+`version_source:` and optionally `changelog:` in `.vellum/product.yaml`.
+Nothing infers a version from tags, commits or a `pyproject.toml` that happens
+to be lying there — a checkout with no block is exit 2, not a guess.
+
+**Which version reader runs is decided by the source file's NAME.**
+`pyproject.toml` → `[project] version` (tomllib, or tomli below 3.11),
+`package.json` → `version`, anything else → the file's trimmed contents. A
+`pyproject.toml` this failed to parse must be a refusal: falling back to
+"trimmed contents" would report most of a TOML file as a version.
+
+**1 and 2 are different codes, and the workflow acts on the difference.** A
+declared changelog with no entry for the version is 1 — the command answered,
+and the answer is that a release nobody described is not one to name. Everything
+else that stops it is 2. `release-cut` fails a job on 1 by telling an operator
+*which entry to write*, and it must never say that about a repository it could
+not read. `TagError` maps to 2 and `TagRefused` to 1 in `cli.main`.
+
+**A shipped workflow names its side.** `Shipped.side` is `INTENT` or `PRODUCT`,
+and `install.shipped_for(side)` is what every caller wants where it used to
+iterate `SHIPPED`. Four things read that tuple as "the stubs this checkout
+carries" — `init`, `doctor`, the ownership table, `provision`'s plan — and that
+reading was true only while every stub was the intent repo's. The two callers
+that genuinely mean the whole table are the render-drift check over
+`adapters/github/` and `owned.table()`.
+
+**`install.side_of` is the one reader of which half a checkout is.**
+`.vellum/workspace.yaml` is the intent half, `.vellum/product.yaml` the product
+half, both or neither is an error. `upgrade.side_of` had it first and now
+delegates: three commands reading one fact through two implementations is how
+they come to disagree about the checkout that carries both files.
+
+**`doctor --product` is one report over the pair, with one exit code.** An
+installation is the pair, so a run that exited 0 because the intent half was
+clean is the failure the option exists to stop. `Doctor.paired` holds the other
+half; `Doctor.body()` is a report without the blind-spot list and `report()`
+appends `CANNOT_KNOW` once, because a pair has the same blind spots twice. The
+path is an input, not something the command finds — the workspace names the
+product *repository* and not where it is checked out, the same reason
+`--releases-from` and `upgrade --from` take theirs.
+
+**The product-side stub is owned before it exists.** Provisioning stamps the
+intent half only (the spec has the stub "stamped by `vellum init` on the product
+side" — a run in that checkout), so a freshly provisioned pair has
+`.github/workflows/release-cut.yml` in the product manifest's `owned:` and not
+on disk. Owned so `vellum upgrade` can re-stamp it; absent because nobody has
+stamped it. `doctor` in that checkout reports it `missing`, and the provisioning
+report names the command that writes it. It is the one row where owned and
+present come apart, and `tests/test_init_provision.py::STAMPED_SEPARATELY` names
+it rather than leaving it to be found.
 
 ## Patterns worth keeping
 

@@ -10,9 +10,9 @@ notes live in `.vellum/memory/areas/`; wave worklogs in `.vellum/memory/waves/`.
 | `src/vellum/` | The CLI. One module per concern; see `.vellum/memory/areas/cli.md`. |
 | `src/vellum/seeds/` | What `vellum init --shape …` seeds into a new installation, and what `vellum upgrade` compares against: the harness skeleton under `harness/`, the seeded config, release ledger and memory map under `templates/`, and `CHANGES.yaml`, the installation-shape changelog. Package data rather than repository paths, for the reason the caller stubs are generated rather than copied: an installed CLI is a wheel. Every `.py` in it is a module of a real package and ships whatever setuptools is told — `seeds/harness/__init__.py` has the argument — and the files that are not `.py` are declared in `pyproject.toml`'s `[tool.setuptools.package-data]`. Templates are FILES rather than string constants because `vellum upgrade` reads a release's copy with `git show <ref>:<path>`. |
 | `tests/` | `unittest` suite plus fixture spec trees under `tests/fixtures/`. |
-| `.github/workflows/` | `ci.yml` tests this repo; `spec-ci.yml`, `on-spec-merge.yml` and `harness-ci.yml` are **reusable** (`workflow_call`) workflows an installation's intent repo calls, and never run here. See `.vellum/memory/areas/adapters-github.md`. |
-| `adapters/github/` | The **caller stubs** an intent repo carries, rendered by `vellum init` from `vellum.install.SHIPPED`. See `.vellum/memory/areas/adapters-github.md`. |
-| `.vellum/product.yaml` | Backref to the intent repo, and the pin of record — `pin.commit`. Nothing mounts the intent repo here; CI fetches it, and tests read `VELLUM_INTENT_REPO`. Also `write_boundaries`, which `vellum verify boundaries` reads. |
+| `.github/workflows/` | `ci.yml` tests this repo; `spec-ci.yml`, `on-spec-merge.yml` and `harness-ci.yml` are **reusable** (`workflow_call`) workflows an installation's *intent* repo calls, and `release-cut.yml` is the one its *product* repo calls. None of the four runs here through a stub; `release-cut-caller.yml` is this repo's own caller for the last of them, naming it by local path because a repo cannot pin the tag it is about to mint. See `.vellum/memory/areas/adapters-github.md`. |
+| `adapters/github/` | The **caller stubs** an installation carries, rendered by `vellum init` from `vellum.install.SHIPPED` — three for the intent repo and `release-cut.yml` for the product repo, each row naming its own side. See `.vellum/memory/areas/adapters-github.md`. |
+| `.vellum/product.yaml` | Backref to the intent repo, and the pin of record — `pin.commit`. Nothing mounts the intent repo here; CI fetches it, and tests read `VELLUM_INTENT_REPO`. Also `write_boundaries`, which `vellum verify boundaries` reads, and `release:`, which `vellum release tag` reads to name this repo's own release tag. |
 | `LICENSE`, `pyproject.toml` | MIT, and the packaging metadata that declares and ships it. The `setuptools>=77` floor is load-bearing — see `.vellum/memory/waves/go-live-prep.md`. |
 
 ## Areas
@@ -32,6 +32,7 @@ notes live in `.vellum/memory/areas/`; wave worklogs in `.vellum/memory/waves/`.
 - [`.vellum/memory/waves/go-live-prep.md`](waves/go-live-prep.md) — MIT licence and packaging metadata; `VELLUM_TOKEN` became optional; a stranger's read over the prose.
 - [`.vellum/memory/waves/installer-provisions-the-pair.md`](waves/installer-provisions-the-pair.md) — `vellum init` grew a provisioning mode: three shapes, a plan, `gh` as the transport, and the seed.
 - [`.vellum/memory/waves/installation-upgrades.md`](waves/installation-upgrades.md) — an installation names the files Vellum owns (`.vellum/install.yaml`), and `vellum upgrade` rewrites only those, as a pull request.
+- [`.vellum/memory/waves/release-tags.md`](waves/release-tags.md) — `vellum release tag` computes a release name and the forge's `release-cut` workflow applies it; the product side of the pair gets its first caller stub.
 
 Worklogs up to `spec-v6.md` are named for the version they landed at. This one
 is named for what it did, because a version's name is decoration now
@@ -41,9 +42,9 @@ work. Later waves should follow this one.
 
 ## Technology choice, and why
 
-**Python 3.10+, standard library, plus exactly two pure-data dependencies:
-`PyYAML` and `gherkin-official`.** Pinned by range in `requirements.txt` and
-`pyproject.toml`.
+**Python 3.10+, standard library, plus pure-data dependencies only: `PyYAML`,
+`gherkin-official`, and `tomli` below 3.11.** Pinned by range in
+`requirements.txt` and `pyproject.toml`.
 
 The instruction was boring and portable: no frameworks, no database, no
 services, plain files as the substrate. The reasoning, so a later wave can
@@ -64,11 +65,18 @@ re-open it knowingly rather than by accident:
   YAML and no ecosystem has a YAML parser in its standard library. A
   hand-written subset is the classic quiet-rot choice: it works until someone
   writes a construct it silently mis-reads.
+- **`tomli` only below 3.11, and only because the floor is 3.10.** `vellum
+  release tag` reads a `pyproject.toml` version source and `tomllib` is stdlib
+  from 3.11; `tomli` is the module it was adopted from, so this is one reader
+  spelled twice rather than a third parser. The marker matters: installing a
+  backport of a stdlib module beside the stdlib module is how a wheel comes to
+  carry two of them.
 - **`argparse` and `unittest`, both stdlib.** No CLI framework, no pytest.
 - **No database, no service, no daemon.** Every command reads and writes plain
   files, and git is the only state store — which is what decision D11
   (stateless reconciler) requires of anything the orchestrator drives.
 
-Cost of the two dependencies: they are a supply-chain surface, which
-`spec/behaviors/security.md` makes a verifier red-flag item. Both are widely
-used, pure-Python and pinned by range.
+Cost of the dependencies: they are a supply-chain surface, which
+`spec/behaviors/security.md` makes a verifier red-flag item. All are widely
+used, pure-Python and pinned by range, and the third is not installed at all on
+the interpreter this repo's CI mostly runs.
