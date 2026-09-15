@@ -87,6 +87,18 @@ ITEM_KEYS = (
     "certification",
     "lease",
 )
+# `announced:` — the addressed event a run wrote at its own boundary
+# (`spec/features/continuous-engineering.md`) — is deliberately NOT in the tuple
+# above, and the omission is a finding rather than an oversight. `ITEM_KEYS` is
+# this module's reading of the fields `spec/features/ledger.md` names, which is
+# what `test_work_item_carries_every_field_the_spec_names` grades it as; that
+# slice names an issue, a title, a repo, satisfies, a PR, a state, a briefing, a
+# cost, a certification and a lease, and no announcement. So the field rides
+# where `ordered` already promises an installation's own keys will ride — at the
+# end, kept rather than dropped — and is materialised only on an item that has
+# actually announced something, which leaves every record of an item that has
+# not byte for byte what it was. Whether the ledger slice should name the field
+# is a spec question and is raised as one.
 COST_KEYS = ("attempts", "tokens", "usd", "executor")
 #: ``certification: {sha, run, at, result}`` (``spec/features/ledger.md``).
 CERTIFICATION_KEYS = ("sha", "run", "at", "result")
@@ -299,6 +311,14 @@ def _ordered_item(item: dict) -> dict:
     out = {**item, "cost": _ordered(dict(item.get("cost") or {}), COST_KEYS)}
     _ordered_present(out, "certification", CERTIFICATION_KEYS)
     _ordered_present(out, "lease", LEASE_KEYS)
+    # Imported here rather than at module scope: `vellum.announce` reads the
+    # installation's declaration to address an announcement, and it reads this
+    # module to find the record — so a top-level import either way is a cycle.
+    # The key order is the announcement module's to state, for `LEASE_KEYS`'s
+    # reason, and this is the one line that needs it.
+    from vellum.announce import ANNOUNCED_KEYS
+
+    _ordered_present(out, "announced", ANNOUNCED_KEYS)
     return _ordered(out, ITEM_KEYS)
 
 
@@ -372,6 +392,8 @@ def advance(
     tokens: int = 0,
     usd: float = 0.0,
     executor: str | None = None,
+    announce: bool = True,
+    notes: list[str] | None = None,
 ) -> Path:
     """Advance a record's state, commit a work plan, or update one work item.
 
@@ -379,6 +401,19 @@ def advance(
     agent invocation into the item's entry, so ``--attempts/--tokens/--usd`` add
     to what is there rather than replacing it. ``--executor`` names the most
     recent one.
+
+    **A pull request reaching a work item announces the run's end.**
+    ``spec/features/continuous-engineering.md``: "a run's last act is to say so",
+    and this is the act — the number a finished run reports is the report. What
+    it writes is an ``announced:`` block naming the role the news is for; what
+    *delivers* it is a transport or the next tick (``vellum.announce``). Only a
+    number that is new announces, so replaying a report announces nothing.
+
+    An installation that declares no role to address it to is a fact the caller
+    is told rather than a refusal: the item's own state is still recorded, the
+    reason lands in *notes*, and nothing is dispatched. ``announce=False`` turns
+    the whole of it off for a caller repairing a record rather than reporting a
+    run.
     """
     path = find_record(ledger_dir, sha)
     if path is None:
@@ -426,7 +461,10 @@ def advance(
                 )
             item["state"] = item_state
         if pr is not None:
+            reported = item.get("pr") != pr
             item["pr"] = pr
+            if reported and announce:
+                _announce_finish(ledger_dir, sha, item, issue, pr, notes)
         cost = item.setdefault("cost", new_cost())
         cost["attempts"] = (cost.get("attempts") or 0) + attempts
         cost["tokens"] = (cost.get("tokens") or 0) + tokens
@@ -438,6 +476,43 @@ def advance(
 
     write(path, record)
     return path
+
+
+def _announce_finish(ledger_dir, sha: str, item: dict, issue: int, pr: int,
+                     notes: list[str] | None) -> None:
+    """Put a ``finished`` announcement on *item*, or say why there is none.
+
+    Told rather than refused, and that is the reconciler's own failure
+    direction: a run that finished and could not address its news has still
+    finished, and the record of that must not be lost because an installation
+    has not declared an address space yet. It costs latency and never
+    correctness (``spec/decisions/2026-08-28-reconciler.md``).
+    """
+    from vellum.announce import (
+        AnnounceError,
+        addressee_for_ledger,
+        new_announcement,
+        set_announcement,
+    )
+
+    checkout = Path(ledger_dir).resolve().parent
+    try:
+        to = addressee_for_ledger(checkout, ledger_dir)
+    except AnnounceError as exc:
+        if notes is not None:
+            notes.append(
+                f"Work item {issue} reported pull request {pr} and nothing was "
+                f"addressed: {exc} Nothing is dispatched for it until an addressee "
+                f"can be read (spec/features/continuous-engineering.md)."
+            )
+        return
+    set_announcement(item, new_announcement(
+        "finished", to,
+        f"work item {issue} has finished and reported pull request {pr}; "
+        f"the wave's next part begins",
+    ))
+    if notes is not None:
+        notes.append(f"Work item {issue}'s run announced its end to {to}.")
 
 
 def _upsert_planned(record: dict, entry: dict) -> None:

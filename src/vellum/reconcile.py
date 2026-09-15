@@ -103,6 +103,15 @@ from pathlib import Path
 
 import yaml
 
+from vellum.announce import (
+    AnnounceError,
+    addressee_for_ledger,
+    announced,
+    dispatch_detail,
+    find_handoff,
+    new_announcement,
+    set_announcement,
+)
 from vellum.backpressure import NOT_A_RECORD, ledger_dir_for
 from vellum.config import ConfigError
 from vellum.config import load as load_config
@@ -211,6 +220,12 @@ class Action:
     item: int | None
     #: One line, already narrowed. Printed and emitted verbatim.
     detail: str
+    #: The role this action is addressed to, or "" where it is addressed to
+    #: nobody. Only an announcement's delivery addresses anything
+    #: (``spec/features/continuous-engineering.md``): an ordinary work dispatch
+    #: says a claimed item is ready for a run and names no party at all, which is
+    #: what makes an addressee, where there is one, attributable to the event.
+    role: str = ""
 
     @property
     def taken(self) -> bool:
@@ -218,13 +233,20 @@ class Action:
         return ACTION_KINDS[self.kind]
 
     def to_dict(self) -> dict:
-        return {
+        emitted = {
             "kind": self.kind,
             "version": self.version,
             "item": self.item,
             "detail": self.detail,
             "taken": self.taken,
         }
+        # Present only when there is an addressee, so an unaddressed action's
+        # payload is byte for byte what it has always been and a reader asking
+        # "is this addressed" gets the same answer from the key's absence as from
+        # its emptiness.
+        if self.role:
+            emitted["role"] = self.role
+        return emitted
 
     def __str__(self) -> str:
         # Joined from the parts that are there rather than formatted with a gap
@@ -234,6 +256,8 @@ class Action:
         parts = [f"[{self.kind}]", self.version[:12] if self.version else "-" * 12]
         if self.item is not None:
             parts.append(f"item {self.item}")
+        if self.role:
+            parts.append(f"to {self.role}:")
         parts.append(self.detail)
         return " ".join(parts)
 
@@ -742,11 +766,15 @@ class _Reconciler:
         self.time_ordered: set[tuple[str, str]] = set()
         #: Items leased with nothing confirming their forge issue is filed.
         self.leased_unconfirmed: list[int] = []
+        #: Announcement kinds this pass could not address, so the report says so
+        #: once rather than once per item.
+        self.unaddressable: set[str] = set()
 
     # ------------------------------------------------------------- helpers
 
-    def act(self, kind: str, version: str, item: int | None, detail: str) -> None:
-        self.actions.append(Action(kind, version, item, one_line(detail)))
+    def act(self, kind: str, version: str, item: int | None, detail: str,
+            role: str = "") -> None:
+        self.actions.append(Action(kind, version, item, one_line(detail), role))
 
     def touched(self, sha: str) -> None:
         self.dirty.add(sha)
@@ -941,6 +969,13 @@ class _Reconciler:
                         "record-direction", sha, issue,
                         f"briefing updated: {one_line(briefing, 60)}",
                     )
+                    # The arrival is the event. "What the owner says dispatches
+                    # the role that must act on it ... direction that sits unread
+                    # is indistinguishable from direction never given", so new
+                    # direction announces where a re-report of direction already
+                    # on the briefing does not — the condition above is what
+                    # keeps this idempotent.
+                    self._announce(sha, item, issue, "direction", briefing)
                 held = active_lease(item, now=self.now)
                 if held is not None:
                     self.act(
@@ -1043,6 +1078,76 @@ class _Reconciler:
             )
             if item is not None:
                 self.parked_items.add((version, item))
+
+    def _announce(self, sha: str, item: dict, issue: int | None, kind: str,
+                  asks: str) -> None:
+        """Put an announcement on *item*, or note why none could be addressed."""
+        try:
+            to = addressee_for_ledger(self.checkout, self.ledger)
+        except AnnounceError as exc:
+            if kind not in self.unaddressable:
+                self.unaddressable.add(kind)
+                self.notes.append(
+                    f"Nothing was addressed for the {kind} event(s) this pass "
+                    f"recorded: {exc} The ledger still carries what happened; what "
+                    f"is missing is a party to tell "
+                    f"(spec/features/continuous-engineering.md)."
+                )
+            return
+        if set_announcement(item, new_announcement(kind, to, asks)):
+            self.touched(sha)
+
+    def announcements(self, open_shas: list[str]) -> None:
+        """Deliver what has been announced and not yet dispatched.
+
+        **The fallback transport, and never the mechanism.** What causes an
+        addressed dispatch is the announcement record — written by the run at its
+        own boundary, by ``ledger advance --pr`` reporting a pull request, or by
+        the arrival of direction above. ``vellum announce`` delivers one in the
+        same act that records it, with no pass involved at all; this exists so
+        that a delivery nobody carried costs latency rather than correctness,
+        which is the reconciler's own rule
+        (``spec/decisions/2026-08-28-reconciler.md``).
+
+        The discriminator between the two readings is visible here rather than
+        argued: this pass reads announcements and nothing else. A pass over a
+        world that announced nothing addresses nobody, however many times it
+        runs, and a finished item is still skipped by ``queue()`` exactly as
+        before.
+
+        Delivery is once. ``dispatched`` is written back into the record, so the
+        next reader — this pass again, another transport, the same command twice
+        — emits nothing, and a handoff the addressed role has already answered
+        dispatches nobody at all.
+        """
+        for sha in open_shas:
+            _, record = self.records[sha]
+            for item in _items(record):
+                standing = announced(item)
+                if standing is None or standing.get("dispatched"):
+                    continue
+                issue = _int_or_none(item.get("issue"))
+                role = str(standing.get("to") or "").strip()
+                if not role:
+                    continue
+                name = str(standing.get("handoff") or "").strip()
+                if name:
+                    handoff = find_handoff(self.ledger, name)
+                    if handoff is not None and handoff.is_answered:
+                        # Not written back: the record says the handoff was
+                        # answered, which is the durable fact, and rewriting the
+                        # item to say so a second time is a byte this pass would
+                        # change over an unchanged world.
+                        self.notes.append(
+                            f"Handoff {name} was answered on "
+                            f"{one_line(handoff.answered, 40)}, so work item {issue} "
+                            f"dispatches nobody: a handoff already acted on runs its "
+                            f"receiver no further times."
+                        )
+                        continue
+                self.act("dispatch", sha, issue, dispatch_detail(standing), role=role)
+                standing["dispatched"] = True
+                self.touched(sha)
 
     def queue(self, open_shas: list[str]) -> None:
         """The work-item queue: dispatch what is unclaimed, hold what is claimed."""
@@ -1205,6 +1310,11 @@ def reconcile(
     engine.raised()
     for sha in open_shas:
         engine.plan_and_file(sha)
+    # After the events that announce and before the queue: direction recorded
+    # this pass supersedes a finish still standing from an earlier one, so the
+    # addressee is dispatched about the newest thing that happened rather than
+    # twice about two.
+    engine.announcements(open_shas)
     engine.queue(open_shas)
 
     written: list[str] = []

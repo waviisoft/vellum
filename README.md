@@ -233,6 +233,61 @@ quietly, and says "rotate" only for the half that is a credential. Treat it as
 a backstop: by the time a value reaches the command it has been through a
 shell history and a process table, and a dropped substring undoes neither.
 
+### `vellum announce handoff|finished|deliver|answer|list`
+
+The addressed event, and the dispatch its arrival causes
+(`spec/features/continuous-engineering.md`). A run announces at its **boundary**
+— it has finished, or it is blocked and has stopped — and the announcement is
+what starts the role it names. Nothing here opens a channel into a running
+agent: the record lands in the repository, and what travels is the news that it
+is there.
+
+```
+vellum announce handoff <checkout> --version <sha> --item 12 \
+    --from librarian --asks "apply the proven fix under harness/" \
+    --tried "…" --observed "…" --proved "…" --path harness/steps.py
+vellum announce finished <checkout> --version <sha> --item 12 --pr 34
+vellum announce deliver  <checkout> [--item 12] [--handoff 0001-….md]
+vellum announce answer   <checkout> --handoff 0001-….md
+vellum announce list     <checkout>
+```
+
+**`handoff`** records a blocked run's proposal under `ledger/handoffs/`, one
+file per handoff: who it is for, what it asks for, and the evidence — what was
+tried, what was observed, what was proven, in the run's own words, so the
+receiver verifies rather than rediscovers. The addressee is read off the
+installation's `write_boundaries` block: the role that holds the tree the
+proposed change lies in. A tree with **no** declared holder, or **two**, is
+refused rather than guessed, and `--to` is how an installation answers that. A
+handoff addressed back to its own sender is refused outright.
+
+**The sender proposes and the holder writes.** Recording a handoff writes the
+record and the announcing item's `announced:` field, and nothing at all in the
+tree the handoff is *about*. No handoff grants its sender reach it did not
+declare; `vellum verify boundaries` is unchanged and still refuses the sender.
+
+**`finished`** announces a run's end. `vellum ledger advance --pr` records the
+same announcement — reporting a pull request *is* the report — and leaves
+delivery to a transport.
+
+**Delivery happens twice over, and the difference is the point.** `handoff` and
+`finished` deliver the dispatch *themselves*, in the same act that record it:
+that is the push, and **no reconciler pass is in the causal chain**. `vellum
+tick` drains whatever is still pending as the **fallback**, so a delivery
+nobody carried costs latency and never correctness. A pass over a world that
+announced nothing addresses nobody — which is what makes the dispatch a
+function of the announcement rather than of the scan.
+
+Which transport carries an announcement onward — a forge webhook, a claim
+daemon, a workflow — is an installation's, declared with its executors. That an
+announcement is *pushed* is not.
+
+**Dispatch is idempotent and terminates.** Delivery writes `dispatched` back
+into the record, so the next reader of it emits nothing; a handoff the
+addressed role has answered (`vellum announce answer`) dispatches nobody at
+all. An addressed dispatch is a `dispatch` action carrying the role it is for;
+an ordinary work dispatch carries no addressee and is unchanged.
+
 ### `vellum mint <intent-checkout>`
 
 The bookkeeping a spec merge leaves behind: opens the ledger record for the
