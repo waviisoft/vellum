@@ -110,6 +110,7 @@ from vellum.announce import (
     dispatch_detail,
     find_handoff,
     new_announcement,
+    pending_announcements,
     set_announcement,
 )
 from vellum.backpressure import NOT_A_RECORD, ledger_dir_for
@@ -179,7 +180,12 @@ ACTION_KINDS: dict[str, bool] = {
     "answer-question": False,  # a raised question the corpus answers: reply, file nothing
     "draft-clarify": False, # an open question with an owner comment and no clarify PR
     "close-question": False,  # a question whose clarify PR merged
-    "dispatch": False,      # spawn an executor for a claimed item
+    # A `dispatch` WITH a `role` addresses that role (an announcement's
+    # delivery); WITHOUT one it spawns an executor for the claimed item — the
+    # two are the same action kind because both are "start a run", and a
+    # caller reading the emitted actions branches on whether `role` is present
+    # rather than being handed two kinds for one verb (S8).
+    "dispatch": False,
     # -- performed here, as a ledger write ------------------------------------
     "commit-plan": True,
     "supersede": True,
@@ -1097,6 +1103,45 @@ class _Reconciler:
         if set_announcement(item, new_announcement(kind, to, asks)):
             self.touched(sha)
 
+    def _dispatch_one(self, sha: str, issue: int | None, slot: dict) -> bool:
+        """Deliver one announcement slot. True when it is resolved — dispatched,
+        or settled because its handoff was answered — and should not be
+        delivered again; False when it stays pending (no addressee yet, or its
+        handoff could not be read this pass).
+
+        A handoff read failure (SS7) is caught here rather than left to crash
+        this tick: a handoff record this cannot read yet says nothing about
+        whether it was answered, so the safe reading is "not yet", leaving the
+        item pending rather than dispatching it based on a guess.
+        """
+        role = str(slot.get("to") or "").strip()
+        if not role:
+            return False
+        name = str(slot.get("handoff") or "").strip()
+        if name:
+            try:
+                handoff = find_handoff(self.ledger, name)
+            except AnnounceError as exc:
+                self.notes.append(
+                    f"Handoff {name} could not be read, so work item {issue} is "
+                    f"left pending rather than dispatched: {exc}"
+                )
+                return False
+            if handoff is not None and handoff.is_answered:
+                # N1: settled rather than left standing forever — the next
+                # pass neither redispatches it nor repeats this note.
+                slot["dispatched"] = True
+                self.notes.append(
+                    f"Handoff {name} was answered on "
+                    f"{one_line(handoff.answered, 40)}, so work item {issue} "
+                    f"dispatches nobody: a handoff already acted on runs its "
+                    f"receiver no further times."
+                )
+                return True
+        self.act("dispatch", sha, issue, dispatch_detail(slot), role=role)
+        slot["dispatched"] = True
+        return True
+
     def announcements(self, open_shas: list[str]) -> None:
         """Deliver what has been announced and not yet dispatched.
 
@@ -1119,38 +1164,56 @@ class _Reconciler:
         next reader — this pass again, another transport, the same command twice
         — emits nothing, and a handoff the addressed role has already answered
         dispatches nobody at all.
+
+        **S1: an item's own field carries the newest event, and
+        ``announced_pending`` carries whatever a supersede would otherwise have
+        dropped** — a standing announcement to a different role than the one
+        that replaced it. Both are delivered here, so a blocked run that also
+        opened a pull request dispatches both roles rather than only the last
+        one to have been recorded.
         """
         for sha in open_shas:
             _, record = self.records[sha]
             for item in _items(record):
-                standing = announced(item)
-                if standing is None or standing.get("dispatched"):
-                    continue
                 issue = _int_or_none(item.get("issue"))
-                role = str(standing.get("to") or "").strip()
-                if not role:
+                standing = announced(item)
+                if standing is not None and not standing.get("dispatched"):
+                    if self._dispatch_one(sha, issue, standing):
+                        self.touched(sha)
+                pending = pending_announcements(item)
+                if not pending:
                     continue
-                name = str(standing.get("handoff") or "").strip()
-                if name:
-                    handoff = find_handoff(self.ledger, name)
-                    if handoff is not None and handoff.is_answered:
-                        # Not written back: the record says the handoff was
-                        # answered, which is the durable fact, and rewriting the
-                        # item to say so a second time is a byte this pass would
-                        # change over an unchanged world.
-                        self.notes.append(
-                            f"Handoff {name} was answered on "
-                            f"{one_line(handoff.answered, 40)}, so work item {issue} "
-                            f"dispatches nobody: a handoff already acted on runs its "
-                            f"receiver no further times."
-                        )
+                kept = []
+                changed = False
+                for slot in pending:
+                    if slot.get("dispatched"):
+                        changed = True
                         continue
-                self.act("dispatch", sha, issue, dispatch_detail(standing), role=role)
-                standing["dispatched"] = True
-                self.touched(sha)
+                    if self._dispatch_one(sha, issue, slot):
+                        changed = True
+                    else:
+                        kept.append(slot)
+                if changed:
+                    if kept:
+                        item["announced_pending"] = kept
+                    else:
+                        item.pop("announced_pending", None)
+                    self.touched(sha)
 
     def queue(self, open_shas: list[str]) -> None:
-        """The work-item queue: dispatch what is unclaimed, hold what is claimed."""
+        """The work-item queue: dispatch what is unclaimed, hold what is claimed.
+
+        **B3: an item whose standing announcement is an unanswered handoff is
+        held, not re-dispatched.** Without this, an item that hands off stays
+        in state ``planned``/``implementing`` (blocked is not a ledger state —
+        it is a handoff, and the item that raised it is still nominally
+        queueable) and every tick claims it again: a fresh run spawns, re-hits
+        the same boundary, and — since B1 makes a replayed handoff reuse its
+        existing record rather than raise a new one — nothing about *that*
+        loops, but the item's own dispatch does, once per tick, forever.
+        Answering the handoff (``handoff.is_answered``) releases the item back
+        to the ordinary queue below.
+        """
         for sha in open_shas:
             _, record = self.records[sha]
             for item in _items(record):
@@ -1160,6 +1223,24 @@ class _Reconciler:
                     continue
                 if item.get("pr") not in (None, ""):
                     continue  # reported: its PR is the forge's to merge
+                standing = announced(item)
+                if standing is not None and standing.get("kind") == "handoff":
+                    name = str(standing.get("handoff") or "").strip()
+                    try:
+                        handoff = find_handoff(self.ledger, name) if name else None
+                    except AnnounceError as exc:
+                        handoff = None
+                        self.notes.append(
+                            f"Handoff {name} could not be read, so work item "
+                            f"{issue} is held rather than claimed: {exc}"
+                        )
+                    if handoff is None or not handoff.is_answered:
+                        role = str(standing.get("to") or "").strip() or "(nobody declared)"
+                        self.act(
+                            "hold", sha, issue,
+                            f"waiting on handoff {name or '(unnamed)'} to {role}",
+                        )
+                        continue
                 if issue is not None and (sha, issue) in self.parked_items:
                     self.act(
                         "hold", sha, issue,

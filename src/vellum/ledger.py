@@ -378,6 +378,7 @@ def find_item(record: dict, issue: int) -> dict | None:
 def advance(
     ledger_dir: str | Path,
     sha: str,
+    checkout: str | Path = ".",
     state: str | None = None,
     release: str | None = None,
     plan: list[dict] | None = None,
@@ -402,18 +403,22 @@ def advance(
     to what is there rather than replacing it. ``--executor`` names the most
     recent one.
 
-    **A pull request reaching a work item announces the run's end.**
-    ``spec/features/continuous-engineering.md``: "a run's last act is to say so",
-    and this is the act — the number a finished run reports is the report. What
-    it writes is an ``announced:`` block naming the role the news is for; what
-    *delivers* it is a transport or the next tick (``vellum.announce``). Only a
-    number that is new announces, so replaying a report announces nothing.
+    **A pull request reaching a work item announces the run's end, and
+    delivers it in the same act** — the same push ``vellum announce finished``
+    makes, so a fresh commit here dispatches its addressee without waiting for
+    a tick. What it writes is an ``announced:`` block naming the role the news
+    is for. Only a number that is new announces, so replaying a report
+    announces nothing and dispatches nothing a second time (S3).
 
-    An installation that declares no role to address it to is a fact the caller
-    is told rather than a refusal: the item's own state is still recorded, the
-    reason lands in *notes*, and nothing is dispatched. ``announce=False`` turns
-    the whole of it off for a caller repairing a record rather than reporting a
-    run.
+    *checkout* names the installation whose ``write_boundaries`` decide the
+    addressee (S4) — never guessed from ``ledger_dir``'s parent, which is not
+    obliged to be the checkout at all. When no role can be addressed, the
+    item's own state (its PR, its cost) is still written, but this then exits
+    by raising ``AnnounceError`` rather than merely noting it in *notes* and
+    returning 0: a run that finished and could not be addressed to anybody is
+    something the caller needs to see, not a line it can leave on stderr.
+    ``announce=False`` turns the whole of it off for a caller repairing a
+    record rather than reporting a run.
     """
     path = find_record(ledger_dir, sha)
     if path is None:
@@ -435,6 +440,7 @@ def advance(
         for entry in plan:
             _upsert_planned(record, entry)
 
+    pending_error = None
     if issue is not None:
         item = find_item(record, issue)
         if item is None:
@@ -464,7 +470,7 @@ def advance(
             reported = item.get("pr") != pr
             item["pr"] = pr
             if reported and announce:
-                _announce_finish(ledger_dir, sha, item, issue, pr, notes)
+                pending_error = _announce_finish(checkout, ledger_dir, sha, item, issue, pr, notes)
         cost = item.setdefault("cost", new_cost())
         cost["attempts"] = (cost.get("attempts") or 0) + attempts
         cost["tokens"] = (cost.get("tokens") or 0) + tokens
@@ -475,18 +481,20 @@ def advance(
         raise LedgerError("work-item options require --item <issue>")
 
     write(path, record)
+    if pending_error is not None:
+        raise pending_error
     return path
 
 
-def _announce_finish(ledger_dir, sha: str, item: dict, issue: int, pr: int,
-                     notes: list[str] | None) -> None:
-    """Put a ``finished`` announcement on *item*, or say why there is none.
+def _announce_finish(checkout, ledger_dir, sha: str, item: dict, issue: int, pr: int,
+                     notes: list[str] | None):
+    """Put a ``finished`` announcement on *item*, and deliver it (S3).
 
-    Told rather than refused, and that is the reconciler's own failure
-    direction: a run that finished and could not address its news has still
-    finished, and the record of that must not be lost because an installation
-    has not declared an address space yet. It costs latency and never
-    correctness (``spec/decisions/2026-08-28-reconciler.md``).
+    Returns the ``AnnounceError`` that should be raised once the record has
+    been written (S4), or None. The item's own state is written regardless —
+    a run that finished has finished whether or not this installation has
+    declared an address space yet — but the caller must still exit non-zero,
+    which raising after the write achieves without losing that state.
     """
     from vellum.announce import (
         AnnounceError,
@@ -495,7 +503,6 @@ def _announce_finish(ledger_dir, sha: str, item: dict, issue: int, pr: int,
         set_announcement,
     )
 
-    checkout = Path(ledger_dir).resolve().parent
     try:
         to = addressee_for_ledger(checkout, ledger_dir)
     except AnnounceError as exc:
@@ -505,14 +512,24 @@ def _announce_finish(ledger_dir, sha: str, item: dict, issue: int, pr: int,
                 f"addressed: {exc} Nothing is dispatched for it until an addressee "
                 f"can be read (spec/features/continuous-engineering.md)."
             )
-        return
-    set_announcement(item, new_announcement(
+        return exc
+    changed = set_announcement(item, new_announcement(
         "finished", to,
         f"work item {issue} has finished and reported pull request {pr}; "
         f"the wave's next part begins",
     ))
+    if changed:
+        # Deliver in the same act (S3): the same push `vellum announce
+        # finished` makes, so this needs no transport or tick to reach `to`.
+        standing = item.get("announced") or {}
+        standing["dispatched"] = True
     if notes is not None:
-        notes.append(f"Work item {issue}'s run announced its end to {to}.")
+        notes.append(
+            f"Work item {issue}'s run announced its end to {to} and dispatched it."
+            if changed else
+            f"Work item {issue} already announced its end to {to}; not redispatched."
+        )
+    return None
 
 
 def _upsert_planned(record: dict, entry: dict) -> None:

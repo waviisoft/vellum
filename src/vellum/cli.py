@@ -200,6 +200,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     adv = ledger_sub.add_parser("advance", help="advance a record, or update a work item")
     _add_common_ledger_args(adv)
+    adv.add_argument(
+        "--checkout", default=".",
+        help="the intent checkout to read installation config from, for "
+             "addressing a finished announcement when --pr is given "
+             "(default: current directory). Never guessed from --ledger-dir",
+    )
     adv.add_argument("--state", help="record state")
     adv.add_argument("--release", help="the cut that shipped this version")
     adv.add_argument("--plan", help="workplan.yaml to commit into the record")
@@ -214,6 +220,11 @@ def build_parser() -> argparse.ArgumentParser:
     adv.add_argument("--tokens", type=int, default=0, help="tokens to add to cost")
     adv.add_argument("--usd", type=float, default=0.0, help="usd to add to cost")
     adv.add_argument("--executor", help="executor that performed the work")
+    adv.add_argument(
+        "--no-announce", dest="announce", action="store_false", default=True,
+        help="record --pr without announcing or dispatching; for a caller "
+             "repairing a record rather than reporting a run",
+    )
 
     ver = ledger_sub.add_parser(
         "verify",
@@ -412,7 +423,7 @@ def _add_announce(sub) -> None:
             "A run's last act is to say so. Records a finished announcement "
             "against the work item and dispatches the role it names. `ledger "
             "advance --pr` records the same announcement — reporting a pull "
-            "request is the report — and leaves the delivery to a transport."
+            "request is the report — and delivers it the same way."
         ),
     )
     _common(fin)
@@ -420,7 +431,33 @@ def _add_announce(sub) -> None:
     fin.add_argument("--item", type=int, required=True, help="the work item")
     fin.add_argument("--pr", type=int, help="the pull request the run left")
     fin.add_argument("--to", help="the role it is addressed to (default: the "
-                                  "declared holder of the ledger)")
+                                  "declared holder of the ledger); must be a "
+                                  "declared role")
+    fin.add_argument("--from", dest="sender", default="",
+                      help="the role reporting this (optional). If it equals "
+                           "the addressee, the announcement is recorded but "
+                           "not dispatched — a role has nothing to learn from "
+                           "dispatching itself")
+
+    direction = announce_sub.add_parser(
+        "direction",
+        help="record the owner's direction and dispatch the role that must act",
+        description=(
+            "Records new direction on a work item's briefing and dispatches "
+            "the role that must act on it, in the same act — so an owner-review "
+            "webhook does not need a full `vellum tick` to make it real. `vellum "
+            "tick` still records and delivers direction it is told about through "
+            "--observed, as the fallback."
+        ),
+    )
+    _common(direction)
+    direction.add_argument("--version", required=True, help="spec version")
+    direction.add_argument("--item", type=int, required=True, help="the work item")
+    direction.add_argument("--briefing", required=True,
+                           help="the owner's own words: what changed")
+    direction.add_argument("--to", help="the role it is addressed to (default: "
+                                        "the declared holder of the ledger); "
+                                        "must be a declared role")
 
     deliver = announce_sub.add_parser(
         "deliver",
@@ -435,6 +472,7 @@ def _add_announce(sub) -> None:
     deliver.add_argument("checkout", help="the intent repo checkout")
     deliver.add_argument("--ledger-dir",
                          help="ledger directory (default: <checkout>/ledger)")
+    deliver.add_argument("--version", help="deliver only this record's")
     deliver.add_argument("--item", type=int, help="deliver only this work item's")
     deliver.add_argument("--handoff", help="deliver only the announcement this "
                                            "handoff record raised")
@@ -453,6 +491,10 @@ def _add_announce(sub) -> None:
     answer.add_argument("--ledger-dir",
                         help="ledger directory (default: <checkout>/ledger)")
     answer.add_argument("--handoff", required=True, help="the handoff record's name")
+    answer.add_argument("--by", required=True,
+                        help="the role recording the answer; must be the "
+                             "handoff's own addressee or the role that holds "
+                             "the ledger")
     answer.add_argument("--now", help="the moment it was answered, ISO 8601")
 
     listing = announce_sub.add_parser(
@@ -1160,19 +1202,23 @@ def _dispatch_actions(sent) -> list[dict]:
 
 def _announce(args) -> int:
     from vellum.announce import (
+        Delivery,
+        addressee_for_ledger,
         answer_handoff,
         deliver,
         deliveries,
         handoffs,
         new_announcement,
         record_announcement,
+        record_direction,
         record_handoff,
+        require_role,
     )
 
     checkout, ledger_dir = _ledger_of(args)
 
     if args.announce_command == "answer":
-        path = answer_handoff(ledger_dir, args.handoff, at=args.now)
+        path = answer_handoff(ledger_dir, checkout, args.handoff, args.by, at=args.now)
         print(path)
         return 0
 
@@ -1197,32 +1243,71 @@ def _announce(args) -> int:
         return 0
 
     if args.announce_command == "deliver":
-        sent, held = deliver(ledger_dir, item=args.item, handoff=args.handoff)
+        sent, held = deliver(ledger_dir, item=args.item, handoff=args.handoff,
+                             version=args.version)
         return _report_dispatches(args, sent, held, ledger_dir)
 
-    # `handoff` and `finished`: record the event, then deliver it in the same
-    # act. That is the push — the dispatch is the announcement's own consequence
-    # and no reconciler pass is in the chain.
+    # `handoff`, `finished` and `direction`: record the event, then deliver it
+    # in the same act. That is the push — the dispatch is the announcement's
+    # own consequence and no reconciler pass is in the chain.
     if args.announce_command == "handoff":
+        handoff_notes: list[str] = []
         path, handoff = record_handoff(
             ledger_dir, checkout, args.version, args.item, args.sender,
             asks=args.asks, tried=args.tried, observed=args.observed,
             proved=args.proved, paths=args.paths, to=args.to, at=args.now,
+            notes=handoff_notes,
         )
+        for note in handoff_notes:
+            print(f"vellum: {note}", file=sys.stderr)
+        if handoff.is_answered:
+            # B1: replaying the arrival of an already-answered handoff reuses
+            # the record and dispatches nobody — the arrival is idempotent,
+            # and an answered handoff dispatches nobody either way.
+            note = (
+                f"{path}: already answered by "
+                f"{handoff.answered_by or handoff.to} at {handoff.answered}"
+            )
+            if args.json:
+                print(json.dumps({
+                    "ledger": str(ledger_dir), "recorded": str(path),
+                    "already_answered": note, "actions": [], "withheld": [],
+                }, indent=1))
+            else:
+                print(note)
+            return 0
         recorded = f"{path} (to {handoff.to})"
+    elif args.announce_command == "direction":
+        path, item = record_direction(
+            ledger_dir, checkout, args.version, args.item, args.briefing,
+            to=args.to,
+        )
+        to = ((item.get("announced") or {}).get("to")) or ""
+        recorded = f"{path} (to {to})"
     else:
-        from vellum.announce import addressee_for_ledger
-
         to = args.to or addressee_for_ledger(checkout, ledger_dir)
+        to = require_role(checkout, to, "--to")
+        sender = (getattr(args, "sender", "") or "").strip()
+        if sender:
+            sender = require_role(checkout, sender, "--from")
         pr = f" and reported pull request {args.pr}" if args.pr is not None else ""
+        detail = f"work item {args.item} has finished{pr}; the wave's next part begins"
         path, _ = record_announcement(
             ledger_dir, args.version, args.item,
-            new_announcement(
-                "finished", to,
-                f"work item {args.item} has finished{pr}; the wave's next part begins",
-            ),
+            new_announcement("finished", to, detail),
         )
         recorded = f"{path} (to {to})"
+        if sender and sender == to:
+            # SB3: a role has nothing to learn from dispatching itself.
+            # Recorded above; not delivered.
+            held = [Delivery(
+                args.version, args.item, to, detail,
+                withheld=(
+                    f"{sender} both raised and would receive this "
+                    f"announcement; recorded, not dispatched"
+                ),
+            )]
+            return _report_dispatches(args, [], held, ledger_dir, recorded=recorded)
 
     if args.no_dispatch:
         sent, held = [], []
@@ -1621,6 +1706,7 @@ def _ledger(args: argparse.Namespace) -> int:
     path = advance(
         args.ledger_dir,
         sha,
+        checkout=args.checkout,
         state=args.state,
         release=args.release,
         plan=plan,
@@ -1635,6 +1721,7 @@ def _ledger(args: argparse.Namespace) -> int:
         tokens=args.tokens,
         usd=args.usd,
         executor=args.executor,
+        announce=args.announce,
         notes=notes,
     )
     print(path)
