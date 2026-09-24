@@ -105,6 +105,11 @@ class History:
     """What the spec-touching commits say about when each scenario last changed."""
 
     by_id: dict[str, str] = field(default_factory=dict)
+    #: The fingerprint each id carried as of the newest version — what the
+    #: working tree's current fingerprint is checked against before `by_id`'s
+    #: version is trusted (waviisoft/vellum#34): an id match alone does not
+    #: say the content is still what that version committed.
+    fingerprint_by_id: dict[str, str] = field(default_factory=dict)
     #: Fingerprints as of the newest version. The fallback for a scenario whose
     #: id the history does not carry — which is how the 19 scenarios written
     #: before ids existed keep their version across the change that introduced
@@ -367,6 +372,7 @@ def version_history(repo: Path, prefix: str, ref: str = "HEAD") -> History:
     for seen in previous:
         if seen.id:
             history.by_id[seen.id] = seen.version
+            history.fingerprint_by_id[seen.id] = seen.fingerprint
         # Among scenarios sharing content, take the earliest version: that is
         # when the behavior was first specified, and dating a fallback match
         # too early only leaves it enforced, never wrongly armed. "Earliest" is
@@ -425,9 +431,21 @@ def extract(spec_dir: str | Path) -> Suite:
     entries: list[SuiteEntry] = []
     for relpath, found in scanned:
         for sc in found:
-            version = history.by_id.get(sc.id) if sc.id else None
-            if version is None:
-                version = history.by_fingerprint.get(fingerprint(sc))
+            fp = fingerprint(sc)
+            committed = history.by_id.get(sc.id) if sc.id else None
+            if committed is not None:
+                # An id match names a committed version, but not that the
+                # working tree still matches it: compare the fingerprint the
+                # tree carries now against the one that version committed
+                # (waviisoft/vellum#34). A mismatch is an uncommitted edit to
+                # an existing scenario — pending, with no version, exactly
+                # like a scenario that has never been committed at all. It
+                # does not fall through to the fingerprint fallback below:
+                # that fallback is for a scenario gaining an id it never had,
+                # not for one whose already-dated id just changed shape.
+                version = committed if history.fingerprint_by_id.get(sc.id) == fp else None
+            else:
+                version = history.by_fingerprint.get(fp)
             entries.append(
                 SuiteEntry(
                     scenario=sc,

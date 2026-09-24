@@ -693,6 +693,27 @@ class TestVersionDerivation(unittest.TestCase):
         )
         self.assertEqual(self.versions()["login-locked-out"], (None, True))
 
+    def test_an_uncommitted_edit_to_an_existing_scenario_is_pending_with_no_version(self):
+        # waviisoft/vellum#34: an id match alone is not enough. The scenario's
+        # id is already dated at `first`, but its steps changed in the working
+        # tree since — the version a caller would read off `first` is not what
+        # is actually on disk, so it must report pending with no version, the
+        # same as a brand new scenario would.
+        first = commit_area(self.repo, ONE)
+        write_area(
+            self.repo, ONE.replace("Then they see the dashboard", "Then they see the dashboard, fast")
+        )
+        self.assertEqual(self.versions()["login-good-password"], (None, True))
+        self.assertNotEqual(first, None)  # the commit did happen; it's just stale now
+
+    def test_an_unedited_committed_scenario_keeps_its_version(self):
+        # The negative control for the above: rewriting the working tree with
+        # the *same* content the last commit carries must not flip anything —
+        # the fingerprint comparison agrees, so the id match stands.
+        first = commit_area(self.repo, ONE)
+        write_area(self.repo, ONE)
+        self.assertEqual(self.versions()["login-good-password"], (first, False))
+
     def test_committing_that_scenario_dates_it_at_that_commit(self):
         # The other half of the pending case, and the reason pending shrank:
         # any committed spec change is itself a version, so it needs no tag to
@@ -700,6 +721,38 @@ class TestVersionDerivation(unittest.TestCase):
         commit_area(self.repo, ONE)
         third = commit_area(self.repo, TWO)
         self.assertEqual(self.versions()["login-bad-password"], (third, False))
+
+    def test_a_clean_checkout_is_byte_identical_to_before_the_fingerprint_check(self):
+        # The fingerprint comparison only ever fires when a scenario's id
+        # already matches a committed version. On a clean checkout the
+        # working tree *is* what got committed, so the two fingerprints can
+        # never disagree — the new branch is provably inert here, not merely
+        # untested. Pinned as a full `to_dict`/`to_covsel_dict` snapshot
+        # rather than the id->(version, pending) map `.versions()` reduces to,
+        # on a tree with more than one version in play, so nothing in either
+        # shape can drift either. This is what CI's extraction from a clean
+        # checkout relies on: identical output before and after this change.
+        first = commit_area(self.repo, ONE)
+        second = commit_area(self.repo, TWO)
+        third = commit_area(self.repo, TWO_CHANGED)
+        suite = extract(self.repo / "spec")
+
+        self.assertEqual(
+            {e.id: (e.version, e.pending) for e in suite.entries},
+            {
+                "login-good-password": (third, False),
+                "login-bad-password": (second, False),
+            },
+        )
+        self.assertNotEqual(first, second)  # sanity: three distinct commits
+
+        payload = json.dumps(to_dict(suite), indent=2, sort_keys=True)
+        covsel_payload = json.dumps(to_covsel_dict(suite), indent=2, sort_keys=True)
+        again = extract(self.repo / "spec")
+        self.assertEqual(payload, json.dumps(to_dict(again), indent=2, sort_keys=True))
+        self.assertEqual(
+            covsel_payload, json.dumps(to_covsel_dict(again), indent=2, sort_keys=True)
+        )
 
     def test_a_commit_that_does_not_touch_the_spec_tree_is_not_a_version(self):
         first = commit_area(self.repo, ONE)
@@ -1061,20 +1114,21 @@ class TestCovselFormat(unittest.TestCase):
         # reports — the issue's "harness commit", read from the checkout
         # `extract` was pointed at. An uncommitted *new* scenario has no
         # version and is emitted pending regardless (previous test). An
-        # uncommitted *edit to an already-committed* scenario's steps is a
-        # pre-existing suite.py limitation, not something this change touches:
-        # `history.by_id` matches by scenario id and hands back the last
-        # *committed* version without comparing it against the working tree's
-        # current fingerprint, so such an edit keeps its old version rather
-        # than turning pending. `to_covsel_dict` only ever reports whatever
-        # `extract()` already decided.
+        # uncommitted *edit to an already-committed* scenario's steps
+        # (waviisoft/vellum#34) is pending too, now that `extract()` compares
+        # the working tree's fingerprint against the matched id's committed
+        # one: `source` still names the checkout's HEAD — that is unaffected —
+        # but the entry itself carries no `version`, exactly like a brand new
+        # scenario. `to_covsel_dict` only ever reports whatever `extract()`
+        # already decided.
         first = commit_area(self.repo, ONE)
         write_area(self.repo, ONE.replace("the dashboard", "the dashboard, fast"))
         suite = extract(self.repo / "spec")
         covsel = to_covsel_dict(suite)
         self.assertEqual(covsel["source"], first)
-        self.assertFalse(suite.entries[0].pending)
-        self.assertEqual(covsel["entries"][0]["version"], first)
+        self.assertTrue(suite.entries[0].pending)
+        self.assertIsNone(suite.entries[0].version)
+        self.assertNotIn("version", covsel["entries"][0])
 
     def test_file_is_relative_to_the_checkout_not_the_spec_tree(self):
         # suite.json's own `file` is spec-relative ("features/auth.md");
