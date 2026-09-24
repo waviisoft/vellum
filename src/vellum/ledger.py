@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import contextlib
 import datetime
-import fcntl
 import hashlib
 import os
 import re
@@ -94,12 +93,13 @@ ITEM_KEYS = (
     "certification",
     "lease",
 )
-# `announced:` — the addressed event a run wrote at its own boundary
-# (`spec/features/continuous-engineering.md`) — is deliberately NOT in the tuple
-# above, and the omission is a finding rather than an oversight. `ITEM_KEYS` is
-# this module's reading of the fields `spec/features/ledger.md` names, which is
-# what `test_work_item_carries_every_field_the_spec_names` grades it as; that
-# slice names an issue, a title, a repo, satisfies, a PR, a state, a briefing, a
+# `announcements:` — the append-only log of every addressed event a run wrote
+# at its own boundary (`spec/features/continuous-engineering.md`) — is
+# deliberately NOT in the tuple above, and the omission is a finding rather
+# than an oversight. `ITEM_KEYS` is this module's reading of the fields
+# `spec/features/ledger.md` names, which is what
+# `test_work_item_carries_every_field_the_spec_names` grades it as; that slice
+# names an issue, a title, a repo, satisfies, a PR, a state, a briefing, a
 # cost, a certification and a lease, and no announcement. So the field rides
 # where `ordered` already promises an installation's own keys will ride — at the
 # end, kept rather than dropped — and is materialised only on an item that has
@@ -260,6 +260,18 @@ def _ordered_present(item: dict, key: str, keys: tuple[str, ...]) -> None:
         item[key] = _ordered(dict(item[key]), keys)
 
 
+def _ordered_list_present(item: dict, key: str, keys: tuple[str, ...]) -> None:
+    """Order every mapping inside ``item[key]`` in place, if it is there and is
+    a list. Each entry of the ``announcements:`` log is ordered independently
+    (``_ordered_present``'s reasoning applies per-entry, not to the list as a
+    whole) and a non-mapping entry is left exactly as found."""
+    if key in item and isinstance(item[key], list):
+        item[key] = [
+            _ordered(dict(entry), keys) if isinstance(entry, dict) else entry
+            for entry in item[key]
+        ]
+
+
 def new_cost() -> dict:
     return {"attempts": 0, "tokens": 0, "usd": 0.0, "executor": None}
 
@@ -323,9 +335,9 @@ def _ordered_item(item: dict) -> dict:
     # module to find the record — so a top-level import either way is a cycle.
     # The key order is the announcement module's to state, for `LEASE_KEYS`'s
     # reason, and this is the one line that needs it.
-    from vellum.announce import ANNOUNCED_KEYS
+    from vellum.announce import ANNOUNCEMENT_KEYS
 
-    _ordered_present(out, "announced", ANNOUNCED_KEYS)
+    _ordered_list_present(out, "announcements", ANNOUNCEMENT_KEYS)
     return _ordered(out, ITEM_KEYS)
 
 
@@ -351,11 +363,25 @@ def write(path: Path, record: dict) -> None:
     filesystem) is written and fsynced, then ``os.replace`` swaps it in —
     ``os.replace`` is atomic on POSIX and on Windows alike, unlike
     ``Path.write_text``'s truncate-then-write.
+
+    **S-7: published at the ordinary file mode, not ``mkstemp``'s ``0600``.**
+    A temp file `tempfile.mkstemp` creates is private to its own owner by
+    construction, which is right for a file nobody else should ever see under
+    its temporary name — but wrong for what it becomes after ``os.replace``:
+    an ordinary tracked ledger record, which a checkout shared between
+    accounts (or simply read by a different service user than the one that
+    last advanced it) expects at the same ``0666 & ~umask`` a plain
+    ``open(..., "w")`` would have given it. ``os.fchmod`` sets that explicitly
+    before the rename publishes the file under its real name, so the
+    permissive mode is in place from the first moment anything can see it.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     content = dump(record)
     fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
     try:
+        umask = os.umask(0)
+        os.umask(umask)
+        os.fchmod(fd, 0o666 & ~umask)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(content)
             handle.flush()
@@ -417,21 +443,54 @@ def git_toplevel(path: str | Path) -> str | None:
     return found or None
 
 
+def _user_lock_dir() -> Path:
+    """A private, per-user directory for the ledger lock's tempdir fallback
+    (S-8).
+
+    ``tempfile.gettempdir()`` is shared and world-writable; a lock file
+    placed directly inside it sits at a name any other account on the same
+    machine can pre-create, replace, or symlink before this process ever gets
+    there — an ordinary shared-tempdir footgun this project's own exclusion
+    lock must not carry. Scoped to this user (``uid`` in the name, mode
+    ``0700``) and refused outright if something already occupies that name
+    under a different owner, rather than silently reused.
+    """
+    base = Path(tempfile.gettempdir()) / f"vellum-locks-{os.getuid()}"
+    try:
+        base.mkdir(mode=0o700, exist_ok=True)
+        owner = base.stat().st_uid
+    except OSError as exc:
+        raise LedgerError(f"{base}: cannot prepare the ledger lock directory: {exc}") from exc
+    if owner != os.getuid():
+        raise LedgerError(
+            f"{base}: owned by another account, not this one; refusing to place "
+            f"a ledger lock inside a directory this process does not control"
+        )
+    os.chmod(base, 0o700)
+    return base
+
+
+def _tempdir_lock_path(ledger_dir: str | Path) -> Path:
+    key = hashlib.sha256(str(Path(ledger_dir).resolve()).encode()).hexdigest()[:24]
+    return _user_lock_dir() / f"{LOCK_NAME}.{key}"
+
+
 def _lock_path(ledger_dir: str | Path) -> Path:
-    """Where the cross-process ledger lock lives (R2).
+    """Where the cross-process ledger lock lives (R2), for the ordinary case.
 
     Inside git's own directory when the ledger sits in a work tree — content
     nothing ever stages, so a workflow that commits ``ledger/`` never commits
-    the lock and a boundary guard diffing a commit never sees it. A tempdir
-    entry keyed by the ledger's own resolved path otherwise, for a ledger this
-    cannot place in a git checkout at all (still exclusive across processes
-    naming the same ledger directory, just not repository-local).
+    the lock and a boundary guard diffing a commit never sees it. The
+    per-user tempdir path otherwise, for a ledger this cannot place in a git
+    checkout at all. This is only the *candidate*: ``locked()`` is what
+    actually falls back to the tempdir path (S-8), and it does so on any
+    failure to open this one, not only when there is no git directory to
+    begin with.
     """
     git_dir = _git_dir(Path(ledger_dir))
     if git_dir is not None:
         return git_dir / LOCK_NAME
-    key = hashlib.sha256(str(Path(ledger_dir).resolve()).encode()).hexdigest()[:24]
-    return Path(tempfile.gettempdir()) / f"{LOCK_NAME}.{key}"
+    return _tempdir_lock_path(ledger_dir)
 
 
 @contextlib.contextmanager
@@ -453,17 +512,50 @@ def locked(ledger_dir: str | Path):
     the first. A thread-local set of currently-held lock paths makes the
     second (and any further nested) acquisition a no-op; a genuinely
     different thread or process still blocks on the real ``flock``.
+
+    **S-8: the tempdir fallback triggers on failing to open the git-directory
+    path, not only on there being no git directory at all.** A ``.git`` this
+    process cannot write into — read-only, wrong permissions, an unusual
+    submodule layout — is exactly as unusable as no ``.git`` being there, and
+    the old rule only caught the second. Falling back is silent (the lock
+    still does its job from the per-user tempdir instead); a failure to open
+    *either* path is not, and becomes ``LedgerError`` rather than a raw
+    ``OSError`` a caller elsewhere in this project is not written to expect.
     """
-    path = _lock_path(ledger_dir)
-    key = str(path)
+    import fcntl  # lazy: `fcntl` is POSIX-only, and every other symbol in
+    # this module is used on every platform vellum otherwise runs on.
+
     held = getattr(_lock_state, "paths", None)
     if held is None:
         held = _lock_state.paths = set()
-    if key in held:
+
+    primary = _lock_path(ledger_dir)
+    if str(primary) in held:
         yield
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o644)
+
+    fd = None
+    used_path = primary
+    try:
+        primary.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(primary, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o644)
+    except OSError as primary_exc:
+        fallback = _tempdir_lock_path(ledger_dir)
+        if str(fallback) in held:
+            yield
+            return
+        try:
+            fallback.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(fallback, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o644)
+            used_path = fallback
+        except OSError as fallback_exc:
+            raise LedgerError(
+                f"{ledger_dir}: cannot open a ledger lock at {primary} "
+                f"({primary_exc}) or its fallback {fallback} ({fallback_exc}); "
+                f"no exclusive lock could be taken"
+            ) from fallback_exc
+
+    key = str(used_path)
     held.add(key)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
@@ -510,6 +602,7 @@ def find_item(record: dict, issue: int) -> dict | None:
 def advance(
     ledger_dir: str | Path,
     sha: str,
+    *,
     checkout: str | Path | None = None,
     state: str | None = None,
     release: str | None = None,
@@ -632,12 +725,19 @@ def advance(
 
 def _announce_finish(checkout, ledger_dir, item: dict, issue: int, pr: int,
                      notes: list[str] | None) -> None:
-    """Put a ``finished`` announcement on *item*. Never raises, never marks
-    ``dispatched`` (K3, and the corrected S4 ruling): recording a run's end is
-    unconditional, and only ``deliver``/``tick`` (or this command's own
+    """Append a ``finished`` announcement to *item*'s log. Never raises, never
+    marks ``dispatched`` (K3, and the corrected S4 ruling): recording a run's
+    end is unconditional, and only ``deliver``/``tick`` (or this command's own
     ``--json``, in the CLI layer) ever flips that bit.
     """
-    from vellum.announce import AnnounceError, addressee_for_ledger, new_announcement, set_announcement
+    from vellum.announce import (
+        AnnounceError,
+        addressee_for_ledger,
+        append_announcement,
+        finished_announcement_id,
+        new_announcement,
+        retry_unaddressed,
+    )
 
     # Note 2/4's rule: the git work tree containing `--ledger-dir`, falling
     # back to its textual parent *only* when the ledger is not in a git work
@@ -647,6 +747,11 @@ def _announce_finish(checkout, ledger_dir, item: dict, issue: int, pr: int,
     resolved = checkout
     if resolved is None:
         resolved = git_toplevel(ledger_dir) or str(Path(ledger_dir).parent)
+    # Rule 4: a prior call may have left an earlier entry on this same item
+    # unaddressed (no declared holder found at the time); retried here so an
+    # installation that adds `write_boundaries` later does not have to wait
+    # for the next tick to see it resolved.
+    retried = retry_unaddressed(resolved, ledger_dir, item)
     to = ""
     try:
         to = addressee_for_ledger(resolved, ledger_dir)
@@ -658,11 +763,11 @@ def _announce_finish(checkout, ledger_dir, item: dict, issue: int, pr: int,
                 f"undelivered; `vellum tick` and `announce list` will "
                 f"surface it."
             )
-    changed = set_announcement(item, new_announcement(
-        "finished", to,
+    changed = append_announcement(item, new_announcement(
+        finished_announcement_id(pr), "finished", to,
         f"work item {issue} has finished and reported pull request {pr}; "
         f"the wave's next part begins",
-    ))
+    )) or retried
     if notes is not None and to:
         notes.append(
             f"Work item {issue}'s run announced its end to {to}; `deliver` or "

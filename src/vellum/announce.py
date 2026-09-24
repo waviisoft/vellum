@@ -11,9 +11,13 @@ So this module supplies the cause, and nothing else. Three things live here:
 **An announcement** is a durable, addressed record that a run writes at its own
 boundary — it has finished, or it is blocked and has stopped. It names the role
 it is addressed to and what it asks for, and it records whether it has been
-dispatched yet. It is a work item's own field (``announced:``), because the
-announcement is a fact about that unit of work and the ledger is where facts
-about a unit of work already live.
+dispatched yet. It lives in a work item's own append-only log (``announcements:``),
+because the announcement is a fact about that unit of work and the ledger is
+where facts about a unit of work already live. The log is never rewritten or
+pruned, only appended to, and an arrival is deduplicated by its own ``id`` —
+the same event recorded twice (a replayed handoff, a re-run ``ledger advance
+--pr``) lands once, and two different events addressed to two different roles
+both survive rather than one overwriting the other.
 
 **A handoff** is the one announcement an agent authors rather than the forge
 emitting it for free: a blocked run's proposal, addressed to the role that holds
@@ -23,8 +27,8 @@ what was observed, what was proven — that a receiver reads, and because "a
 handoff is durable and lives in the forge".
 
 **``announce handoff`` is the ledger holder's act, done on the sender's
-behalf.** It writes into ``ledger/`` — a handoff record and the announcing
-item's ``announced:`` field — and nothing a sender does not already hold write
+behalf.** It writes into ``ledger/`` — a handoff record and an entry appended
+to the announcing item's ``announcements:`` log — and nothing a sender does not already hold write
 access to under fire-and-collect is touched by it. ``--from`` is attribution
 only: under fire-and-collect the orchestrator is the one that records the
 handoff when it collects a blocked run, and the sender named is who raised it,
@@ -55,8 +59,8 @@ run's boundary and read out of the repository afterwards;
 ``spec/decisions/2026-08-28-fire-and-collect-executors.md`` survives clause for
 clause, and nothing here addresses a run that is still going.
 
-**It widens no boundary.** Recording a handoff writes the handoff record and the
-announcing item's ``announced:`` field, and nothing in the tree the handoff is
+**It widens no boundary.** Recording a handoff writes the handoff record and
+appends to the announcing item's ``announcements:`` log, and nothing in the tree the handoff is
 *about*. The sender proposes; the role that holds the tree writes. The guard
 that says so is ``vellum verify boundaries``, and it is unchanged — a handoff
 grants nobody reach they did not declare.
@@ -87,6 +91,7 @@ import errno
 import hashlib
 import os
 import re
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -124,11 +129,15 @@ HANDOFF_DIRNAME = "handoffs"
 #: and hands off, and the owner says something.
 ANNOUNCEMENT_KINDS = ("finished", "handoff", "direction")
 
-#: ``announced:`` on a work item, in the order it is written. ``dispatched`` is a
-#: boolean rather than a timestamp deliberately: what the idempotence rule needs
-#: to know is *whether* the receiver has been started, and a clock in a ledger
-#: record is a byte that differs between two runs of the same world.
-ANNOUNCED_KEYS = ("kind", "to", "asks", "handoff", "dispatched")
+#: One entry of a work item's ``announcements:`` log, in the order it is
+#: written. ``dispatched`` is a boolean rather than a timestamp deliberately:
+#: what the idempotence rule needs to know is *whether* the receiver has been
+#: started, and a clock in a ledger record is a byte that differs between two
+#: runs of the same world. ``id`` is first because it is what the log
+#: deduplicates by; ``settled`` is last and omitted entirely when absent — an
+#: entry is only ever born or later marked "self" or "answered", never
+#: anything else.
+ANNOUNCEMENT_KEYS = ("id", "kind", "to", "asks", "handoff", "dispatched", "settled")
 
 #: The frontmatter keys of a handoff record, in the order they are written.
 #: ``to`` is first because the addressee is what makes the record deliverable at
@@ -168,6 +177,17 @@ MAX_HANDOFF_FILE_BYTES = 1 << 20  # 1 MiB
 #: on.
 MAX_EVIDENCE_BYTES = 64 * 1024
 
+#: A handoff's ``--asks`` cap (S-1): shorter than an evidence field's own,
+#: since an ask is a sentence a receiver is addressed by, not the proof
+#: behind it — and capped before it is ever hashed or scrubbed, so neither of
+#: those has to reckon with an unbounded string.
+MAX_ASKS_BYTES = 4096
+
+#: A direction's ``--briefing`` cap (S-1), for the same reason: scrubbed and
+#: hashed for its announcement id, and both of those want a bound in place
+#: before they run.
+MAX_BRIEFING_BYTES = 16384
+
 #: Control characters this module refuses in text that reaches a terminal or a
 #: CI log (SN1, S6). ``\n`` and ``\t`` are carved out for the evidence bodies —
 #: prose needs a line break — and everything else refused here is a character
@@ -185,14 +205,20 @@ _BAD_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f‪-‮⁦-⁩]")
 #: ``ledger.clean_run_reference``, which reads a whole value as one URL. An
 #: evidence field is prose that may *contain* a link a run followed, not a
 #: link itself.
-_URL_RE = re.compile(r"\w+://\S+")
+#:
+#: **S-1: the scheme is bounded, not ``\w+``.** ``\w+://\S+`` backtracks
+#: catastrophically on a long run of word characters that never reaches a
+#: literal ``://`` — every prefix length of the run retries the same failed
+#: match — so a crafted evidence field a few tens of kilobytes long (well
+#: under ``MAX_EVIDENCE_BYTES``) could take this regex engine minutes rather
+#: than milliseconds. A scheme is a handful of letters, digits, ``+``, ``-``
+#: and ``.`` in real use (``https``, ``git+ssh``, ``x-custom-scheme``) and
+#: never remotely evidence-field-length, so ``{0,31}`` bounds the backtracking
+#: without narrowing what this actually needs to match.
+_URL_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9+.-]{0,31}://\S+")
 
 
-def _sans_dispatched(announcement: dict) -> dict:
-    return {k: v for k, v in announcement.items() if k != "dispatched"}
-
-
-def _refuse_controls(argname: str, text) -> None:
+def refuse_controls(argname: str, text) -> None:
     value = str(text or "")
     found = _BAD_CONTROL_RE.search(value)
     if found:
@@ -204,16 +230,20 @@ def _refuse_controls(argname: str, text) -> None:
         )
 
 
-def _cap_evidence(argname: str, text) -> str:
+def _cap_bytes(argname: str, text, limit: int, label: str) -> str:
     value = str(text or "")
     size = len(value.encode("utf-8"))
-    if size > MAX_EVIDENCE_BYTES:
+    if size > limit:
         raise AnnounceError(
-            f"--{argname} is {size} bytes, over the {MAX_EVIDENCE_BYTES}-byte cap "
-            f"on one handoff evidence field; refused rather than truncated, "
-            f"because a truncated proof is not the proof"
+            f"--{argname} is {size} bytes, over the {limit}-byte cap on {label}; "
+            f"refused rather than truncated, because a truncated proof is not "
+            f"the proof"
         )
     return value
+
+
+def _cap_evidence(argname: str, text) -> str:
+    return _cap_bytes(argname, text, MAX_EVIDENCE_BYTES, "one handoff evidence field")
 
 
 #: A credential-shaped query parameter, wherever it sits — inside a URL this
@@ -232,7 +262,7 @@ _BEARER_RE = re.compile(r"(?i)\bBearer\s+([A-Za-z0-9._~+/-]+=*)")
 _ASSIGNMENT_RE = re.compile(r"\b([A-Z][A-Z0-9_]*(?:_TOKEN|_SECRET|_KEY))=(\S+)")
 
 
-def _scrub_credentials(argname: str, text: str, notes: list[str]) -> str:
+def scrub_credentials(argname: str, text: str, notes: list[str]) -> str:
     """Strip a credential from *text* wherever one of these shapes finds it
     (SN2, S7): ``user:token@`` in a URL's userinfo, a token-shaped query
     parameter, a ``Bearer`` value, or a ``*_TOKEN``/``*_SECRET``/``*_KEY``
@@ -474,84 +504,153 @@ def addressee_for_ledger(checkout: str | Path, ledger_dir: str | Path) -> str:
 
 # ------------------------------------------------------- the announcement
 
-def new_announcement(kind: str, to: str, asks: str, handoff: str = "") -> dict:
-    """One ``announced:`` block, in the emission order ``ANNOUNCED_KEYS`` gives."""
+def handoff_announcement_id(name: str) -> str:
+    """The log id a handoff record's own announcement is filed under.
+
+    Deterministic from the handoff's name alone, which is itself the record's
+    identity once created — so an arrival that reuses an existing handoff
+    (``record_handoff``'s B1 identity match) always computes the same id and
+    the log's own dedup-by-id makes the "repair a missing announcement"
+    replay a no-op rather than a special case.
+    """
+    return f"handoff:{name}"
+
+
+def finished_announcement_id(pr: int | None) -> str:
+    """The log id a "work item finished" event is filed under. Keyed on the PR
+    number alone (not the item or version, which the log entry already lives
+    inside) when one was reported: the same PR reported twice is the same
+    piece of news. A finished run that reports no pull request at all has
+    only one piece of news to give an item — "it finished" — so every such
+    call collapses to the one ``finished:done`` id."""
+    return f"finished:pr{pr}" if pr is not None else "finished:done"
+
+
+def direction_announcement_id(briefing: str) -> str:
+    """The log id a piece of direction is filed under: a short hash of the
+    *scrubbed* briefing text (the credential-stripped form actually stored),
+    so two different directions never collide and the same direction resent
+    verbatim always resolves to the same id, whatever role it is redirected
+    to on a later call."""
+    digest = hashlib.sha256(str(briefing or "").encode("utf-8")).hexdigest()
+    return f"direction:{digest[:12]}"
+
+
+def new_announcement(
+    id: str,
+    kind: str,
+    to: str,
+    asks: str,
+    handoff: str = "",
+    *,
+    dispatched: bool = False,
+    settled: str | None = None,
+) -> dict:
+    """One entry of the ``announcements:`` log, in the emission order
+    ``ANNOUNCEMENT_KEYS`` gives.
+
+    *id* is required and non-empty: the log is deduplicated by it
+    (``append_announcement``), so an entry with no identity could neither be
+    matched on replay nor found again by ``answer_handoff``.
+    """
     if kind not in ANNOUNCEMENT_KINDS:
         raise AnnounceError(
             f"{kind!r} is not an announcement kind ({', '.join(ANNOUNCEMENT_KINDS)})"
         )
-    return ordered({
+    if not str(id or "").strip():
+        raise AnnounceError(
+            "an announcement needs an id: the append-only log is deduplicated by it"
+        )
+    entry = {
+        "id": id,
         "kind": kind,
         "to": to,
         "asks": one_line(asks, 200),
         "handoff": handoff,
-        "dispatched": False,
-    }, ANNOUNCED_KEYS)
+        "dispatched": bool(dispatched),
+    }
+    if settled:
+        entry["settled"] = settled
+    return ordered(entry, ANNOUNCEMENT_KEYS)
 
 
-def announced(item: dict) -> dict | None:
-    """The announcement standing against *item*, or None."""
-    found = item.get("announced")
-    return found if isinstance(found, dict) else None
-
-
-def pending_announcements(item: dict) -> list[dict]:
-    """Announcements a superseding one displaced before they were delivered.
-
-    **S1: superseding is per addressee.** ``set_announcement`` replaces
-    ``announced:`` with the newest event, and that is right when both are
-    addressed to the same role — the newest is what that role should act on.
-    It is wrong when they differ: a blocked run that also opened a pull
-    request has raised news for two roles, and overwriting the first with the
-    second would dispatch nobody for it. So a standing, undelivered
-    announcement addressed to a *different* role than the one superseding it
-    is kept here instead of dropped, and delivered on the next pass exactly
-    as ``announced:`` itself would be.
-    """
-    found = item.get("announced_pending")
+def announcements(item: dict) -> list[dict]:
+    """The append-only log of every announcement ever raised against *item*,
+    oldest first. Never rewritten, only appended to (``append_announcement``)
+    — an entry's presence here is itself the durable record that the event
+    happened, whether or not it has been dispatched yet."""
+    found = item.get("announcements")
     return [e for e in found if isinstance(e, dict)] if isinstance(found, list) else []
 
 
+def find_announcement(item: dict, id: str) -> dict | None:
+    """The log entry with this *id*, or None."""
+    for entry in announcements(item):
+        if str(entry.get("id") or "") == str(id):
+            return entry
+    return None
+
+
 def is_pending(item: dict) -> bool:
-    """True when this item has an announcement nothing has dispatched yet."""
-    found = announced(item)
-    return found is not None and not found.get("dispatched")
+    """True when this item has at least one announcement nothing has
+    dispatched yet."""
+    return any(not e.get("dispatched") for e in announcements(item))
 
 
-def set_announcement(item: dict, announcement: dict) -> bool:
-    """Put *announcement* on *item*, superseding whatever stood there.
+def append_announcement(item: dict, announcement: dict) -> bool:
+    """Append *announcement* to the log, unless its ``id`` is already there.
 
-    **One pending announcement per addressee, and the newest wins for that
-    addressee (B2, S1).** Compared with ``dispatched`` excluded: an
-    announcement already delivered and one just like it in every other way are
-    the same event, and rewriting the record to say ``dispatched: false``
-    again would redeliver it — ``announce finished --pr 7`` run twice must
-    dispatch once, not twice.
-
-    A standing announcement addressed to a role *other* than the new one, and
-    not yet dispatched, is not overwritten in place: it is kept in
-    ``announced_pending`` so its own delivery still happens (S1). One
-    addressed to the *same* role is superseded outright — the newest is what
-    that role should act on — and one already dispatched is superseded too,
-    since nothing is lost by that.
+    **Idempotent by id, and append-only.** The same event arriving twice — a
+    replayed handoff, a re-run ``ledger advance --pr``, a resent direction —
+    computes the same id and this is a no-op; the first arrival's entry,
+    dispatched or not, is left exactly as it stood. Two *different* events,
+    however similar, get different ids and both survive as their own entries
+    — which is what closes the old standing-announcement-plus-pending-queue
+    model's whole class of supersede/repair/reopen bugs by construction: there
+    is no "newest wins" and nothing to lose track of superseding.
 
     Returns True when this actually changed the item, so a caller writes a
     record only when a byte of it moved — ``vellum tick``'s D11 idempotence.
     """
-    standing = announced(item)
-    if standing is not None and _sans_dispatched(standing) == _sans_dispatched(announcement):
+    id = str(announcement.get("id") or "")
+    if not id:
+        raise AnnounceError("an announcement needs an id to be appended to the log")
+    log = item.setdefault("announcements", [])
+    if any(str(e.get("id") or "") == id for e in log if isinstance(e, dict)):
         return False
-    if (standing is not None and not standing.get("dispatched")
-            and str(standing.get("to") or "") != str(announcement.get("to") or "")):
-        pending = item.setdefault("announced_pending", [])
-        # S4: at most one pending entry per addressee — a newer announcement
-        # queued for the same role *that is still waiting in the pending
-        # queue* replaces it rather than piling up beside it, which is what
-        # let alternating announcements grow the queue without bound.
-        standing_to = str(standing.get("to") or "")
-        pending[:] = [p for p in pending if str(p.get("to") or "") != standing_to]
-        pending.append(standing)
-    item["announced"] = announcement
+    log.append(announcement)
+    return True
+
+
+def retry_unaddressed(checkout: str | Path, ledger_dir: str | Path, item: dict) -> bool:
+    """Try to resolve an addressee for every log entry recorded without one
+    (rule 4).
+
+    An entry is born with ``to: ""`` in exactly one case: an implicit
+    ``finished`` announcement (``ledger advance --pr``, K3's soft-fail path)
+    raised when no declared role could be found yet — recorded rather than
+    refused, because a run reporting its own pull request must never fail
+    over an address it could not compute. That does not mean the news stays
+    undeliverable forever: an installation that adds ``write_boundaries``
+    after the fact should not have to replay every PR it already reported.
+    Called on every reconciler pass (rule 5's caller) and again from
+    ``ledger.advance`` itself, so either the next tick or the next explicit
+    call notices as soon as an addressee becomes resolvable.
+
+    Returns True when this resolved at least one entry, so a caller knows to
+    write the record back.
+    """
+    pending = [e for e in announcements(item) if not str(e.get("to") or "").strip()]
+    if not pending:
+        return False
+    try:
+        to = addressee_for_ledger(checkout, ledger_dir)
+    except AnnounceError:
+        return False
+    if not to:
+        return False
+    for entry in pending:
+        entry["to"] = to
     return True
 
 
@@ -950,13 +1049,22 @@ def _handoff_dir_refusal(checkout: str | Path, ledger_dir: str | Path) -> str | 
 def _create_handoff(ledger_dir: str | Path, checkout: str | Path, base: Handoff) -> Handoff:
     """Create a new handoff record, retrying the next number as needed.
 
-    ``os.O_EXCL | os.O_NOFOLLOW`` (SB1): the file must not already exist, and
-    if the name is occupied by a symlink — dangling or not — this never opens
-    through it. Either way the fix is the same: try the next number. That also
-    closes the ordinary concurrent-name race, where two callers compute the
-    same ``_next_number()`` before either has written: the second one's
-    ``O_EXCL`` open fails with ``EEXIST`` and it moves on rather than
-    clobbering the first.
+    **S-6: written whole to a temp file first, published with ``os.link``.**
+    The previous approach opened ``target`` itself with
+    ``O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW`` and then wrote the content —
+    which means the name existed, empty, for the whole span between the
+    ``open`` and the ``write`` completing. A reader racing that window
+    (``_next_number``'s own ``iterdir``, a concurrent ``record_handoff``
+    scanning for a match, ``handoffs()`` listing the directory) could open and
+    read a file this had created but not yet filled. Writing the full content
+    to a private temp file in the same directory first, and only then linking
+    it into place, means the name never becomes visible under ``target`` until
+    the content behind it is already complete — there is no window to race.
+    ``os.link`` keeps exactly the exclusivity ``O_EXCL`` gave: it fails with
+    ``FileExistsError`` when ``target`` is already occupied by anything at
+    all, symlink included (SB1), and this still just tries the next number —
+    which is what also closes the ordinary concurrent-name race, where two
+    callers compute the same ``_next_number()`` before either has published.
     """
     refusal = _handoff_dir_refusal(checkout, ledger_dir)
     if refusal is not None:
@@ -972,21 +1080,28 @@ def _create_handoff(ledger_dir: str | Path, checkout: str | Path, base: Handoff)
         handoff = dataclasses.replace(base, name=name)
         target = tree / name
         content = render_handoff(handoff).encode("utf-8")
+        fd, tmp_name = tempfile.mkstemp(dir=tree, prefix=".handoff-", suffix=".tmp")
         try:
-            fd = os.open(
-                target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644
-            )
-        except FileExistsError:
-            continue
-        except OSError as exc:
-            if exc.errno == errno.ELOOP:
-                continue  # a symlink already occupies this name; skip past it
-            raise
-        try:
-            os.write(fd, content)
+            try:
+                os.write(fd, content)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.chmod(tmp_name, 0o644)
+            try:
+                os.link(tmp_name, target)
+            except FileExistsError:
+                continue  # the name is already occupied; try the next number
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    continue  # a symlink already occupies this name
+                raise
+            return handoff
         finally:
-            os.close(fd)
-        return handoff
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
     raise AnnounceError(f"{tree}: no free handoff number found after 10000 tries")
 
 
@@ -1119,7 +1234,37 @@ def answer_handoff(
         handoff.answered = canonical_time(at) or ledger_now()
         handoff.answered_by = recorded_by
         write_handoff(ledger_dir, handoff, checkout)
+        _settle_handoff_announcement(ledger_dir, handoff)
     return handoff_dir(ledger_dir) / name
+
+
+def _settle_handoff_announcement(ledger_dir: str | Path, handoff: Handoff) -> None:
+    """Mark the owning ledger record's log entry for *handoff* ``settled:
+    "answered"`` (rule 3), when it is still undelivered.
+
+    Best-effort and never raises: the handoff file itself, just patched by
+    the caller above, is what ``_withheld_reason`` actually reads to decide
+    whether a delivery dispatches it, so a ledger record this cannot find —
+    moved, renamed, or simply absent because *handoff.item* was never set —
+    leaves the one fact that matters, "an answered handoff dispatches
+    nobody", intact either way. This is annotation on top of that fact, not a
+    second copy of it.
+    """
+    if handoff.item is None:
+        return
+    try:
+        with _locked(ledger_dir):
+            path, record = _record_for(ledger_dir, handoff.version)
+            item = find_item(record, handoff.item)
+            if item is None:
+                return
+            entry = find_announcement(item, handoff_announcement_id(handoff.name))
+            if entry is None or entry.get("dispatched") or entry.get("settled"):
+                return
+            entry["settled"] = "answered"
+            write(path, record)
+    except AnnounceError:
+        return
 
 
 # ------------------------------------------------------- recording an event
@@ -1161,27 +1306,9 @@ def record_announcement(
                 f"of work, and this record's items are "
                 f"{', '.join(str(i.get('issue')) for i in record.get('work_items') or []) or '(none)'}"
             )
-        if set_announcement(found, announcement):
+        if append_announcement(found, announcement):
             write(path, record)
         return path, found
-
-
-def mark_dispatched(ledger_dir: str | Path, version: str, item: int) -> bool:
-    """Record that the addressed dispatch for this item's main announcement has
-    been emitted. Kept for a direct caller; ``deliver`` below writes back
-    through the live record it already holds instead of calling this, which is
-    what lets it mark an ``announced_pending`` entry too and an item whose
-    ``issue`` is ``null`` (N2/SS8, where a lookup by issue could never find it
-    again).
-    """
-    path, record = _record_for(ledger_dir, version)
-    found = find_item(record, item)
-    standing = announced(found) if found is not None else None
-    if standing is None or standing.get("dispatched"):
-        return False
-    standing["dispatched"] = True
-    write(path, record)
-    return True
 
 
 def record_handoff(
@@ -1236,10 +1363,10 @@ def record_handoff(
         declared = declared_boundaries(checkout)
         sender = require_role(checkout, sender, "--from")
 
-        _refuse_controls("asks", asks)
-        _refuse_controls("tried", tried)
-        _refuse_controls("observed", observed)
-        _refuse_controls("proved", proved)
+        refuse_controls("asks", asks)
+        refuse_controls("tried", tried)
+        refuse_controls("observed", observed)
+        refuse_controls("proved", proved)
         if not str(tried or "").strip() or not str(proved or "").strip():
             raise AnnounceError(
                 "a handoff carries what was tried and what was proved — the "
@@ -1247,14 +1374,15 @@ def record_handoff(
                 "none of that is a question, and goes by the question protocol "
                 "instead (spec/features/question-protocol.md)"
             )
+        asks = _cap_bytes("asks", asks, MAX_ASKS_BYTES, "a handoff's ask")
         tried = _cap_evidence("tried", tried)
         observed = _cap_evidence("observed", observed)
         proved = _cap_evidence("proved", proved)
         local_notes: list[str] = []
-        tried = _scrub_credentials("tried", tried, local_notes)
-        observed = _scrub_credentials("observed", observed, local_notes)
-        proved = _scrub_credentials("proved", proved, local_notes)
-        asks = _scrub_credentials("asks", asks, local_notes)
+        tried = scrub_credentials("tried", tried, local_notes)
+        observed = scrub_credentials("observed", observed, local_notes)
+        proved = scrub_credentials("proved", proved, local_notes)
+        asks = scrub_credentials("asks", asks, local_notes)
         if notes is not None:
             notes.extend(local_notes)
 
@@ -1307,12 +1435,15 @@ def record_handoff(
         identity_paths = tuple(sorted(proposed))
         existing = _matching_handoff(ledger_dir, full_version, item, to, asks_hash, identity_paths)
         if existing is not None:
-            # K4: still idempotent — but a replay also repairs an
-            # announcement a prior crash or lost update left missing, rather
-            # than trusting the record is already right.
+            # K4: still idempotent — the log is deduplicated by id
+            # (`handoff:<name>`), so a replay that finds a matching handoff
+            # appends nothing new; it also repairs an announcement a prior
+            # crash or lost update left missing, rather than trusting the
+            # record is already right.
             record_announcement(
                 ledger_dir, full_version, item,
-                new_announcement("handoff", to, existing.asks, handoff=existing.name),
+                new_announcement(handoff_announcement_id(existing.name), "handoff",
+                                 to, existing.asks, handoff=existing.name),
             )
             return handoff_dir(ledger_dir) / existing.name, existing
 
@@ -1325,7 +1456,8 @@ def record_handoff(
         handoff = _create_handoff(ledger_dir, checkout, template)
         record_announcement(
             ledger_dir, full_version, item,
-            new_announcement("handoff", to, handoff.asks, handoff=handoff.name),
+            new_announcement(handoff_announcement_id(handoff.name), "handoff",
+                             to, handoff.asks, handoff=handoff.name),
         )
         return handoff_dir(ledger_dir) / handoff.name, handoff
 
@@ -1371,7 +1503,7 @@ def record_direction(
     to: str | None = None,
     at: str | None = None,
     notes: list[str] | None = None,
-) -> tuple[Path, dict]:
+) -> tuple[Path, dict, str]:
     """Record the owner's direction against a work item, and announce it.
 
     Mirrors ``reconcile.directions()``'s own write — the item's ``briefing``
@@ -1392,25 +1524,38 @@ def record_direction(
         role = require_role(checkout, to, "--to") if to else addressee_for_ledger(checkout, ledger_dir)
         # S6: the owner's own words reach a briefing an agent reads, and from
         # there a terminal or a log the same way any other evidence would.
-        _refuse_controls("briefing", briefing)
+        refuse_controls("briefing", briefing)
+        briefing = _cap_bytes("briefing", briefing, MAX_BRIEFING_BYTES, "a direction's briefing")
         local_notes: list[str] = []
-        briefing = _scrub_credentials("briefing", briefing, local_notes)
+        briefing = scrub_credentials("briefing", briefing, local_notes)
         if notes is not None:
             notes.extend(local_notes)
         changed_briefing = found.get("briefing") != briefing
         if changed_briefing:
             found["briefing"] = briefing
-        changed_announcement = set_announcement(found, new_announcement("direction", role, briefing))
+        announcement = new_announcement(
+            direction_announcement_id(briefing), "direction", role, briefing,
+        )
+        changed_announcement = append_announcement(found, announcement)
         if changed_briefing or changed_announcement:
             write(path, record)
-        return path, found
+        return path, found, role
 
 
 # ------------------------------------------------------------------ delivery
 
 @dataclass(frozen=True)
 class Delivery:
-    """One pending announcement, resolved into the dispatch it would cause."""
+    """One dispatch action: everything undelivered addressed to one role, for
+    one work item, resolved into the single command that role receives.
+
+    **One dispatch per (version, item, to), covering every entry it groups
+    (rule 2).** A blocked run's handoff and, moments later, that same item
+    finishing both address the ledger holder; delivering them as two separate
+    dispatches would run the receiver's collection twice for one commission.
+    Grouped here into one ``Delivery`` instead — ``entries`` carries every log
+    entry it speaks for, and ``deliver`` marks all of them dispatched together.
+    """
 
     version: str
     item: int | None
@@ -1419,12 +1564,15 @@ class Delivery:
     #: Why it was not delivered, or "" when it was. An answered handoff is the
     #: one case: "a handoff already acted on dispatches nobody".
     withheld: str = ""
-    #: The live ``(path, record)`` and announcement dict this came from, for
-    #: ``deliver`` to write back through directly (N2/SS8) — never by looking
-    #: the item back up by ``issue``, which an item with ``issue: null`` (or a
-    #: duplicate) could not be found by a second time.
+    #: The live ``(path, record)`` this came from, for ``deliver`` to write
+    #: back through directly (N2/SS8) — never by looking the item back up by
+    #: ``issue``, which an item with ``issue: null`` (or a duplicate) could
+    #: not be found by a second time.
     record: tuple[Path, dict] | None = field(default=None, repr=False, compare=False)
-    slot: dict | None = field(default=None, repr=False, compare=False)
+    #: The live announcement-log entries this dispatch speaks for — one for an
+    #: ordinary delivery or a withheld one, more than one when rule 2 grouped
+    #: several undelivered entries addressed to the same role together.
+    entries: tuple[dict, ...] = field(default=(), repr=False, compare=False)
 
 
 def _records(ledger_dir: str | Path) -> list[tuple[Path, dict]]:
@@ -1449,8 +1597,8 @@ def _records(ledger_dir: str | Path) -> list[tuple[Path, dict]]:
     return found
 
 
-def _withheld_reason(ledger_dir: str | Path, slot: dict) -> str:
-    name = str(slot.get("handoff") or "").strip()
+def _withheld_reason(ledger_dir: str | Path, entry: dict) -> str:
+    name = str(entry.get("handoff") or "").strip()
     if not name:
         return ""
     try:
@@ -1470,50 +1618,75 @@ def _withheld_reason(ledger_dir: str | Path, slot: dict) -> str:
     return ""
 
 
+def _resolve_version_path(ledger_dir: str | Path, version: str) -> Path | None:
+    """*version* resolved to its record's own path (S-2), the same way every
+    other announce command resolves it (``_record_for``), rather than a bare
+    string comparison against ``spec_version`` — a comparison an abbreviated
+    sha, valid everywhere else this project takes ``--version``, would simply
+    never match."""
+    return find_record(ledger_dir, version)
+
+
 def deliveries(
     ledger_dir: str | Path,
     item: int | None = None,
     handoff: str | None = None,
     version: str | None = None,
 ) -> list[Delivery]:
-    """Every announcement standing undispatched, as the dispatch it would cause.
+    """Every undispatched announcement, resolved into the dispatch(es) it
+    would cause.
 
     Read-only: what is *deliverable* is a question about the record, and asking
-    it must not be the thing that answers it. ``--version`` (N2/SS8) narrows to
-    one record the way every other announce command already does, so a
-    transport that knows which wave it is delivering for is not made to scan
-    every open one.
+    it must not be the thing that answers it. ``--version`` (N2/SS8, S-2)
+    narrows to one record the way every other announce command already does —
+    resolved through ``find_record`` so an abbreviated sha matches exactly as
+    it would anywhere else this project takes ``--version`` — so a transport
+    that knows which wave it is delivering for is not made to scan every open
+    one.
     """
+    resolved_path = None
+    if version is not None:
+        resolved_path = _resolve_version_path(ledger_dir, version)
+        if resolved_path is None:
+            return []
     found: list[Delivery] = []
     for path, record in _records(ledger_dir):
-        rec_version = str(record.get("spec_version") or "")
-        if version is not None and rec_version != version:
+        if resolved_path is not None and path != resolved_path:
             continue
+        rec_version = str(record.get("spec_version") or "")
         for entry in record.get("work_items") or []:
             if not isinstance(entry, dict):
                 continue
             issue = entry.get("issue")
             if item is not None and issue != item:
                 continue
-            slots: list[dict] = []
-            standing = announced(entry)
-            if standing is not None:
-                slots.append(standing)
-            slots.extend(pending_announcements(entry))
-            for slot in slots:
-                if slot.get("dispatched"):
-                    continue
-                name = str(slot.get("handoff") or "").strip()
-                if handoff is not None and name != handoff:
-                    continue
-                role = str(slot.get("to") or "").strip()
+            issue_int = issue if isinstance(issue, int) and not isinstance(issue, bool) else None
+            pending = [a for a in announcements(entry) if not a.get("dispatched")]
+            if handoff is not None:
+                pending = [a for a in pending if str(a.get("handoff") or "").strip() == handoff]
+            # Rule 2: group every deliverable entry addressed to the same role
+            # into one dispatch. A withheld entry is reported on its own
+            # instead — grouping it with a role's other, deliverable entries
+            # would either withhold news that is not withheld, or silently
+            # drop the one that is.
+            grouped: dict[str, list[dict]] = {}
+            for entry_ann in pending:
+                role = str(entry_ann.get("to") or "").strip()
                 if not role:
+                    # Rule 4: unaddressed — recorded, but nothing to deliver
+                    # to yet. A reconciler pass retries resolving it.
                     continue
-                withheld = _withheld_reason(ledger_dir, slot)
-                issue_int = issue if isinstance(issue, int) and not isinstance(issue, bool) else None
-                found.append(Delivery(rec_version, issue_int, role,
-                                      dispatch_detail(slot), withheld,
-                                      record=(path, record), slot=slot))
+                withheld = _withheld_reason(ledger_dir, entry_ann)
+                if withheld:
+                    found.append(Delivery(rec_version, issue_int, role,
+                                          dispatch_detail(entry_ann), withheld,
+                                          record=(path, record), entries=(entry_ann,)))
+                    continue
+                grouped.setdefault(role, []).append(entry_ann)
+            for role, group in grouped.items():
+                detail = "; ".join(dispatch_detail(a) for a in group)
+                found.append(Delivery(rec_version, issue_int, role, detail, "",
+                                      record=(path, record), entries=tuple(group)))
     return found
 
 
@@ -1552,27 +1725,19 @@ def deliver(
             if delivery.withheld:
                 held.append(delivery)
                 continue
-            if delivery.slot is not None:
-                delivery.slot["dispatched"] = True
+            for entry in delivery.entries:
+                entry["dispatched"] = True
             if delivery.record is not None:
                 path, record = delivery.record
                 touched[path] = record
             sent.append(delivery)
+        # No pruning: the log is append-only (unlike the old
+        # standing-announcement-plus-pending-queue shape, S4's "prune every
+        # dispatched pending entry before writing" no longer applies — a
+        # dispatched entry stays in `announcements:` as the durable record
+        # that it happened, and the log's own size is bounded by how many
+        # events a work item actually raises, not by anything this prunes).
         for path, record in touched.items():
-            # S4: prune every now-dispatched `announced_pending` entry before
-            # writing — otherwise a slot marked dispatched above stays in the
-            # list forever, and the queue grows without bound.
-            for entry in record.get("work_items") or []:
-                if not isinstance(entry, dict):
-                    continue
-                pending = entry.get("announced_pending")
-                if not isinstance(pending, list):
-                    continue
-                kept = [p for p in pending if isinstance(p, dict) and not p.get("dispatched")]
-                if kept:
-                    entry["announced_pending"] = kept
-                else:
-                    entry.pop("announced_pending", None)
             write(path, record)
     return sent, held
 
@@ -1585,13 +1750,17 @@ def utc(value: str | None) -> datetime.datetime | None:
 
 
 __all__ = [
-    "ANNOUNCED_KEYS", "ANNOUNCEMENT_KINDS", "AnnounceError", "HANDOFF_DIRNAME",
-    "HANDOFF_NAME_RE", "Handoff", "MAX_EVIDENCE_BYTES", "MAX_HANDOFF_FILE_BYTES",
-    "addressee", "addressee_for_ledger", "announced", "answer_handoff",
-    "declared_boundaries", "dispatch_detail", "find_handoff", "handoff_dir",
-    "handoffs", "holders", "is_pending", "mark_dispatched", "new_announcement",
-    "pending_announcements", "read_handoff", "record_announcement",
-    "record_direction", "record_handoff", "render_handoff", "require_role",
-    "set_announcement", "valid_handoff_name", "write_handoff", "Delivery",
-    "deliver", "deliveries",
+    "ANNOUNCEMENT_KEYS", "ANNOUNCEMENT_KINDS", "AnnounceError", "HANDOFF_DIRNAME",
+    "HANDOFF_NAME_RE", "Handoff", "MAX_ASKS_BYTES", "MAX_BRIEFING_BYTES",
+    "MAX_EVIDENCE_BYTES", "MAX_HANDOFF_FILE_BYTES",
+    "addressee", "addressee_for_ledger", "announcements", "answer_handoff",
+    "append_announcement", "declared_boundaries", "direction_announcement_id",
+    "dispatch_detail", "find_announcement", "find_handoff",
+    "finished_announcement_id", "handoff_announcement_id", "handoff_dir",
+    "handoffs", "holders", "is_pending", "new_announcement",
+    "read_handoff", "record_announcement",
+    "record_direction", "record_handoff", "refuse_controls", "render_handoff",
+    "require_role", "retry_unaddressed", "scrub_credentials",
+    "valid_handoff_name", "write_handoff",
+    "Delivery", "deliver", "deliveries",
 ]

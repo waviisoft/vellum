@@ -1219,6 +1219,7 @@ def _announce(args) -> int:
         answer_handoff,
         deliver,
         deliveries,
+        finished_announcement_id,
         handoffs,
         new_announcement,
         record_announcement,
@@ -1288,13 +1289,12 @@ def _announce(args) -> int:
         recorded = f"{path} (to {handoff.to})"
     elif args.announce_command == "direction":
         direction_notes: list[str] = []
-        path, item = record_direction(
+        path, item, to = record_direction(
             ledger_dir, checkout, args.version, args.item, args.briefing,
             to=args.to, notes=direction_notes,
         )
         for note in direction_notes:
             print(f"vellum: {note}", file=sys.stderr)
-        to = ((item.get("announced") or {}).get("to")) or ""
         recorded = f"{path} (to {to})"
     else:
         to = args.to or addressee_for_ledger(checkout, ledger_dir)
@@ -1304,16 +1304,16 @@ def _announce(args) -> int:
             sender = require_role(checkout, sender, "--from")
         pr = f" and reported pull request {args.pr}" if args.pr is not None else ""
         detail = f"work item {args.item} has finished{pr}; the wave's next part begins"
-        announcement = new_announcement("finished", to, detail)
         self_dispatch = bool(sender) and sender == to
-        if self_dispatch:
-            # K5: settled at birth, not merely postponed. A `dispatched:
-            # false` record with nobody withholding it in the reader's own
-            # act is exactly what a later `deliver`/`tick` picks up and
-            # dispatches anyway — a role has nothing to learn from
-            # dispatching itself, permanently, not just this one time.
-            announcement["dispatched"] = True
-            announcement["settled"] = "self"
+        # K5: settled at birth, not merely postponed. A `dispatched: false`
+        # entry with nobody withholding it in the reader's own act is exactly
+        # what a later `deliver`/`tick` picks up and dispatches anyway — a
+        # role has nothing to learn from dispatching itself, permanently, not
+        # just this one time.
+        announcement = new_announcement(
+            finished_announcement_id(args.pr), "finished", to, detail,
+            dispatched=self_dispatch, settled="self" if self_dispatch else None,
+        )
         path, _ = record_announcement(ledger_dir, args.version, args.item, announcement)
         recorded = f"{path} (to {to})"
         if self_dispatch:
