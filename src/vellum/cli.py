@@ -212,9 +212,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--checkout", default=None,
         help="the intent checkout to read installation config from, for "
              "addressing a finished announcement when --pr is given "
-             "(default: the git work tree containing --ledger-dir). Name it "
-             "explicitly when the ledger is not in a git checkout, or is in "
-             "the wrong one",
+             "(default: the git work tree containing --ledger-dir, or its "
+             "textual parent when it is not in one at all). Name it "
+             "explicitly when it resolves to the wrong checkout",
     )
     adv.add_argument("--state", help="record state")
     adv.add_argument("--release", help="the cut that shipped this version")

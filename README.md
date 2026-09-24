@@ -289,8 +289,9 @@ dispatched, since a role has nothing to learn from dispatching itself, and no
 later `deliver` or `tick` revisits it.
 
 `vellum ledger advance --pr` records the same announcement, addressed against
-the git work tree containing `--ledger-dir` by default (`--checkout` names a
-different one explicitly) — but it *softens* rather than refuses when no
+the git work tree containing `--ledger-dir` by default — falling back to its
+textual parent only when it is not in a git work tree at all — or a checkout
+`--checkout` names explicitly. It *softens* rather than refuses when no
 addressee can be found: the pull request and every other field it was asked to
 record are still written, the announcement is recorded with an empty address,
 a warning goes to stderr, and the command still exits 0. Reporting a run's end

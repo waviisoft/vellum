@@ -546,12 +546,14 @@ def advance(
 
     *checkout* overrides the addressee's source. Left unnamed, it defaults to
     the git work tree containing *ledger_dir* (corrected S4 ruling,
-    superseding the first cut: neither the process's current directory nor
-    ``ledger_dir``'s textual parent, since a ``--ledger-dir`` is not obliged to
-    be either). When no addressee can be found at all — not in a git work
-    tree, no ``write_boundaries``, no unique holder — the item's own state (its
-    PR, its cost) is still recorded, the announcement is recorded too but with
-    an empty ``to`` so it dispatches nobody, a warning lands in *notes*, and
+    superseding the first cut, which was ``ledger_dir``'s textual parent alone
+    with no git-toplevel attempt first — never the process's current
+    directory) — falling back to that same textual parent only when
+    *ledger_dir* is not inside a git work tree at all. When no addressee can
+    be found even so — no ``write_boundaries``, no unique holder — the item's
+    own state (its PR, its cost) is still recorded, the announcement is
+    recorded too but with an empty ``to`` so it dispatches nobody, a warning
+    lands in *notes*, and
     this still returns normally: an implicit announcement inside ordinary
     ledger bookkeeping must never fail a state change over an address it could
     not compute. ``vellum announce finished`` — the explicit command — keeps
@@ -636,30 +638,26 @@ def _announce_finish(checkout, ledger_dir, item: dict, issue: int, pr: int,
     ``--json``, in the CLI layer) ever flips that bit.
     """
     from vellum.announce import AnnounceError, addressee_for_ledger, new_announcement, set_announcement
-    from vellum.config import config_path as _config_path
 
-    resolved = checkout if checkout is not None else git_toplevel(ledger_dir)
-    to = ""
+    # Note 2/4's rule: the git work tree containing `--ledger-dir`, falling
+    # back to its textual parent *only* when the ledger is not in a git work
+    # tree at all. `ledger_dir.parent` alone, with no git-toplevel attempt
+    # first, is exactly the guess the blind review flagged (S4); this is the
+    # fallback for the one case that guess did get right, not the whole rule.
+    resolved = checkout
     if resolved is None:
+        resolved = git_toplevel(ledger_dir) or str(Path(ledger_dir).parent)
+    to = ""
+    try:
+        to = addressee_for_ledger(resolved, ledger_dir)
+    except AnnounceError as exc:
         if notes is not None:
             notes.append(
-                f"Work item {issue} reported pull request {pr}, but "
-                f"{ledger_dir} is not inside a git work tree and no --checkout "
-                f"was given, so nothing could be addressed. The announcement "
-                f"is recorded as undelivered; `vellum tick` and `announce "
-                f"list` will surface it."
+                f"Work item {issue} reported pull request {pr} and nothing "
+                f"was addressed: {exc} The announcement is recorded as "
+                f"undelivered; `vellum tick` and `announce list` will "
+                f"surface it."
             )
-    else:
-        try:
-            to = addressee_for_ledger(resolved, ledger_dir)
-        except AnnounceError as exc:
-            if notes is not None:
-                notes.append(
-                    f"Work item {issue} reported pull request {pr} and nothing "
-                    f"was addressed: {exc} The announcement is recorded as "
-                    f"undelivered; `vellum tick` and `announce list` will "
-                    f"surface it."
-                )
     changed = set_announcement(item, new_announcement(
         "finished", to,
         f"work item {issue} has finished and reported pull request {pr}; "

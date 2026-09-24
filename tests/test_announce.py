@@ -848,10 +848,14 @@ class LedgerAdvanceAddressesExplicitly(unittest.TestCase):
             self.assertEqual(_item(repo)["pr"], 7)
             self.assertEqual(_item(repo)["announced"]["to"], "")
 
-    def test_a_ledger_dir_outside_any_git_work_tree_also_softens(self):
+    def test_a_ledger_dir_outside_any_git_work_tree_falls_back_to_its_parent(self):
+        """Note 4: `ledger_dir.parent` is the fallback for the one case the
+        first-cut S4 guess got right — no git work tree at all — not a
+        replacement for trying the git toplevel first.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             # Not a git repo at all — `git -C <ledger_dir> rev-parse
-            # --show-toplevel` fails outright.
+            # --show-toplevel` fails outright, so the parent is tried.
             ledger_dir = Path(tmp) / "loose" / "ledger"
             code, _ = run_cli(["ledger", "open", "--version", VERSION,
                                "--ledger-dir", str(ledger_dir), "--approved", NOW])
@@ -867,11 +871,46 @@ class LedgerAdvanceAddressesExplicitly(unittest.TestCase):
                 str(ledger_dir), "--item", str(SUBJECT), "--pr", "7",
             ])
             self.assertEqual(code, 0, said)
-            self.assertIn("not inside a git work tree", said)
+            # The parent (`loose/`) has no `.vellum/config.yaml` either, so
+            # addressing still fails — but via "cannot read the installation
+            # config", not "not inside a git work tree", since the parent was
+            # actually tried.
+            self.assertIn("undelivered", said)
+            self.assertNotIn("not inside a git work tree", said)
             record = load(record_path(ledger_dir, VERSION))
             item = find_item(record, SUBJECT)
             self.assertEqual(item["pr"], 7)
             self.assertEqual(item["announced"]["to"], "")
+
+    def test_the_parent_fallback_actually_addresses_when_it_can(self):
+        """The positive case: no git work tree, but the ledger's own parent
+        directory carries a real installation config — the fallback must
+        actually resolve it, not merely avoid crashing.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            from support import write_intent_config
+
+            checkout = Path(tmp) / "no_git_here"
+            write_intent_config(checkout, boundaries={
+                "librarian": ["ledger", ".vellum/memory"],
+            })
+            ledger_dir = checkout / "ledger"
+            code, _ = run_cli(["ledger", "open", "--version", VERSION,
+                               "--ledger-dir", str(ledger_dir), "--approved", NOW])
+            self.assertEqual(code, 0)
+            code, said = run_cli([
+                "ledger", "advance", "--version", VERSION, "--ledger-dir",
+                str(ledger_dir), "--item", str(SUBJECT), "--title", "t",
+                "--repo", "app", "--item-state", "planned",
+            ])
+            self.assertEqual(code, 0, said)
+            code, said = run_cli([
+                "ledger", "advance", "--version", VERSION, "--ledger-dir",
+                str(ledger_dir), "--item", str(SUBJECT), "--pr", "7",
+            ])
+            self.assertEqual(code, 0, said)
+            record = load(record_path(ledger_dir, VERSION))
+            self.assertEqual(find_item(record, SUBJECT)["announced"]["to"], "librarian")
 
     def test_no_checkout_flag_defaults_to_the_git_toplevel(self):
         """The corrected default — the git work tree containing --ledger-dir
