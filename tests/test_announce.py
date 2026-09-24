@@ -2496,6 +2496,81 @@ class HandoffCreationIsNeverVisibleHalfWritten(unittest.TestCase):
             self.assertNotEqual(new_names[0], "0001-fix-item-1.md")
 
 
+class AnswerPatchesAtomicallyUnderTheLock(unittest.TestCase):
+    """S-6 (architect note 6, the `answer` half): `answer_handoff` holds the
+    shared ledger lock across its whole find/check/patch/settle, and
+    `write_handoff` publishes the patched record through a temp file plus
+    `os.replace` rather than truncating the real file in place. Without
+    either half, a `record_handoff` replay racing an in-flight `answer`
+    could read the handoff mid-patch (or, before this fix, momentarily
+    empty), fail its identity match against that, and mint a second record
+    — dispatching the receiver again for news already answered.
+    """
+
+    def test_a_concurrent_replay_never_sees_a_half_patched_record(self):
+        import threading
+        import unittest.mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            _record_handoff(repo, "--no-dispatch")
+            name = next(iter(_handoffs(repo)))
+
+            entered_replace = threading.Event()
+            release_replace = threading.Event()
+            real_replace = os.replace
+            handoff_path = repo / "ledger" / "handoffs" / name
+
+            def _blocking_replace(src, dst):
+                # Only the publish of *this* handoff record blocks — a
+                # ledger-record write elsewhere in the same call chain
+                # (`_settle_handoff_announcement`) also goes through
+                # `os.replace` and must not be mistaken for the window this
+                # test means to hold open.
+                if Path(dst) == handoff_path:
+                    entered_replace.set()
+                    release_replace.wait(timeout=5)
+                real_replace(src, dst)
+
+            with unittest.mock.patch("os.replace", side_effect=_blocking_replace):
+                answer_thread = threading.Thread(
+                    target=lambda: _answer(repo, name, "--now", AFTER_LEASE))
+                answer_thread.start()
+                self.assertTrue(entered_replace.wait(timeout=5),
+                                "answer never reached its publish")
+
+                # The identical handoff, arriving again, concurrently, while
+                # the answer is mid-publish — blocked just before its
+                # `os.replace`, still holding the lock the whole time.
+                replay_done = threading.Event()
+
+                def _replay():
+                    from vellum import announce as announce_mod
+
+                    announce_mod.record_handoff(
+                        repo / "ledger", repo, VERSION, SUBJECT, "librarian",
+                        asks=ASKS, tried=TRIED, observed=OBSERVED, proved=PROVED,
+                        paths=["harness/steps.py"],
+                    )
+                    replay_done.set()
+
+                replay_thread = threading.Thread(target=_replay)
+                replay_thread.start()
+                self.assertFalse(replay_done.wait(timeout=0.3),
+                                 "the replay was not blocked by answer_handoff's lock")
+                release_replace.set()
+                answer_thread.join(timeout=5)
+                replay_thread.join(timeout=5)
+                self.assertTrue(replay_done.is_set(), "the replay never completed")
+
+            # Exactly one record — the replay reused it rather than minting
+            # a second one — and it dispatches nobody: it was answered.
+            records = _handoffs(repo)
+            self.assertEqual(len(records), 1, records)
+            payload = _tick(repo)
+            self.assertEqual(_addressed(payload, SUBJECT), [], payload["actions"])
+
+
 # ------------------------------------------------------------------ rule 3
 
 

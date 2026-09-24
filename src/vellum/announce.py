@@ -85,6 +85,7 @@ overrides it wherever an installation knows better.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime
 import errno
@@ -1151,6 +1152,22 @@ def write_handoff(ledger_dir: str | Path, handoff: Handoff, checkout: str | Path
     module re-derives a file from a second time. Only ``answered:`` and
     ``answered_by:`` ever change; every other byte, including the fences and
     bodies of the evidence sections, is copied through untouched.
+
+    **Atomic (round-6 S-6, the ``answer`` half).** The previous version opened
+    ``path`` itself with ``O_WRONLY``, truncated it to zero, and then wrote —
+    which means the file sat empty on disk for the whole span between the
+    truncate and the write completing. A concurrent ``record_handoff`` replay
+    racing that window (its identity check reads every handoff in
+    ``handoffs/``) would read an empty file, fail the identity match against
+    it, and mint a second handoff record — dispatching the receiver again for
+    news it already answered. A crash in the same window left an empty file
+    behind permanently: unparseable, so `is_answered` reads false forever and
+    the item holds on a handoff that can never be marked answered again.
+    Written whole to a temp file in the same directory first (the same
+    pattern ``ledger.write`` and ``announce._create_handoff`` already use) and
+    published with ``os.replace``, so the name never shows anything but the
+    complete old content or the complete new content — never a truncated
+    file in between.
     """
     tree = handoff_dir(ledger_dir)
     path = tree / handoff.name
@@ -1172,12 +1189,23 @@ def write_handoff(ledger_dir: str | Path, handoff: Handoff, checkout: str | Path
         raise AnnounceError(f"{path}: not valid UTF-8: {exc}") from exc
     patched = _patch_answer(text, handoff.answered, handoff.answered_by)
     content = patched.encode("utf-8")
-    fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW, 0o644)
     try:
-        os.ftruncate(fd, 0)
-        os.write(fd, content)
-    finally:
-        os.close(fd)
+        fd, tmp_name = tempfile.mkstemp(dir=str(tree), prefix=f".{path.name}.", suffix=".tmp")
+    except OSError as exc:
+        raise AnnounceError(f"{path}: cannot patch handoff record: {exc}") from exc
+    try:
+        umask = os.umask(0)
+        os.umask(umask)
+        os.fchmod(fd, 0o666 & ~umask)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
     return path
 
 
@@ -1203,39 +1231,50 @@ def answer_handoff(
     is the one fact this record exists to carry — and never the handoff's own
     sender, ledger holder or not, since a sender answering its own handoff is
     the self-clearance a handoff must not become.
+
+    **Locked, whole (round-6 S-6, the ``answer`` half).** The find, the
+    identity/role checks, the patch and the settle all hold the shared ledger
+    lock — the same lock ``record_handoff`` holds across its own identity
+    check and create. Without it, a ``record_handoff`` replay's identity scan
+    could read this handoff mid-patch (see ``write_handoff``) and, seeing
+    something that fails to match, mint a second record for news already
+    answered. The lock is reentrant (``ledger.locked``), so
+    ``_settle_handoff_announcement`` taking it again below is a no-op, not a
+    deadlock.
     """
-    handoff = find_handoff(ledger_dir, name)
-    if handoff is None:
-        raise AnnounceError(
-            f"{handoff_dir(ledger_dir) / str(name)}: no handoff by that name. This "
-            f"checkout records {', '.join(h.name for h in handoffs(ledger_dir)) or '(none)'}"
-        )
-    if by is None:
-        recorded_by = handoff.to
-    else:
-        if by == handoff.sender:
+    with _locked(ledger_dir):
+        handoff = find_handoff(ledger_dir, name)
+        if handoff is None:
             raise AnnounceError(
-                f"{by!r} raised this handoff ({handoff.name}) and may not also "
-                f"answer it — that is the self-clearance a handoff must not become"
+                f"{handoff_dir(ledger_dir) / str(name)}: no handoff by that name. This "
+                f"checkout records {', '.join(h.name for h in handoffs(ledger_dir)) or '(none)'}"
             )
-        holder = None
-        try:
-            holder = addressee_for_ledger(checkout, ledger_dir)
-        except AnnounceError:
+        if by is None:
+            recorded_by = handoff.to
+        else:
+            if by == handoff.sender:
+                raise AnnounceError(
+                    f"{by!r} raised this handoff ({handoff.name}) and may not also "
+                    f"answer it — that is the self-clearance a handoff must not become"
+                )
             holder = None
-        if by != handoff.to and by != holder:
-            raise AnnounceError(
-                f"{by!r} may not answer a handoff addressed to {handoff.to!r}: only "
-                f"the addressee, or the role that holds the ledger "
-                f"({holder or '(none declared)'}), may record that it was acted on"
-            )
-        recorded_by = by
-    if not handoff.is_answered:
-        handoff.answered = canonical_time(at) or ledger_now()
-        handoff.answered_by = recorded_by
-        write_handoff(ledger_dir, handoff, checkout)
-        _settle_handoff_announcement(ledger_dir, handoff)
-    return handoff_dir(ledger_dir) / name
+            try:
+                holder = addressee_for_ledger(checkout, ledger_dir)
+            except AnnounceError:
+                holder = None
+            if by != handoff.to and by != holder:
+                raise AnnounceError(
+                    f"{by!r} may not answer a handoff addressed to {handoff.to!r}: only "
+                    f"the addressee, or the role that holds the ledger "
+                    f"({holder or '(none declared)'}), may record that it was acted on"
+                )
+            recorded_by = by
+        if not handoff.is_answered:
+            handoff.answered = canonical_time(at) or ledger_now()
+            handoff.answered_by = recorded_by
+            write_handoff(ledger_dir, handoff, checkout)
+            _settle_handoff_announcement(ledger_dir, handoff)
+        return handoff_dir(ledger_dir) / name
 
 
 def _settle_handoff_announcement(ledger_dir: str | Path, handoff: Handoff) -> None:
