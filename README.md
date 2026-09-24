@@ -250,7 +250,7 @@ vellum announce finished  <checkout> --version <sha> --item 12 --pr 34
 vellum announce direction <checkout> --version <sha> --item 12 \
     --briefing "the owner's own words: what changed"
 vellum announce deliver  <checkout> [--version <sha>] [--item 12] [--handoff 0001-….md]
-vellum announce answer   <checkout> --handoff 0001-….md --by harness-engineer
+vellum announce answer   <checkout> --handoff 0001-….md [--by harness-engineer]
 vellum announce list     <checkout>
 ```
 
@@ -282,11 +282,26 @@ role it names is who raised it, never who ran this command. No handoff grants
 its sender reach it did not declare; `vellum verify boundaries` is unchanged
 and still refuses the sender.
 
-**`finished`** announces a run's end. `vellum ledger advance --pr` records the
-same announcement and delivers it the same way — reporting a pull request *is*
-the report, and delivering it is not a separate step. `--to` and `--from` are
-each a declared role or refused; a `--from` equal to `--to` is recorded but
-not dispatched, since a role has nothing to learn from dispatching itself.
+**`finished`** announces a run's end and refuses outright when no addressee
+can be found. `--to` and `--from` are each a declared role or refused; a
+`--from` equal to `--to` is recorded settled (`dispatched: true`) rather than
+dispatched, since a role has nothing to learn from dispatching itself, and no
+later `deliver` or `tick` revisits it.
+
+`vellum ledger advance --pr` records the same announcement, addressed against
+the git work tree containing `--ledger-dir` by default (`--checkout` names a
+different one explicitly) — but it *softens* rather than refuses when no
+addressee can be found: the pull request and every other field it was asked to
+record are still written, the announcement is recorded with an empty address,
+a warning goes to stderr, and the command still exits 0. Reporting a run's end
+is ordinary ledger bookkeeping and must never fail over an address it could
+not compute; only the explicit `announce finished` keeps refusing outright.
+Recording leaves `dispatched: false` by default — `vellum tick` or `vellum
+announce deliver` perform the actual dispatch afterward and report it; pass
+`--json` to `ledger advance` to deliver in the same act instead and print the
+dispatch the way `announce finished --json` does. Marking an announcement
+dispatched without emitting it anywhere would lose the event, so the default
+never does that.
 
 **`direction`** records the owner's review or comment against a work item's
 briefing and dispatches the role that must act on it, in the same act — so an
@@ -313,15 +328,28 @@ announcement is *pushed* is not.
 **Dispatch is idempotent and terminates.** Delivery writes `dispatched` back
 into the record, so the next reader of it emits nothing; a handoff the
 addressed role — or the role that holds the ledger — has answered (`vellum
-announce answer --by <role>`) dispatches nobody at all, and `vellum tick`
-holds rather than re-claims a work item whose standing announcement is an
-still-unanswered handoff. A `dispatch` action carrying a `role` is that
-addressed delivery; a `dispatch` action carrying none is the ordinary case,
-spawning an executor for a claimed item — the same action kind either way, and
-a caller branches on whether `role` is present. Delivery itself is
-lock-guarded (`ledger/.announce.lock`): `dispatched` is authoritative only once
-committed, so two concurrent deliveries of the same announcement cannot both
-dispatch it.
+announce answer`, optionally `--by <role>`) dispatches nobody at all, and
+`vellum tick` holds rather than re-claims a work item whose standing
+announcement is a still-unanswered handoff. A `dispatch` action carrying a
+`role` is that addressed delivery; a `dispatch` action carrying none is the
+ordinary case, spawning an executor for a claimed item — the same action kind
+either way, and a caller branches on whether `role` is present. Delivery
+itself is lock-guarded (a lock file inside the checkout's `.git` directory,
+never inside the tracked `ledger/` tree a workflow might commit): `dispatched`
+is authoritative only once committed, so two concurrent deliveries of the same
+announcement cannot both dispatch it.
+
+**`--by` (and `--from`) are attribution, not verified identity.** Nothing here
+authenticates who is really running the command — `--by harness-engineer`
+means "record that harness-engineer answered", said by whoever invoked the
+CLI. What is enforced is narrower and mechanical: the name given must be one
+of the roles the installation actually declares, `--by` must be the handoff's
+addressee or the role holding the ledger (never its own sender, even when that
+role also holds the ledger), and a role addressing a handoff back to itself is
+refused outright. That closes the self-clearance a handoff must not become; it
+does not verify that the process invoking `vellum` truly acts on that role's
+behalf, which is a property of who can run commands as that role in an
+installation's own transport, not of this CLI.
 
 ### `vellum mint <intent-checkout>`
 
