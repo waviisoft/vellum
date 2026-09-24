@@ -94,6 +94,23 @@ def _item(repo: Path, issue: int = SUBJECT) -> dict:
     return find_item(load(record_path(repo / "ledger", VERSION)), issue)
 
 
+def _log(item: dict) -> list[dict]:
+    """*item*'s whole ``announcements:`` log, oldest first."""
+    found = item.get("announcements")
+    return [e for e in found if isinstance(e, dict)] if isinstance(found, list) else []
+
+
+def _latest(item: dict) -> dict | None:
+    """The most recently appended entry of *item*'s log, or None."""
+    log = _log(item)
+    return log[-1] if log else None
+
+
+def _by_kind(item: dict, kind: str) -> list[dict]:
+    """Every log entry of *kind*, oldest first."""
+    return [e for e in _log(item) if e.get("kind") == kind]
+
+
 def _tick(repo: Path, *extra, now: str = AFTER_LEASE, executor: str = "librarian"):
     """``vellum tick --json`` over *repo*, as the harness drives it."""
     argv = ["tick", str(repo), "--ledger-dir", str(repo / "ledger"), "--now", now,
@@ -290,10 +307,11 @@ class FinishingAnnounces(unittest.TestCase):
             repo = _intent(Path(tmp))
             code, said = _finish(repo)
             self.assertEqual(code, 0, said)
-            announced = _item(repo).get("announced")
+            announced = _latest(_item(repo))
             self.assertIsNotNone(announced, _item(repo))
             self.assertEqual(announced["kind"], "finished")
             self.assertEqual(announced["to"], "librarian")
+            self.assertEqual(announced["id"], "finished:pr7")
             # K3: `ledger advance --pr` records and addresses it, but leaves
             # `dispatched: false` by default — `deliver`/`tick` (or --json)
             # perform and report the actual dispatch, so the event is never
@@ -328,7 +346,7 @@ class FinishingAnnounces(unittest.TestCase):
                  "--ledger-dir", str(repo / "ledger"), "--item", str(SUBJECT),
                  "--pr", "7", "--no-dispatch"])
             self.assertEqual(code, 0, out + err)
-            self.assertIs(_item(repo)["announced"]["dispatched"], False)
+            self.assertIs(_latest(_item(repo))["dispatched"], False)
             payload = _tick(repo)
             addressed = _addressed(payload, SUBJECT)
             self.assertEqual(len(addressed), 1, payload["actions"])
@@ -363,7 +381,7 @@ class FinishingAnnounces(unittest.TestCase):
             addressed = _addressed(payload, SUBJECT)
             self.assertEqual(len(addressed), 1, payload)
             self.assertEqual(addressed[0]["role"], "librarian")
-            self.assertIs(_item(repo)["announced"]["dispatched"], True)
+            self.assertIs(_latest(_item(repo))["dispatched"], True)
 
 
 # ------------------ an-owner-review-dispatches-the-role-that-must-act
@@ -404,19 +422,35 @@ class DirectionAnnounces(unittest.TestCase):
             self.assertIn(OWNER_REVIEW, addressed[0]["detail"])
 
     def test_direction_supersedes_a_pending_finish_rather_than_adding_to_it(self):
-        """One pending announcement per item: the newest event is what is asked."""
+        """Rule 2: a pending finish and a new direction addressed to the same
+        role are one dispatch, not two — the log keeps both entries, but they
+        are delivered together rather than as separate redundant dispatches."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo = _intent(root)
             code, said = _finish(repo)
             self.assertEqual(code, 0, said)
-            self.assertEqual(_item(repo)["announced"]["kind"], "finished")
-            self.assertIs(_item(repo)["announced"]["dispatched"], False)
+            self.assertEqual(_latest(_item(repo))["kind"], "finished")
+            self.assertIs(_latest(_item(repo))["dispatched"], False)
             observed = self._observed(root, directions=[
                 {"version": VERSION, "item": SUBJECT, "briefing": OWNER_REVIEW}])
             payload = _tick(repo, "--observed", str(observed))
             self.assertEqual(len(_addressed(payload, SUBJECT)), 1, payload["actions"])
+            # An addressed dispatch's detail is content the receiver acts on,
+            # not a log line for a human to skim — so unlike every other
+            # action kind's free-text explanation, it is never narrowed to
+            # 120 characters (`_Reconciler.act`'s `limit=None`). A grouped
+            # dispatch combining a finish and a direction must still carry
+            # the direction's full text, or the receiver is told the news
+            # exists and has to go find it — exactly what this scenario
+            # (waviisoft/vellum-intent's `an-owner-review-dispatches-the-
+            # role-that-must-act`) grades.
             self.assertIn(OWNER_REVIEW, _addressed(payload, SUBJECT)[0]["detail"])
+            # Nothing is actually lost, though: the full, un-narrowed text of
+            # both events is still in the log this dispatch was grouped from.
+            log = _log(_item(repo))
+            self.assertEqual(_by_kind(_item(repo), "direction")[-1]["asks"], OWNER_REVIEW)
+            self.assertTrue(all(e["dispatched"] for e in log), log)
 
     def test_direction_already_on_the_briefing_announces_nothing(self):
         """Idempotence: a re-reported direction is not new direction."""
@@ -447,9 +481,9 @@ class DispatchIsIdempotentAndTerminates(unittest.TestCase):
             self.assertEqual(_addressed(again, SUBJECT), [], again["actions"])
 
     def test_announce_finished_pr_run_twice_dispatches_once(self):
-        """B2: `set_announcement` excludes `dispatched` from its comparison, so
-        replaying the same `announce finished --pr 7` does not rewrite the
-        record back to undispatched and redeliver it.
+        """The log is deduplicated by id, so replaying the same `announce
+        finished --pr 7` appends nothing new and does not rewrite the entry
+        back to undispatched and redeliver it.
         """
         with tempfile.TemporaryDirectory() as tmp:
             repo = _intent(Path(tmp))
@@ -462,7 +496,8 @@ class DispatchIsIdempotentAndTerminates(unittest.TestCase):
             code2, out2, err2 = run_cli_streams(argv)
             self.assertEqual(code2, 0, out2 + err2)
             self.assertEqual(_addressed(json.loads(out2), SUBJECT), [], out2)
-            self.assertIs(_item(repo)["announced"]["dispatched"], True)
+            self.assertEqual(len(_by_kind(_item(repo), "finished")), 1, _log(_item(repo)))
+            self.assertIs(_latest(_item(repo))["dispatched"], True)
 
     def test_the_same_handoff_arriving_twice_runs_the_receiver_once(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -489,7 +524,7 @@ class DispatchIsIdempotentAndTerminates(unittest.TestCase):
             repo = _intent(Path(tmp))
             _record_handoff(repo, "--no-dispatch")
             name = next(iter(_handoffs(repo)))
-            self.assertIs(_item(repo)["announced"]["dispatched"], False)
+            self.assertIs(_latest(_item(repo))["dispatched"], False)
             code, said = _answer(repo, name, "--now", AFTER_LEASE)
             self.assertEqual(code, 0, said)
             payload = _tick(repo)
@@ -704,6 +739,38 @@ class QueueHoldsOnAnUnansweredHandoff(unittest.TestCase):
                       if a["kind"] == "claim" and a["item"] == SUBJECT]
             self.assertEqual(len(claims), 1, payload["actions"])
 
+    def test_a_later_direction_does_not_release_an_unanswered_handoff(self):
+        """Rule 5: the hold reads every handoff the log names, not just
+        whichever entry a reader would call "standing". Under the old
+        standing-announcement-plus-pending-queue shape, a fresh direction
+        recorded after the handoff replaced `announced.kind` with "direction"
+        and the handoff's own hold silently stopped applying — this is
+        exactly the replay this closes: the item must stay held even though a
+        `direction` entry is now the newest thing in the log, and the item is
+        still otherwise queueable (no PR reported).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _intent(root)
+            _record_handoff(repo, "--no-dispatch")
+            self.assertEqual(_latest(_item(repo))["kind"], "handoff")
+            observed = root / "observed.yaml"
+            observed.write_text(yaml.safe_dump({
+                "issues": [SUBJECT, CONTROL],
+                "directions": [{"version": VERSION, "item": SUBJECT,
+                                "briefing": "reconsider the approach"}],
+            }), encoding="utf-8")
+            payload = _tick(repo, "--observed", str(observed))
+            self.assertEqual(_latest(_item(repo))["kind"], "direction")
+            self.assertIsNone(_item(repo).get("pr"))
+            holds = [a for a in payload["actions"]
+                     if a["kind"] == "hold" and a["item"] == SUBJECT
+                     and "waiting on handoff" in a["detail"]]
+            self.assertEqual(len(holds), 1, payload["actions"])
+            claims = [a for a in payload["actions"]
+                      if a["kind"] == "claim" and a["item"] == SUBJECT]
+            self.assertEqual(claims, [], payload["actions"])
+
 
 # --------------------------------------------------------------------- S1
 
@@ -719,18 +786,21 @@ class AnnouncementsToDifferentRolesBothDeliver(unittest.TestCase):
             # The handoff (to harness-engineer) is left undelivered — a
             # transport that has not yet collected it.
             _record_handoff(repo, "--no-dispatch")
-            self.assertIs(_item(repo)["announced"]["dispatched"], False)
-            self.assertEqual(_item(repo)["announced"]["to"], "harness-engineer")
+            handoff_entry = _latest(_item(repo))
+            self.assertIs(handoff_entry["dispatched"], False)
+            self.assertEqual(handoff_entry["to"], "harness-engineer")
             # The same item also reports a pull request (to librarian).
             code, said = _finish(repo)
             self.assertEqual(code, 0, said)
-            self.assertEqual(_item(repo)["announced"]["to"], "librarian")
-            self.assertIs(_item(repo)["announced"]["dispatched"], False)
-            # The handoff must not have been lost: it is still there, pending.
-            pending = _item(repo).get("announced_pending") or []
-            self.assertEqual(len(pending), 1, _item(repo))
-            self.assertEqual(pending[0]["to"], "harness-engineer")
-            self.assertIs(pending[0]["dispatched"], False)
+            finished_entry = _latest(_item(repo))
+            self.assertEqual(finished_entry["to"], "librarian")
+            self.assertIs(finished_entry["dispatched"], False)
+            # The handoff must not have been lost: the append-only log keeps
+            # both entries, undispatched, rather than one superseding the
+            # other.
+            pending = [e for e in _log(_item(repo)) if not e["dispatched"]]
+            self.assertEqual(len(pending), 2, _log(_item(repo)))
+            self.assertEqual({e["to"] for e in pending}, {"harness-engineer", "librarian"})
             # A tick delivers both — the finished announcement and the
             # queued, previously-undelivered handoff.
             payload = _tick(repo)
@@ -738,13 +808,15 @@ class AnnouncementsToDifferentRolesBothDeliver(unittest.TestCase):
             self.assertEqual(addressed, {"harness-engineer", "librarian"},
                              payload["actions"])
 
-    def test_the_pending_queue_is_cleared_once_delivered(self):
+    def test_both_entries_are_marked_dispatched_once_delivered(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = _intent(Path(tmp))
             _record_handoff(repo, "--no-dispatch")
             _finish(repo)
             _tick(repo)
-            self.assertNotIn("announced_pending", _item(repo))
+            log = _log(_item(repo))
+            self.assertEqual(len(log), 2, log)
+            self.assertTrue(all(e["dispatched"] for e in log), log)
 
 
 # --------------------------------------------------------------------- S2
@@ -767,7 +839,7 @@ class DirectionRecordsAndDeliversInOneAct(unittest.TestCase):
             self.assertEqual(addressed[0]["role"], "librarian")
             self.assertIn(OWNER_REVIEW, addressed[0]["detail"])
             self.assertEqual(_item(repo)["briefing"], OWNER_REVIEW)
-            self.assertIs(_item(repo)["announced"]["dispatched"], True)
+            self.assertIs(_latest(_item(repo))["dispatched"], True)
 
     def test_direction_no_dispatch_leaves_it_pending_for_a_tick(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -775,7 +847,7 @@ class DirectionRecordsAndDeliversInOneAct(unittest.TestCase):
             run_cli(["announce", "direction", str(repo), "--version", VERSION,
                      "--ledger-dir", str(repo / "ledger"), "--item", str(SUBJECT),
                      "--briefing", OWNER_REVIEW, "--no-dispatch"])
-            self.assertIs(_item(repo)["announced"]["dispatched"], False)
+            self.assertIs(_latest(_item(repo))["dispatched"], False)
             payload = _tick(repo)
             self.assertEqual(len(_addressed(payload, SUBJECT)), 1, payload["actions"])
 
@@ -813,7 +885,7 @@ class LedgerAdvanceAddressesExplicitly(unittest.TestCase):
             self.assertEqual(code, 0, said)
             self.assertIn("undelivered", said)
             self.assertEqual(_item(repo)["pr"], 7)
-            announced = _item(repo)["announced"]
+            announced = _latest(_item(repo))
             self.assertEqual(announced["to"], "")
             self.assertIs(announced["dispatched"], False)
 
@@ -846,7 +918,7 @@ class LedgerAdvanceAddressesExplicitly(unittest.TestCase):
             ])
             self.assertEqual(code, 0, said)
             self.assertEqual(_item(repo)["pr"], 7)
-            self.assertEqual(_item(repo)["announced"]["to"], "")
+            self.assertEqual(_latest(_item(repo))["to"], "")
 
     def test_a_ledger_dir_outside_any_git_work_tree_falls_back_to_its_parent(self):
         """Note 4: `ledger_dir.parent` is the fallback for the one case the
@@ -880,7 +952,7 @@ class LedgerAdvanceAddressesExplicitly(unittest.TestCase):
             record = load(record_path(ledger_dir, VERSION))
             item = find_item(record, SUBJECT)
             self.assertEqual(item["pr"], 7)
-            self.assertEqual(item["announced"]["to"], "")
+            self.assertEqual(_latest(item)["to"], "")
 
     def test_the_parent_fallback_actually_addresses_when_it_can(self):
         """The positive case: no git work tree, but the ledger's own parent
@@ -910,7 +982,7 @@ class LedgerAdvanceAddressesExplicitly(unittest.TestCase):
             ])
             self.assertEqual(code, 0, said)
             record = load(record_path(ledger_dir, VERSION))
-            self.assertEqual(find_item(record, SUBJECT)["announced"]["to"], "librarian")
+            self.assertEqual(_latest(find_item(record, SUBJECT))["to"], "librarian")
 
     def test_no_checkout_flag_defaults_to_the_git_toplevel(self):
         """The corrected default — the git work tree containing --ledger-dir
@@ -923,7 +995,7 @@ class LedgerAdvanceAddressesExplicitly(unittest.TestCase):
                 str(repo / "ledger"), "--item", str(SUBJECT), "--pr", "7",
             ])
             self.assertEqual(code, 0, said)
-            self.assertEqual(_item(repo)["announced"]["to"], "librarian")
+            self.assertEqual(_latest(_item(repo))["to"], "librarian")
 
     def test_checkout_flag_overrides_the_git_toplevel_default(self):
         """`ledger_dir` here sits inside `outer/nested`, a plain directory
@@ -961,8 +1033,11 @@ class LedgerAdvanceAddressesExplicitly(unittest.TestCase):
             ])
             self.assertEqual(code, 0, said)
             record = load(record_path(ledger_dir, VERSION))
-            self.assertEqual(find_item(record, SUBJECT)["announced"]["to"], "")
-            # With --checkout naming `nested` explicitly: resolves.
+            self.assertEqual(_latest(find_item(record, SUBJECT))["to"], "")
+            # With --checkout naming `nested` explicitly: resolves. Rule 4:
+            # this is the *same* `finished:pr7` id as the first call, so this
+            # retries the address on that same entry in place rather than
+            # minting a second one for the same news.
             code, said = run_cli([
                 "ledger", "advance", "--version", VERSION, "--ledger-dir",
                 str(ledger_dir), "--checkout", str(nested), "--item",
@@ -970,7 +1045,9 @@ class LedgerAdvanceAddressesExplicitly(unittest.TestCase):
             ])
             self.assertEqual(code, 0, said)
             record = load(record_path(ledger_dir, VERSION))
-            self.assertEqual(find_item(record, SUBJECT)["announced"]["to"], "librarian")
+            item = find_item(record, SUBJECT)
+            self.assertEqual(len(_by_kind(item, "finished")), 1, _log(item))
+            self.assertEqual(_latest(item)["to"], "librarian")
 
     def test_json_delivers_in_the_same_act(self):
         """K3: `--json` is the opt-in for eager delivery — reporting the
@@ -989,7 +1066,7 @@ class LedgerAdvanceAddressesExplicitly(unittest.TestCase):
             addressed = _addressed(payload, SUBJECT)
             self.assertEqual(len(addressed), 1, payload)
             self.assertEqual(addressed[0]["role"], "librarian")
-            self.assertIs(_item(repo)["announced"]["dispatched"], True)
+            self.assertIs(_latest(_item(repo))["dispatched"], True)
 
     def test_without_json_dispatched_stays_false_for_tick_to_deliver(self):
         """The default: recorded, left pending, and a following `vellum tick`
@@ -1004,7 +1081,7 @@ class LedgerAdvanceAddressesExplicitly(unittest.TestCase):
                 str(repo / "ledger"), "--item", str(SUBJECT), "--pr", "7",
             ])
             self.assertEqual(code, 0, said)
-            self.assertIs(_item(repo)["announced"]["dispatched"], False)
+            self.assertIs(_latest(_item(repo))["dispatched"], False)
             payload = _tick(repo)
             addressed = _addressed(payload, SUBJECT)
             self.assertEqual(len(addressed), 1, payload["actions"])
@@ -1045,7 +1122,7 @@ class LedgerAdvanceAddressesExplicitly(unittest.TestCase):
                                   "--checkout", str(repo), "--item",
                                   str(SUBJECT), "--pr", "7"])
             self.assertEqual(code, 0, said)
-            self.assertEqual(_item(repo)["announced"]["to"], "")
+            self.assertEqual(_latest(_item(repo))["to"], "")
 
             from support import write_intent_config
 
@@ -1058,7 +1135,7 @@ class LedgerAdvanceAddressesExplicitly(unittest.TestCase):
                                   "--checkout", str(repo), "--item",
                                   str(SUBJECT), "--pr", "7"])
             self.assertEqual(code, 0, said)
-            self.assertEqual(_item(repo)["announced"]["to"], "librarian")
+            self.assertEqual(_latest(_item(repo))["to"], "librarian")
 
 
 # --------------------------------------------------------------------- S5
@@ -1189,7 +1266,7 @@ class AnsweringSettlesTheAnnouncement(unittest.TestCase):
             first = _tick(repo)
             self.assertTrue(any("dispatches nobody" in n for n in first["notes"]),
                             first["notes"])
-            self.assertIs(_item(repo)["announced"]["dispatched"], True)
+            self.assertIs(_latest(_item(repo))["dispatched"], True)
             again = _tick(repo)
             self.assertFalse(any("dispatches nobody" in n for n in again["notes"]),
                              again["notes"])
@@ -1223,10 +1300,10 @@ class DeliverMarksTheLiveEntryDirectly(unittest.TestCase):
         record["work_items"].append({
             "issue": None, "title": "unfiled", "repo": "app", "satisfies": [],
             "pr": None, "state": "planned", "briefing": None,
-            "announced": {
-                "kind": "finished", "to": "librarian", "asks": "unfiled work "
-                "finished", "handoff": "", "dispatched": False,
-            },
+            "announcements": [{
+                "id": "finished:pr0", "kind": "finished", "to": "librarian",
+                "asks": "unfiled work finished", "handoff": "", "dispatched": False,
+            }],
         })
         write(path, record)
 
@@ -1457,7 +1534,7 @@ class FinishedToIsValidatedAndNeverSelfDispatches(unittest.TestCase):
             payload = json.loads(out)
             self.assertEqual(payload["actions"], [])
             self.assertEqual(len(payload["withheld"]), 1, payload)
-            announced = _item(repo).get("announced")
+            announced = _latest(_item(repo))
             self.assertIsNotNone(announced)
             self.assertEqual(announced["to"], "librarian")
 
@@ -1472,7 +1549,7 @@ class FinishedToIsValidatedAndNeverSelfDispatches(unittest.TestCase):
                 ["announce", "finished", str(repo), "--version", VERSION,
                  "--ledger-dir", str(repo / "ledger"), "--item", str(SUBJECT),
                  "--to", "librarian", "--from", "librarian"])
-            self.assertIs(_item(repo)["announced"]["dispatched"], True)
+            self.assertIs(_latest(_item(repo))["dispatched"], True)
             code, out, err = run_cli_streams(
                 ["announce", "deliver", str(repo), "--ledger-dir",
                  str(repo / "ledger"), "--json"])
@@ -1839,7 +1916,7 @@ class LedgerAdvanceNeverMarksDispatchedSilently(unittest.TestCase):
             run_cli(["ledger", "advance", "--version", VERSION, "--ledger-dir",
                      str(repo / "ledger"), "--checkout", str(repo), "--item",
                      str(SUBJECT), "--pr", "7"])
-            self.assertEqual(_item(repo)["announced"]["to"], "")
+            self.assertEqual(_latest(_item(repo))["to"], "")
             from support import write_intent_config
 
             write_intent_config(repo, boundaries={
@@ -1853,7 +1930,7 @@ class LedgerAdvanceNeverMarksDispatchedSilently(unittest.TestCase):
                                   "--checkout", str(repo), "--item",
                                   str(SUBJECT), "--pr", "7"])
             self.assertEqual(code, 0, said)
-            self.assertEqual(_item(repo)["announced"]["to"], "librarian")
+            self.assertEqual(_latest(_item(repo))["to"], "librarian")
 
 
 # --------------------------------------------------------------------- K5
@@ -1871,37 +1948,82 @@ class LedgerWritesAreLockedAndAtomic(unittest.TestCase):
     """
 
     def test_concurrent_handoffs_on_different_items_lose_neither(self):
+        """S-10: deterministic, not timing-based. ``vellum.announce.write`` is
+        instrumented to block mid-critical-section, and the assertion is that
+        a second, concurrent ``record_handoff`` call cannot even enter its own
+        read until the first one's write has completed and the lock is
+        released — proving mutual exclusion rather than hoping two real
+        threads happen to race inside the small window ``ThreadPoolExecutor``
+        gave the old version of this test no way to guarantee.
+
+        Calls ``announce.record_handoff`` directly rather than
+        ``run_cli_streams`` in a thread (the old version's own nit):
+        ``run_cli_streams`` redirects the process-wide ``sys.stdout`` for its
+        duration, and two threads doing that concurrently race on the same
+        global, which can leak one thread's output into the other's captured
+        stream.
+        """
+        import threading
+
+        from vellum import announce as announce_mod
+
         with tempfile.TemporaryDirectory() as tmp:
             repo = _intent(Path(tmp), boundaries={
                 "harness-engineer": ["harness"],
                 "librarian": ["ledger", ".vellum/memory"],
             })
+            entered_write = threading.Event()
+            release_write = threading.Event()
+            original_write = announce_mod.write
 
-            def _raise(item, path):
-                return run_cli_streams(
-                    ["announce", "handoff", str(repo), "--version", VERSION,
-                     "--ledger-dir", str(repo / "ledger"), "--item", str(item),
-                     "--from", "librarian", "--asks", f"fix item {item}",
-                     "--tried", TRIED, "--observed", OBSERVED, "--proved", PROVED,
-                     "--path", path, "--no-dispatch"])
+            def _blocking_write(path, record):
+                entered_write.set()
+                release_write.wait(timeout=5)
+                original_write(path, record)
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-                results = list(pool.map(
-                    lambda pair: _raise(*pair),
-                    [(SUBJECT, "harness/steps.py"), (CONTROL, "harness/other.py")],
-                ))
-            for code, out, err in results:
-                self.assertEqual(code, 0, out + err)
-            self.assertIsNotNone(_item(repo, SUBJECT).get("announced"),
-                                 "item 1's announcement was lost to a concurrent write")
-            self.assertIsNotNone(_item(repo, CONTROL).get("announced"),
-                                 "item 2's announcement was lost to a concurrent write")
+            announce_mod.write = _blocking_write
+            try:
+                def _raise(item, path):
+                    announce_mod.record_handoff(
+                        repo / "ledger", repo, VERSION, item, "librarian",
+                        asks=f"fix item {item}", tried=TRIED, observed=OBSERVED,
+                        proved=PROVED, paths=[path],
+                    )
+
+                first = threading.Thread(target=_raise, args=(SUBJECT, "harness/steps.py"))
+                first.start()
+                self.assertTrue(entered_write.wait(timeout=5),
+                                "the first call never reached its write")
+
+                second_done = threading.Event()
+                second = threading.Thread(
+                    target=lambda: (_raise(CONTROL, "harness/other.py"), second_done.set())
+                )
+                second.start()
+                # The first call is blocked mid-write, still holding the lock.
+                # A bounded, non-blocking wait proves the second call cannot
+                # even begin its own read-modify-write while that lock stands.
+                self.assertFalse(second_done.wait(timeout=0.3),
+                                 "a concurrent record_handoff call was not blocked by the lock")
+                release_write.set()
+                first.join(timeout=5)
+                second.join(timeout=5)
+                self.assertTrue(second_done.is_set(),
+                               "the second call never completed after the lock was released")
+            finally:
+                announce_mod.write = original_write
+
+            self.assertTrue(_log(_item(repo, SUBJECT)),
+                            "item 1's announcement was lost to a concurrent write")
+            self.assertTrue(_log(_item(repo, CONTROL)),
+                            "item 2's announcement was lost to a concurrent write")
 
     def test_a_replay_repairs_an_announcement_a_lost_update_dropped(self):
         """The B1 early-return used to skip `record_announcement` entirely on
-        a match; now a replay still calls it, so a record whose `announced:`
-        was lost some other way (a hand edit, a lost update elsewhere) is
-        repaired by the next identical arrival rather than staying lost.
+        a match; now a replay still calls it, so a record whose
+        ``announcements:`` log was lost some other way (a hand edit, a lost
+        update elsewhere) is repaired by the next identical arrival rather
+        than staying lost.
         """
         with tempfile.TemporaryDirectory() as tmp:
             repo = _intent(Path(tmp))
@@ -1909,13 +2031,13 @@ class LedgerWritesAreLockedAndAtomic(unittest.TestCase):
             path = record_path(repo / "ledger", VERSION)
             record = load(path)
             item = find_item(record, SUBJECT)
-            del item["announced"]
+            del item["announcements"]
             write(path, record)
-            self.assertIsNone(_item(repo).get("announced"))
+            self.assertEqual(_log(_item(repo)), [])
             code, out, err = _record_handoff(repo, "--no-dispatch")
             self.assertEqual(code, 0, out + err)
-            self.assertIsNotNone(_item(repo)["announced"])
-            self.assertEqual(_item(repo)["announced"]["to"], "harness-engineer")
+            self.assertTrue(_log(_item(repo)))
+            self.assertEqual(_latest(_item(repo))["to"], "harness-engineer")
 
     def test_ledger_write_leaves_no_temp_file_behind(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1956,6 +2078,78 @@ class LockFileNeverEntersTrackedLedgerTree(unittest.TestCase):
             path = _lock_path(repo / "ledger")
             self.assertNotEqual(path.parent.resolve(), (repo / "ledger").resolve())
             self.assertIn(".git", path.parts)
+
+
+# --------------------------------------------------------------------- S-8
+
+
+class LockFallsBackToAPrivateTempdirOnFailure(unittest.TestCase):
+    """S-8: `locked()` falls back to a per-user, mode-0700 tempdir when the
+    git-directory lock path cannot actually be opened — not only when there
+    is no git directory at all — and raises `LedgerError` (never a raw
+    `OSError`) when neither path can be opened."""
+
+    def test_a_git_dir_that_cannot_be_opened_into_falls_back(self):
+        """A regular file standing where a directory is expected fails
+        ``os.open`` with ``NotADirectoryError`` for any account, root
+        included — unlike a permission bit, which root's own DAC-override
+        ignores — so this is what actually exercises the fallback in a test
+        sandbox that may run as root."""
+        import unittest.mock
+
+        import vellum.ledger as ledger_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            ledger_dir = repo / "ledger"
+            bogus = Path(tmp) / "not-a-directory"
+            bogus.write_text("x", encoding="utf-8")
+            with unittest.mock.patch.object(ledger_mod, "_git_dir", return_value=bogus):
+                with ledger_mod.locked(ledger_dir):
+                    pass
+
+    def test_the_fallback_directory_is_private_to_this_user(self):
+        from vellum.ledger import _user_lock_dir
+
+        base = _user_lock_dir()
+        self.assertEqual(base.stat().st_mode & 0o777, 0o700)
+
+    def test_both_paths_failing_raises_ledger_error(self):
+        import unittest.mock
+
+        import vellum.ledger as ledger_mod
+        from vellum.ledger import LedgerError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            ledger_dir = repo / "ledger"
+            bogus = Path(tmp) / "not-a-directory"
+            bogus.write_text("x", encoding="utf-8")
+            with unittest.mock.patch.object(ledger_mod, "_git_dir", return_value=bogus), \
+                 unittest.mock.patch.object(ledger_mod, "_tempdir_lock_path",
+                                            return_value=bogus / "lock"):
+                with self.assertRaises(LedgerError):
+                    with ledger_mod.locked(ledger_dir):
+                        pass
+
+
+# --------------------------------------------------------------------- S-7
+
+
+class LedgerWritesUseTheOrdinaryFileMode(unittest.TestCase):
+    """S-7: `ledger.write` publishes the record at `0666 & ~umask`, not the
+    `0600` `tempfile.mkstemp` leaves a file at by default — a checkout shared
+    between accounts must be able to read a record another one last wrote."""
+
+    def test_a_written_record_is_not_left_owner_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            _finish(repo)
+            path = record_path(repo / "ledger", VERSION)
+            mode = path.stat().st_mode & 0o777
+            umask = os.umask(0)
+            os.umask(umask)
+            self.assertEqual(mode, 0o666 & ~umask)
 
 
 # --------------------------------------------------------------------- S2
@@ -2053,7 +2247,7 @@ class DeliverIsNarrowedToItsOwnVersion(unittest.TestCase):
             # Only this version's item was dispatched — the other version's
             # item 1 must still be pending.
             record = load(record_path(repo / "ledger", other))
-            self.assertIs(find_item(record, SUBJECT)["announced"]["dispatched"], False)
+            self.assertIs(_latest(find_item(record, SUBJECT))["dispatched"], False)
 
 
 # --------------------------------------------------------------------- S6
@@ -2197,6 +2391,141 @@ class DeclaredBoundariesHasOneReader(unittest.TestCase):
                 config_write_boundaries(repo, "librarian")
             self.assertIn("escapes the repository", str(announce_exc.exception))
             self.assertIn("escapes the repository", str(config_exc.exception))
+
+
+# --------------------------------------------------------------------- S-1
+
+
+class URLScanningIsNotQuadratic(unittest.TestCase):
+    """S-1: `_URL_RE`'s scheme is bounded, so a long run of word characters
+    that never reaches `://` cannot make the regex engine backtrack
+    catastrophically."""
+
+    def test_a_long_adversarial_evidence_field_scrubs_quickly(self):
+        import time
+
+        from vellum.announce import scrub_credentials
+
+        adversarial = ("a" * 60_000) + "!"  # never matches `\w+://`
+        start = time.monotonic()
+        scrub_credentials("tried", adversarial, [])
+        elapsed = time.monotonic() - start
+        self.assertLess(elapsed, 0.5, f"took {elapsed:.3f}s — the regex is backtracking")
+
+    def test_asks_over_the_cap_is_refused(self):
+        from vellum.announce import AnnounceError, MAX_ASKS_BYTES
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            code, out, err = _record_handoff(repo, "--asks", "x" * (MAX_ASKS_BYTES + 1))
+            self.assertNotEqual(code, 0, out + err)
+            self.assertIn("byte", (out + err).lower())
+
+    def test_briefing_over_the_cap_is_refused(self):
+        from vellum.announce import MAX_BRIEFING_BYTES
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            code, out, err = run_cli_streams(
+                ["announce", "direction", str(repo), "--version", VERSION,
+                 "--ledger-dir", str(repo / "ledger"), "--item", str(SUBJECT),
+                 "--briefing", "x" * (MAX_BRIEFING_BYTES + 1)])
+            self.assertNotEqual(code, 0, out + err)
+            self.assertIn("byte", (out + err).lower())
+
+
+# --------------------------------------------------------------------- S-2
+
+
+class DeliveriesResolvesAnAbbreviatedVersion(unittest.TestCase):
+    """S-2: `deliveries(..., version=...)` resolves an abbreviated sha to its
+    record the same way `find_record` does everywhere else this project
+    takes `--version`, rather than comparing it as a literal string against
+    `spec_version` (which an abbreviation can never equal)."""
+
+    def test_an_abbreviated_version_still_narrows_to_its_record(self):
+        from vellum.announce import deliveries
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            _finish(repo)
+            found = deliveries(repo / "ledger", version=VERSION[:10])
+            self.assertEqual(len(found), 1, found)
+            self.assertEqual(found[0].role, "librarian")
+
+    def test_an_unmatched_abbreviation_finds_nothing_rather_than_erroring(self):
+        from vellum.announce import deliveries
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            _finish(repo)
+            self.assertEqual(deliveries(repo / "ledger", version="0" * 10), [])
+
+
+# --------------------------------------------------------------------- S-6
+
+
+class HandoffCreationIsNeverVisibleHalfWritten(unittest.TestCase):
+    """S-6: a handoff record is written whole to a temp file and published
+    with `os.link`, so a reader racing its creation never sees a name that
+    exists but is not yet fully written — and a name already occupied (by
+    another handoff, or by an attacker-planted symlink) is skipped rather
+    than clobbered."""
+
+    def test_no_temp_file_is_left_behind_after_a_successful_create(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            _record_handoff(repo)
+            names = [p.name for p in (repo / "ledger" / "handoffs").iterdir()]
+            self.assertFalse([n for n in names if n.startswith(".handoff-")], names)
+
+    def test_an_occupied_name_is_skipped_rather_than_overwritten(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            tree = repo / "ledger" / "handoffs"
+            tree.mkdir(parents=True, exist_ok=True)
+            occupied = tree / "0001-fix-item-1.md"
+            occupied.write_text("not a handoff record\n", encoding="utf-8")
+            code, out, err = _record_handoff(repo, "--no-dispatch")
+            self.assertEqual(code, 0, out + err)
+            # The pre-existing file at 0001 was never touched; the real
+            # handoff landed at the next free number instead.
+            self.assertEqual(occupied.read_text(encoding="utf-8"), "not a handoff record\n")
+            new_names = [p.name for p in tree.iterdir() if p.name != occupied.name]
+            self.assertEqual(len(new_names), 1, new_names)
+            self.assertNotEqual(new_names[0], "0001-fix-item-1.md")
+
+
+# ------------------------------------------------------------------ rule 3
+
+
+class SelfDispatchAndAnswerBothSettleTheLogEntry(unittest.TestCase):
+    """Rule 3: an entry is marked `settled` — "self" at birth for a
+    self-addressed finish, "answered" once its handoff is answered — rather
+    than only ever carrying `dispatched`."""
+
+    def test_a_self_dispatch_is_born_settled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            run_cli_streams(
+                ["announce", "finished", str(repo), "--version", VERSION,
+                 "--ledger-dir", str(repo / "ledger"), "--item", str(SUBJECT),
+                 "--to", "librarian", "--from", "librarian"])
+            entry = _latest(_item(repo))
+            self.assertEqual(entry["settled"], "self")
+            self.assertIs(entry["dispatched"], True)
+
+    def test_answering_a_handoff_settles_its_log_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            _record_handoff(repo, "--no-dispatch")
+            name = next(iter(_handoffs(repo)))
+            entry = _by_kind(_item(repo), "handoff")[-1]
+            self.assertNotIn("settled", entry)
+            code, said = _answer(repo, name, "--now", AFTER_LEASE)
+            self.assertEqual(code, 0, said)
+            entry = _by_kind(_item(repo), "handoff")[-1]
+            self.assertEqual(entry["settled"], "answered")
 
 
 if __name__ == "__main__":

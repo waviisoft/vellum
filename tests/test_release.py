@@ -165,6 +165,46 @@ class TestTheBookkeepingHalf(ReleaseCase):
         )
 
 
+class TestCutLocksItsWrite(ReleaseCase):
+    """B-1: the write half of a cut — the per-wave record writes plus
+    ``releases.yaml`` itself — holds the shared ledger lock, the same lock
+    every other ledger writer in this project holds, so a concurrent writer
+    must serialize against it rather than racing it. Proven deterministically
+    with a held lock and a bounded, non-blocking join, not by timing.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.first, self.second = self.commits(("one",), ("one", "two"))
+        self.records(self.first, self.second)
+        self.releases()
+
+    def test_a_concurrent_lock_holder_blocks_the_cut(self):
+        import threading
+
+        from vellum.ledger import locked
+
+        with locked(self.ledger):
+            done = threading.Event()
+
+            def _cut():
+                self.cut("--wave", self.first, "--versions", f"core={FULL}")
+                done.set()
+
+            thread = threading.Thread(target=_cut)
+            thread.start()
+            # The cut's write is blocked behind the lock this test still
+            # holds — a short, bounded wait proves it did not sneak through.
+            self.assertFalse(done.wait(timeout=0.3),
+                             "the cut's write was not blocked by the held lock")
+            thread.join(timeout=0.1)
+            self.assertTrue(thread.is_alive(), "the cut finished without the lock")
+        # Released: the cut proceeds and completes.
+        thread.join(timeout=5)
+        self.assertTrue(done.is_set(), "the cut never finished after the lock was released")
+        self.assertEqual(len(self.released()["cuts"]), 1)
+
+
 class TestPromotion(ReleaseCase):
     def setUp(self):
         super().setUp()
