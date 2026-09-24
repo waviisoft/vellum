@@ -143,9 +143,11 @@ def _finish(repo: Path, *extra, item: int = SUBJECT, pr: int = 7):
     return run_cli(argv)
 
 
-def _answer(repo: Path, name: str, *extra, by: str = "harness-engineer"):
+def _answer(repo: Path, name: str, *extra, by: str | None = "harness-engineer"):
     argv = ["announce", "answer", str(repo), "--ledger-dir", str(repo / "ledger"),
-            "--handoff", name, "--by", by]
+            "--handoff", name]
+    if by is not None:
+        argv += ["--by", by]
     argv += list(extra)
     return run_cli(argv)
 
@@ -634,6 +636,33 @@ class HandoffArrivalIsIdempotentByIdentity(unittest.TestCase):
             _record_handoff(repo, "--asks", "a completely different ask")
             self.assertEqual(len(_handoffs(repo)), 2, _handoffs(repo))
 
+    def test_the_acceptance_shape_exactly_an_answered_handoff_dispatches_nobody(self):
+        """Mirrors `@id:an-answered-handoff-dispatches-nobody` as
+        `harness/support/sandbox.py`'s `announce_handoff` and
+        `waviisoft/vellum-intent#114` actually drive it: `announce handoff
+        --json`, `announce answer` with no `--by`, the identical `announce
+        handoff --json` again, then a `tick`.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            code1, out1, err1 = _record_handoff(repo, "--json")
+            self.assertEqual(code1, 0, out1 + err1)
+            name = next(iter(_handoffs(repo)))
+            answer_code, said = _answer(repo, name, by=None)
+            self.assertEqual(answer_code, 0, said)
+            before = dict(_handoffs(repo))
+            code2, out2, err2 = _record_handoff(repo, "--json")
+            self.assertEqual(code2, 0, out2 + err2)
+            payload2 = json.loads(out2)
+            # (a) no dispatch carrying a role for this item.
+            self.assertEqual(_addressed(payload2, SUBJECT), [], payload2)
+            # (b) ledger/handoffs/ is byte-identical to before the replay.
+            self.assertEqual(_handoffs(repo), before)
+            # (c) a following tick addresses no role for that item.
+            tick_payload = _tick(repo)
+            self.assertEqual(_addressed(tick_payload, SUBJECT), [],
+                             tick_payload["actions"])
+
 
 # --------------------------------------------------------------------- B3
 
@@ -1048,10 +1077,38 @@ class AnsweredByMustBeTheAddresseeOrTheLedgerHolder(unittest.TestCase):
             self.assertEqual(code, 0, said)
             self.assertIn("answered_by: harness-engineer", _handoffs(repo)[name])
 
-    def test_the_ledger_holder_may_also_answer(self):
+    def test_by_is_optional_and_defaults_to_the_addressee(self):
+        """Narrowed by the architect's 2026-09-24 note: the harness's own
+        call (`announce answer <checkout> --ledger-dir <dir> --handoff
+        <name>`, no `--by` at all) must still record who effectively
+        answered — the addressee.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             repo = _intent(Path(tmp))
             _record_handoff(repo, "--no-dispatch")
+            name = next(iter(_handoffs(repo)))
+            code, said = _answer(repo, name, by=None)
+            self.assertEqual(code, 0, said)
+            self.assertIn("answered_by: harness-engineer", _handoffs(repo)[name])
+
+    def test_by_equal_to_the_sender_is_refused_even_if_also_the_ledger_holder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            _record_handoff(repo, "--no-dispatch", "--from", "librarian")
+            name = next(iter(_handoffs(repo)))
+            code, said = _answer(repo, name, by="librarian")
+            self.assertEqual(code, 2, said)
+            self.assertIn("answered:\n", _handoffs(repo)[name])
+
+    def test_the_ledger_holder_may_also_answer(self):
+        """The ledger holder, when it is *not* the handoff's own sender."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp), boundaries={
+                "harness-engineer": ["harness"],
+                "implementer": ["src"],
+                "librarian": ["ledger", ".vellum/memory"],
+            })
+            _record_handoff(repo, "--no-dispatch", "--from", "implementer")
             name = next(iter(_handoffs(repo)))
             code, said = _answer(repo, name, by="librarian")
             self.assertEqual(code, 0, said)

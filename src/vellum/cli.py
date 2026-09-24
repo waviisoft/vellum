@@ -499,10 +499,11 @@ def _add_announce(sub) -> None:
     answer.add_argument("--ledger-dir",
                         help="ledger directory (default: <checkout>/ledger)")
     answer.add_argument("--handoff", required=True, help="the handoff record's name")
-    answer.add_argument("--by", required=True,
-                        help="the role recording the answer; must be the "
-                             "handoff's own addressee or the role that holds "
-                             "the ledger")
+    answer.add_argument("--by", default=None,
+                        help="the role recording the answer (default: the "
+                             "handoff's own addressee). Given explicitly, it "
+                             "must be the addressee or the role that holds "
+                             "the ledger, and never the handoff's own sender")
     answer.add_argument("--now", help="the moment it was answered, ISO 8601")
 
     listing = announce_sub.add_parser(
@@ -1271,19 +1272,16 @@ def _announce(args) -> int:
         if handoff.is_answered:
             # B1: replaying the arrival of an already-answered handoff reuses
             # the record and dispatches nobody — the arrival is idempotent,
-            # and an answered handoff dispatches nobody either way.
-            note = (
-                f"{path}: already answered by "
-                f"{handoff.answered_by or handoff.to} at {handoff.answered}"
-            )
-            if args.json:
-                print(json.dumps({
-                    "ledger": str(ledger_dir), "recorded": str(path),
-                    "already_answered": note, "actions": [], "withheld": [],
-                }, indent=1))
-            else:
-                print(note)
-            return 0
+            # and an answered handoff dispatches nobody either way. Reported
+            # through the same `withheld` shape every other withheld delivery
+            # uses, so a reader of this command's --json does not need a
+            # second shape for this one case.
+            who = handoff.answered_by or handoff.to
+            note = f"already answered by {who} at {handoff.answered}"
+            held = [Delivery(args.version, args.item, handoff.to, handoff.asks,
+                             withheld=note)]
+            return _report_dispatches(args, [], held, ledger_dir,
+                                      recorded=f"{path} (to {handoff.to})")
         recorded = f"{path} (to {handoff.to})"
     elif args.announce_command == "direction":
         path, item = record_direction(

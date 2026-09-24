@@ -808,7 +808,7 @@ def answer_handoff(
     ledger_dir: str | Path,
     checkout: str | Path,
     name: str,
-    by: str,
+    by: str | None = None,
     at: str | None = None,
 ) -> Path:
     """Mark a handoff answered: the addressed role has acted on it.
@@ -818,9 +818,14 @@ def answer_handoff(
     first answer's time in place, because the question is *whether* it was acted
     on and a second stamp would rewrite a record nothing changed.
 
-    *by* must be the handoff's own addressee or the role that holds the
-    ledger (N3): anyone else recording an answer is not evidence that the
-    addressed role acted, which is the one fact this record exists to carry.
+    *by* is optional and defaults to the handoff's own addressee — a caller
+    that already knows who it dispatched (a transport collecting the
+    addressed role's own run) need not repeat it. Given explicitly, it must
+    be the addressee or the role that holds the ledger (N3): anyone else
+    recording an answer is not evidence that the addressed role acted, which
+    is the one fact this record exists to carry — and never the handoff's own
+    sender, ledger holder or not, since a sender answering its own handoff is
+    the self-clearance a handoff must not become.
     """
     handoff = find_handoff(ledger_dir, name)
     if handoff is None:
@@ -828,20 +833,29 @@ def answer_handoff(
             f"{handoff_dir(ledger_dir) / str(name)}: no handoff by that name. This "
             f"checkout records {', '.join(h.name for h in handoffs(ledger_dir)) or '(none)'}"
         )
-    holder = None
-    try:
-        holder = addressee_for_ledger(checkout, ledger_dir)
-    except AnnounceError:
+    if by is None:
+        recorded_by = handoff.to
+    else:
+        if by == handoff.sender:
+            raise AnnounceError(
+                f"{by!r} raised this handoff ({handoff.name}) and may not also "
+                f"answer it — that is the self-clearance a handoff must not become"
+            )
         holder = None
-    if by != handoff.to and by != holder:
-        raise AnnounceError(
-            f"{by!r} may not answer a handoff addressed to {handoff.to!r}: only "
-            f"the addressee, or the role that holds the ledger "
-            f"({holder or '(none declared)'}), may record that it was acted on"
-        )
+        try:
+            holder = addressee_for_ledger(checkout, ledger_dir)
+        except AnnounceError:
+            holder = None
+        if by != handoff.to and by != holder:
+            raise AnnounceError(
+                f"{by!r} may not answer a handoff addressed to {handoff.to!r}: only "
+                f"the addressee, or the role that holds the ledger "
+                f"({holder or '(none declared)'}), may record that it was acted on"
+            )
+        recorded_by = by
     if not handoff.is_answered:
         handoff.answered = at or ledger_now()
-        handoff.answered_by = by
+        handoff.answered_by = recorded_by
         write_handoff(ledger_dir, handoff, checkout)
     return handoff_dir(ledger_dir) / name
 
