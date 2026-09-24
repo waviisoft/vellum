@@ -255,3 +255,52 @@ releases:
         Nothing in an existing INTENT checkout changes. This release adds a file
         to the product half and a block an installation writes for itself; an
         intent-side upgrade crossing it rewrites nothing new.
+  - release: v0.5.0
+    summary: >-
+      Continuous engineering: a run announces at its own boundary, with
+      `vellum announce`, and the dispatch that announcement causes is addressed
+      to a declared role. Collection is caused, not scheduled (spec-v28).
+    config_keys_added: []
+    files_added: []
+    files_retired: []
+    stub_inputs: []
+    notes:
+      - >-
+        New command: `vellum announce {handoff,finished,direction,deliver,answer,list}`.
+        `handoff` records `ledger/handoffs/NNNN-<slug>.md`, carrying what the
+        run tried, observed and proved, and addresses it to the role that
+        holds every path it names. `finished` and `direction` are addressed to
+        the role that holds `ledger/`. Each one records and delivers in a
+        single act. `deliver` redelivers whatever is still undelivered, and
+        `answer` marks a handoff acted on. `--tried` and `--proved` are required
+        for a handoff, and a handoff without them is a question.
+      - >-
+        TICK CONSUMERS, READ THIS. `vellum tick` now also emits `dispatch`
+        actions that carry a `role` key. A `dispatch` WITH `role` addresses that
+        role about the item; it is NOT "run an executor for this item". A
+        `dispatch` without `role` means what it always meant. A caller that
+        ignores `role` will re-run finished items. For a ledger that never
+        announced anything, the output is byte-identical to v0.4.0.
+      - >-
+        Ledger records gain an append-only `announcements:` list on each work
+        item that announced something. Each entry is identified by its event
+        (`handoff:<record>`, `finished:pr<N>`, `direction:<hash>`), so an event
+        that arrives twice is recorded and delivered once. `vellum tick` holds
+        an item while any handoff for it is unanswered.
+      - >-
+        `vellum ledger advance --pr` now records the run's end as an
+        announcement to the ledger's holder. It delivers that announcement with
+        `--json`, and otherwise leaves it for `deliver` or `tick`. It takes an
+        optional `--checkout`, which defaults to the git work tree containing
+        `--ledger-dir`. A missing addressee is a warning with exit 0, never a
+        failure of the state change.
+      - >-
+        Every ledger read-modify-write (announce, `ledger advance`, `tick`,
+        `release cut`) now holds one lock and writes atomically. The lock file
+        is `vellum-announce.lock` under the checkout's git dir, never in the
+        tracked tree, and falls back to a private per-user temp dir.
+      - >-
+        `vellum suite extract --format covsel` emits covsel's inventory shape.
+        A scenario whose working-tree text differs from its last committed
+        version now reports pending, with no version, instead of that old
+        version.
