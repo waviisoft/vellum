@@ -233,7 +233,7 @@ quietly, and says "rotate" only for the half that is a credential. Treat it as
 a backstop: by the time a value reaches the command it has been through a
 shell history and a process table, and a dropped substring undoes neither.
 
-### `vellum announce handoff|finished|deliver|answer|list`
+### `vellum announce handoff|finished|direction|deliver|answer|list`
 
 The addressed event, and the dispatch its arrival causes
 (`spec/features/continuous-engineering.md`). A run announces at its **boundary**
@@ -244,39 +244,67 @@ is there.
 
 ```
 vellum announce handoff <checkout> --version <sha> --item 12 \
-    --from librarian --asks "apply the proven fix under harness/" \
+    --from implementer --asks "apply the proven fix under harness/" \
     --tried "…" --observed "…" --proved "…" --path harness/steps.py
-vellum announce finished <checkout> --version <sha> --item 12 --pr 34
-vellum announce deliver  <checkout> [--item 12] [--handoff 0001-….md]
-vellum announce answer   <checkout> --handoff 0001-….md
+vellum announce finished  <checkout> --version <sha> --item 12 --pr 34
+vellum announce direction <checkout> --version <sha> --item 12 \
+    --briefing "the owner's own words: what changed"
+vellum announce deliver  <checkout> [--version <sha>] [--item 12] [--handoff 0001-….md]
+vellum announce answer   <checkout> --handoff 0001-….md --by harness-engineer
 vellum announce list     <checkout>
 ```
 
 **`handoff`** records a blocked run's proposal under `ledger/handoffs/`, one
 file per handoff: who it is for, what it asks for, and the evidence — what was
-tried, what was observed, what was proven, in the run's own words, so the
-receiver verifies rather than rediscovers. The addressee is read off the
-installation's `write_boundaries` block: the role that holds the tree the
-proposed change lies in. A tree with **no** declared holder, or **two**, is
-refused rather than guessed, and `--to` is how an installation answers that. A
-handoff addressed back to its own sender is refused outright.
+tried, what was observed, what was proven, verbatim and capped at 64 KiB each,
+in the run's own words, so the receiver verifies rather than rediscovers. An
+ask with no evidence (empty `--tried` or `--proved`) is refused: that is a
+question, and goes by the question protocol instead. The addressee is read off
+the installation's `write_boundaries` block, matched against a proposed
+path's **whole** repo-relative path (so a role declaring `spec/features` is
+found for `spec/features/auth.md`, and one declaring `.vellum/memory` is found
+for a file under it): the role that holds the tree the proposed change lies
+in. A tree with **no** declared holder, or **two**, is refused rather than
+guessed, and `--to` is how an installation answers that — an explicit `--to`
+must still hold at least one tree and every `--path` given. A handoff
+addressed back to its own sender is refused outright. Recording the exact same
+handoff twice (same version, item, addressee, ask and paths) is idempotent: it
+reuses the record rather than writing a second one, and replaying the arrival
+of one already answered exits 0 with a note naming who answered it and when,
+dispatching nobody.
 
-**The sender proposes and the holder writes.** Recording a handoff writes the
-record and the announcing item's `announced:` field, and nothing at all in the
-tree the handoff is *about*. No handoff grants its sender reach it did not
-declare; `vellum verify boundaries` is unchanged and still refuses the sender.
+**Writing a handoff is the ledger holder's act, done on the sender's
+behalf.** It writes into `ledger/` — the handoff record and the announcing
+item's `announced:` field — and nothing at all in the tree the handoff is
+*about*. `--from` is attribution only: under fire-and-collect the orchestrator
+is the one that records the handoff when it collects a blocked run, and the
+role it names is who raised it, never who ran this command. No handoff grants
+its sender reach it did not declare; `vellum verify boundaries` is unchanged
+and still refuses the sender.
 
 **`finished`** announces a run's end. `vellum ledger advance --pr` records the
-same announcement — reporting a pull request *is* the report — and leaves
-delivery to a transport.
+same announcement and delivers it the same way — reporting a pull request *is*
+the report, and delivering it is not a separate step. `--to` and `--from` are
+each a declared role or refused; a `--from` equal to `--to` is recorded but
+not dispatched, since a role has nothing to learn from dispatching itself.
 
-**Delivery happens twice over, and the difference is the point.** `handoff` and
-`finished` deliver the dispatch *themselves*, in the same act that record it:
-that is the push, and **no reconciler pass is in the causal chain**. `vellum
-tick` drains whatever is still pending as the **fallback**, so a delivery
-nobody carried costs latency and never correctness. A pass over a world that
-announced nothing addresses nobody — which is what makes the dispatch a
-function of the announcement rather than of the scan.
+**`direction`** records the owner's review or comment against a work item's
+briefing and dispatches the role that must act on it, in the same act — so an
+owner-review webhook does not need a full `vellum tick` to make it real. `vellum
+tick` still records and delivers direction it learns about through
+`--observed`, as the fallback.
+
+**Delivery happens twice over, and the difference is the point.** `handoff`,
+`finished` and `direction` deliver the dispatch *themselves*, in the same act
+that records it: that is the push, and **no reconciler pass is in the causal
+chain**. `vellum tick` drains whatever is still pending as the **fallback**, so
+a delivery nobody carried costs latency and never correctness. A pass over a
+world that announced nothing addresses nobody — which is what makes the
+dispatch a function of the announcement rather than of the scan. A standing,
+undelivered announcement addressed to a role *other* than the one superseding
+it is never simply dropped: it is kept (`announced_pending`) and delivered on
+its own, so a run that both hands off and reports a pull request dispatches
+both roles rather than only the newest.
 
 Which transport carries an announcement onward — a forge webhook, a claim
 daemon, a workflow — is an installation's, declared with its executors. That an
@@ -284,9 +312,16 @@ announcement is *pushed* is not.
 
 **Dispatch is idempotent and terminates.** Delivery writes `dispatched` back
 into the record, so the next reader of it emits nothing; a handoff the
-addressed role has answered (`vellum announce answer`) dispatches nobody at
-all. An addressed dispatch is a `dispatch` action carrying the role it is for;
-an ordinary work dispatch carries no addressee and is unchanged.
+addressed role — or the role that holds the ledger — has answered (`vellum
+announce answer --by <role>`) dispatches nobody at all, and `vellum tick`
+holds rather than re-claims a work item whose standing announcement is an
+still-unanswered handoff. A `dispatch` action carrying a `role` is that
+addressed delivery; a `dispatch` action carrying none is the ordinary case,
+spawning an executor for a claimed item — the same action kind either way, and
+a caller branches on whether `role` is present. Delivery itself is
+lock-guarded (`ledger/.announce.lock`): `dispatched` is authoritative only once
+committed, so two concurrent deliveries of the same announcement cannot both
+dispatch it.
 
 ### `vellum mint <intent-checkout>`
 
