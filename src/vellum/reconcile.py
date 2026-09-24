@@ -103,6 +103,19 @@ from pathlib import Path
 
 import yaml
 
+from vellum.announce import AnnounceError
+from vellum.announce import addressee_for_ledger
+from vellum.announce import announcements as announcement_log
+from vellum.announce import (
+    append_announcement,
+    dispatch_detail,
+    direction_announcement_id,
+    find_handoff,
+    new_announcement,
+    refuse_controls,
+    retry_unaddressed,
+    scrub_credentials,
+)
 from vellum.backpressure import NOT_A_RECORD, ledger_dir_for
 from vellum.config import ConfigError
 from vellum.config import load as load_config
@@ -114,9 +127,11 @@ from vellum.ledger import (
     dump,
     find_item,
     load,
+    locked,
     new_lease,
     parse_time,
     upsert_plan,
+    write as write_record,
 )
 from vellum.text import one_line
 
@@ -170,7 +185,12 @@ ACTION_KINDS: dict[str, bool] = {
     "answer-question": False,  # a raised question the corpus answers: reply, file nothing
     "draft-clarify": False, # an open question with an owner comment and no clarify PR
     "close-question": False,  # a question whose clarify PR merged
-    "dispatch": False,      # spawn an executor for a claimed item
+    # A `dispatch` WITH a `role` addresses that role (an announcement's
+    # delivery); WITHOUT one it spawns an executor for the claimed item — the
+    # two are the same action kind because both are "start a run", and a
+    # caller reading the emitted actions branches on whether `role` is present
+    # rather than being handed two kinds for one verb (S8).
+    "dispatch": False,
     # -- performed here, as a ledger write ------------------------------------
     "commit-plan": True,
     "supersede": True,
@@ -211,6 +231,12 @@ class Action:
     item: int | None
     #: One line, already narrowed. Printed and emitted verbatim.
     detail: str
+    #: The role this action is addressed to, or "" where it is addressed to
+    #: nobody. Only an announcement's delivery addresses anything
+    #: (``spec/features/continuous-engineering.md``): an ordinary work dispatch
+    #: says a claimed item is ready for a run and names no party at all, which is
+    #: what makes an addressee, where there is one, attributable to the event.
+    role: str = ""
 
     @property
     def taken(self) -> bool:
@@ -218,13 +244,20 @@ class Action:
         return ACTION_KINDS[self.kind]
 
     def to_dict(self) -> dict:
-        return {
+        emitted = {
             "kind": self.kind,
             "version": self.version,
             "item": self.item,
             "detail": self.detail,
             "taken": self.taken,
         }
+        # Present only when there is an addressee, so an unaddressed action's
+        # payload is byte for byte what it has always been and a reader asking
+        # "is this addressed" gets the same answer from the key's absence as from
+        # its emptiness.
+        if self.role:
+            emitted["role"] = self.role
+        return emitted
 
     def __str__(self) -> str:
         # Joined from the parts that are there rather than formatted with a gap
@@ -234,6 +267,8 @@ class Action:
         parts = [f"[{self.kind}]", self.version[:12] if self.version else "-" * 12]
         if self.item is not None:
             parts.append(f"item {self.item}")
+        if self.role:
+            parts.append(f"to {self.role}:")
         parts.append(self.detail)
         return " ".join(parts)
 
@@ -742,11 +777,24 @@ class _Reconciler:
         self.time_ordered: set[tuple[str, str]] = set()
         #: Items leased with nothing confirming their forge issue is filed.
         self.leased_unconfirmed: list[int] = []
+        #: Announcement kinds this pass could not address, so the report says so
+        #: once rather than once per item.
+        self.unaddressable: set[str] = set()
 
     # ------------------------------------------------------------- helpers
 
-    def act(self, kind: str, version: str, item: int | None, detail: str) -> None:
-        self.actions.append(Action(kind, version, item, one_line(detail)))
+    def act(self, kind: str, version: str, item: int | None, detail: str,
+            role: str = "", limit: int | None = 120) -> None:
+        """Record one convergent action. *limit* narrows *detail* to one line
+        of at most that many characters, the way every other action's
+        free-text explanation is narrowed for the terminal — pass ``None`` to
+        skip that narrowing (an addressed ``dispatch``'s own detail, per
+        ``announcements()``'s note: that text is content the receiver reads
+        and acts on, and truncating it is exactly "a pass that went looking"
+        wearing this command's name).
+        """
+        text = one_line(detail, limit if limit is not None else 1 << 30)
+        self.actions.append(Action(kind, version, item, text, role))
 
     def touched(self, sha: str) -> None:
         self.dirty.add(sha)
@@ -934,6 +982,27 @@ class _Reconciler:
                 item = find_item(record, issue)
                 if item is None:
                     continue
+                # S-4: scrubbed *before* it is compared or stored — a
+                # credential an owner pasted into a forge comment used as
+                # direction must not reach the ledger (a repository file) or
+                # a dispatch's own detail verbatim, the same rule
+                # `announce.record_direction` applies to the explicit CLI
+                # path. A control character is refused outright rather than
+                # scrubbed, same as everywhere else this project reads
+                # prose that reaches a terminal or a log — but refused for
+                # this one item's direction, not the whole tick: a stray
+                # byte in one forge comment must not hold every other item
+                # this pass would otherwise converge.
+                try:
+                    refuse_controls("briefing", briefing)
+                except AnnounceError as exc:
+                    self.notes.append(
+                        f"Direction for work item {issue} was not recorded: {exc}"
+                    )
+                    break
+                local_notes: list[str] = []
+                briefing = scrub_credentials("briefing", briefing, local_notes)
+                self.notes.extend(local_notes)
                 if item.get("briefing") != briefing:
                     item["briefing"] = briefing
                     self.touched(sha)
@@ -941,6 +1010,13 @@ class _Reconciler:
                         "record-direction", sha, issue,
                         f"briefing updated: {one_line(briefing, 60)}",
                     )
+                    # The arrival is the event. "What the owner says dispatches
+                    # the role that must act on it ... direction that sits unread
+                    # is indistinguishable from direction never given", so new
+                    # direction announces where a re-report of direction already
+                    # on the briefing does not — the condition above is what
+                    # keeps this idempotent.
+                    self._announce_direction(sha, item, issue, briefing)
                 held = active_lease(item, now=self.now)
                 if held is not None:
                     self.act(
@@ -1044,8 +1120,154 @@ class _Reconciler:
             if item is not None:
                 self.parked_items.add((version, item))
 
+    def _announce_direction(self, sha: str, item: dict, issue: int | None,
+                            briefing: str) -> None:
+        """Append a direction announcement to *item*'s log, or note why none
+        could be addressed."""
+        try:
+            to = addressee_for_ledger(self.checkout, self.ledger)
+        except AnnounceError as exc:
+            if "direction" not in self.unaddressable:
+                self.unaddressable.add("direction")
+                self.notes.append(
+                    f"Nothing was addressed for the direction event(s) this pass "
+                    f"recorded: {exc} The ledger still carries what happened; what "
+                    f"is missing is a party to tell "
+                    f"(spec/features/continuous-engineering.md)."
+                )
+            return
+        announcement = new_announcement(direction_announcement_id(briefing),
+                                        "direction", to, briefing)
+        if append_announcement(item, announcement):
+            self.touched(sha)
+
+    def announcements(self, open_shas: list[str]) -> None:
+        """Deliver what has been announced and not yet dispatched.
+
+        **The fallback transport, and never the mechanism.** What causes an
+        addressed dispatch is the announcement record — written by the run at its
+        own boundary, by ``ledger advance --pr`` reporting a pull request, or by
+        the arrival of direction above. ``vellum announce`` delivers one in the
+        same act that records it, with no pass involved at all; this exists so
+        that a delivery nobody carried costs latency rather than correctness,
+        which is the reconciler's own rule
+        (``spec/decisions/2026-08-28-reconciler.md``).
+
+        The discriminator between the two readings is visible here rather than
+        argued: this pass reads announcements and nothing else. A pass over a
+        world that announced nothing addresses nobody, however many times it
+        runs, and a finished item is still skipped by ``queue()`` exactly as
+        before.
+
+        Delivery is once. ``dispatched`` is written back into the record, so the
+        next reader — this pass again, another transport, the same command twice
+        — emits nothing, and a handoff the addressed role has already answered
+        dispatches nobody at all.
+
+        **Rule 2: every undelivered entry addressed to the same role is one
+        dispatch.** A blocked run's handoff and a later finish, both addressed
+        to the ledger holder, are delivered together rather than as two
+        redundant dispatches. **Rule 4:** an entry recorded with no addressee
+        (``ledger advance --pr`` with no declared holder at the time) is
+        retried here on every pass, mirroring ``announce.deliver``'s own
+        grouping and retry — this reads and writes the in-memory record this
+        tick already holds rather than delegating to ``announce.deliver``,
+        which would re-read the record from disk and miss whatever an earlier
+        pass in this same tick (``directions()``) already changed in memory.
+        """
+        for sha in open_shas:
+            _, record = self.records[sha]
+            for item in _items(record):
+                issue = _int_or_none(item.get("issue"))
+                if retry_unaddressed(self.checkout, self.ledger, item):
+                    self.touched(sha)
+                pending = [e for e in announcement_log(item) if not e.get("dispatched")]
+                if not pending:
+                    continue
+                grouped: dict[str, list[dict]] = {}
+                for entry in pending:
+                    role = str(entry.get("to") or "").strip()
+                    if not role:
+                        continue  # rule 4: unaddressed; retried above
+                    grouped.setdefault(role, []).append(entry)
+                for role, group in grouped.items():
+                    deliverable = []
+                    for entry in group:
+                        name = str(entry.get("handoff") or "").strip()
+                        if not name:
+                            deliverable.append(entry)
+                            continue
+                        try:
+                            handoff = find_handoff(self.ledger, name)
+                        except AnnounceError as exc:
+                            self.notes.append(
+                                f"Handoff {name} could not be read, so work item "
+                                f"{issue} is left pending rather than dispatched: {exc}"
+                            )
+                            continue
+                        if handoff is not None and handoff.is_answered:
+                            # N1: settled rather than left standing forever —
+                            # the next pass neither redispatches it nor
+                            # repeats this note.
+                            entry["dispatched"] = True
+                            self.touched(sha)
+                            self.notes.append(
+                                f"Handoff {name} was answered on "
+                                f"{one_line(handoff.answered, 40)}, so work item "
+                                f"{issue} dispatches nobody: a handoff already "
+                                f"acted on runs its receiver no further times."
+                            )
+                            continue
+                        deliverable.append(entry)
+                    if not deliverable:
+                        continue
+                    detail = "; ".join(dispatch_detail(e) for e in deliverable)
+                    self.act("dispatch", sha, issue, detail, role=role, limit=None)
+                    for entry in deliverable:
+                        entry["dispatched"] = True
+                    self.touched(sha)
+
+    def _open_handoffs(self, item: dict) -> list[tuple[str, object]]:
+        """Every handoff *item*'s own announcement log names, resolved straight
+        from ``handoffs/`` (rule 5).
+
+        Read from the handoff records themselves rather than from whichever
+        kind the announcement log currently happens to call "standing": an
+        item that hands off and *later* also announces something else (a
+        finish, a fresh direction) still holds on the handoff until it is
+        answered, because the handoff is a fact about the work, not about
+        which entry a reader would call current. A name this cannot read at
+        all — corrupt, oversized, gone — comes back paired with the
+        exception rather than skipped, so a caller can tell "unreadable" from
+        "answered" and hold on the former exactly as it would the latter.
+        """
+        names = sorted({
+            str(e.get("handoff") or "").strip()
+            for e in announcement_log(item)
+            if e.get("kind") == "handoff" and str(e.get("handoff") or "").strip()
+        })
+        resolved: list[tuple[str, object]] = []
+        for name in names:
+            try:
+                resolved.append((name, find_handoff(self.ledger, name)))
+            except AnnounceError as exc:
+                resolved.append((name, exc))
+        return resolved
+
     def queue(self, open_shas: list[str]) -> None:
-        """The work-item queue: dispatch what is unclaimed, hold what is claimed."""
+        """The work-item queue: dispatch what is unclaimed, hold what is claimed.
+
+        **B3: an item with an unanswered handoff against it is held, not
+        re-dispatched (rule 5).** Without this, an item that hands off stays
+        in state ``planned``/``implementing`` (blocked is not a ledger state —
+        it is a handoff, and the item that raised it is still nominally
+        queueable) and every tick claims it again: a fresh run spawns, re-hits
+        the same boundary, and — since B1 makes a replayed handoff reuse its
+        existing record rather than raise a new one — nothing about *that*
+        loops, but the item's own dispatch does, once per tick, forever.
+        Answering the handoff (``handoff.is_answered``) releases the item back
+        to the ordinary queue below.
+        """
         for sha in open_shas:
             _, record = self.records[sha]
             for item in _items(record):
@@ -1055,6 +1277,27 @@ class _Reconciler:
                     continue
                 if item.get("pr") not in (None, ""):
                     continue  # reported: its PR is the forge's to merge
+                blocking = [
+                    (name, found) for name, found in self._open_handoffs(item)
+                    if isinstance(found, Exception) or found is None or not found.is_answered
+                ]
+                if blocking:
+                    parts = []
+                    for name, found in blocking:
+                        if isinstance(found, Exception):
+                            self.notes.append(
+                                f"Handoff {name} could not be read, so work item "
+                                f"{issue} is held rather than claimed: {found}"
+                            )
+                            parts.append(f"{name} (unreadable)")
+                        else:
+                            role = found.to if found is not None else "(nobody declared)"
+                            parts.append(f"{name} to {role}")
+                    self.act(
+                        "hold", sha, issue,
+                        f"waiting on handoff {', '.join(parts)}",
+                    )
+                    continue
                 if issue is not None and (sha, issue) in self.parked_items:
                     self.act(
                         "hold", sha, issue,
@@ -1139,80 +1382,92 @@ def reconcile(
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=datetime.timezone.utc)
 
-    records, unreadable = _read_records(ledger)
-    seen = read_observed(observed)
+    # B-1: the whole read-modify-write cycle holds the shared ledger lock,
+    # same as every other read-modify-write of a ledger record in this
+    # project (`announce.record_handoff`, `.deliver`, `ledger.advance`) — a
+    # tick and a concurrent `vellum announce` call (or another tick) must
+    # serialize, or the second writer's read, taken before the first's write
+    # lands, silently drops the first's change.
+    with locked(ledger):
+        records, unreadable = _read_records(ledger)
+        seen = read_observed(observed)
 
-    if version is not None:
-        wanted = str(version).strip().lower()
-        matched = [s for s in records if s.startswith(wanted) or wanted.startswith(s)]
-        if len(matched) != 1:
-            raise TickError(
-                f"--version {version!r} names {len(matched)} of the {len(records)} "
-                f"record(s) in {ledger}; give a sha that names exactly one."
-            )
-        records = {matched[0]: records[matched[0]]}
+        if version is not None:
+            wanted = str(version).strip().lower()
+            matched = [s for s in records if s.startswith(wanted) or wanted.startswith(s)]
+            if len(matched) != 1:
+                raise TickError(
+                    f"--version {version!r} names {len(matched)} of the {len(records)} "
+                    f"record(s) in {ledger}; give a sha that names exactly one."
+                )
+            records = {matched[0]: records[matched[0]]}
 
-    notes: list[str] = []
-    if timebox_hours is None:
-        try:
-            questions = load_config(root).get("questions")
-            configured = questions.get("timebox_hours") if isinstance(questions, dict) else None
-        except ConfigError:
-            configured = None
-        if isinstance(configured, (int, float)) and not isinstance(configured, bool):
-            timebox_hours = float(configured)
-        else:
-            timebox_hours = float(DEFAULT_TIMEBOX_HOURS)
-            notes.append(
-                f"No questions.timebox_hours in the installation config; using the "
-                f"spec's default of {DEFAULT_TIMEBOX_HOURS}h "
-                f"(spec/features/question-protocol.md)."
-            )
+        notes: list[str] = []
+        if timebox_hours is None:
+            try:
+                questions = load_config(root).get("questions")
+                configured = questions.get("timebox_hours") if isinstance(questions, dict) else None
+            except ConfigError:
+                configured = None
+            if isinstance(configured, (int, float)) and not isinstance(configured, bool):
+                timebox_hours = float(configured)
+            else:
+                timebox_hours = float(DEFAULT_TIMEBOX_HOURS)
+                notes.append(
+                    f"No questions.timebox_hours in the installation config; using the "
+                    f"spec's default of {DEFAULT_TIMEBOX_HOURS}h "
+                    f"(spec/features/question-protocol.md)."
+                )
 
-    engine = _Reconciler(
-        checkout=root,
-        ledger=ledger,
-        records=records,
-        observed=seen,
-        now=moment,
-        executor=executor,
-        lease_minutes=lease_minutes,
-        channel=channel or "production",
-        corpus_match=corpus_match,
-    )
-    engine.notes.extend(notes)
-    if executor is not None:
-        engine.notes.append(
-            f"Claims are taken for {one_line(executor, 40)} and last "
-            f"{lease_minutes} minute(s). No spec sentence or config key gives a lease "
-            f"duration, so that number is this command's, not the installation's."
+        engine = _Reconciler(
+            checkout=root,
+            ledger=ledger,
+            records=records,
+            observed=seen,
+            now=moment,
+            executor=executor,
+            lease_minutes=lease_minutes,
+            channel=channel or "production",
+            corpus_match=corpus_match,
         )
-
-    open_shas = engine.open_records()
-    if plan is not None:
-        if len(records) != 1:
-            raise TickError(
-                "--plan commits a work plan into one record; pass --version to say "
-                "which. A plan is produced for a version, and committing one into "
-                "every open record would file the same work several times."
+        engine.notes.extend(notes)
+        if executor is not None:
+            engine.notes.append(
+                f"Claims are taken for {one_line(executor, 40)} and last "
+                f"{lease_minutes} minute(s). No spec sentence or config key gives a lease "
+                f"duration, so that number is this command's, not the installation's."
             )
-        engine.commit_plan(next(iter(records)), plan)
+
         open_shas = engine.open_records()
+        if plan is not None:
+            if len(records) != 1:
+                raise TickError(
+                    "--plan commits a work plan into one record; pass --version to say "
+                    "which. A plan is produced for a version, and committing one into "
+                    "every open record would file the same work several times."
+                )
+            engine.commit_plan(next(iter(records)), plan)
+            open_shas = engine.open_records()
 
-    engine.coalesce(open_shas)
-    engine.directions()
-    engine.questions(timebox_hours)
-    engine.raised()
-    for sha in open_shas:
-        engine.plan_and_file(sha)
-    engine.queue(open_shas)
+        engine.coalesce(open_shas)
+        engine.directions()
+        engine.questions(timebox_hours)
+        engine.raised()
+        for sha in open_shas:
+            engine.plan_and_file(sha)
+        # After the events that announce and before the queue: direction recorded
+        # this pass supersedes a finish still standing from an earlier one, so the
+        # addressee is dispatched about the newest thing that happened rather than
+        # twice about two.
+        engine.announcements(open_shas)
+        engine.queue(open_shas)
 
-    written: list[str] = []
-    if not dry_run:
-        for sha in sorted(engine.dirty):
-            path, record = records[sha]
-            path.write_text(dump(record), encoding="utf-8")
-            written.append(path.name)
+        written: list[str] = []
+        if not dry_run:
+            for sha in sorted(engine.dirty):
+                path, record = records[sha]
+                write_record(path, record)
+                written.append(path.name)
 
     return Tick(
         ledger=ledger,

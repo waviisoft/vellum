@@ -75,10 +75,13 @@ true of ``backpressure`` too.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
+from pathlib import Path
 
 from vellum import __version__
+from vellum.announce import AnnounceError
 from vellum.backpressure import BackpressureError
 from vellum.backpressure import run as backpressure_run
 from vellum.boundaries import SOURCE_CHOICES, BoundaryError
@@ -117,7 +120,12 @@ from vellum.provision import SHAPES, VISIBILITIES, ProvisionError
 from vellum.seeds import SeedsMissing
 from vellum.provision import requested as provision_requested
 from vellum.provision import run_provision as provision_run
-from vellum.reconcile import DEFAULT_CORPUS_MATCH, DEFAULT_LEASE_MINUTES, TickError
+from vellum.reconcile import (
+    DEFAULT_CORPUS_MATCH,
+    DEFAULT_LEASE_MINUTES,
+    Action,
+    TickError,
+)
 from vellum.release import SUITE_RESULTS, ReleaseError, ReleaseRefused
 from vellum.release import run_cut, run_partition
 from vellum.tag import TagError, TagRefused
@@ -200,6 +208,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     adv = ledger_sub.add_parser("advance", help="advance a record, or update a work item")
     _add_common_ledger_args(adv)
+    adv.add_argument(
+        "--checkout", default=None,
+        help="the intent checkout to read installation config from, for "
+             "addressing a finished announcement when --pr is given "
+             "(default: the git work tree containing --ledger-dir, or its "
+             "textual parent when it is not in one at all). Name it "
+             "explicitly when it resolves to the wrong checkout",
+    )
     adv.add_argument("--state", help="record state")
     adv.add_argument("--release", help="the cut that shipped this version")
     adv.add_argument("--plan", help="workplan.yaml to commit into the record")
@@ -214,6 +230,12 @@ def build_parser() -> argparse.ArgumentParser:
     adv.add_argument("--tokens", type=int, default=0, help="tokens to add to cost")
     adv.add_argument("--usd", type=float, default=0.0, help="usd to add to cost")
     adv.add_argument("--executor", help="executor that performed the work")
+    adv.add_argument(
+        "--json", action="store_true",
+        help="also deliver whatever --pr just announced and print the "
+             "dispatch as JSON, the way `announce finished --json` does "
+             "(default: record only; `deliver`/`tick` dispatch it later)",
+    )
 
     ver = ledger_sub.add_parser(
         "verify",
@@ -237,6 +259,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     _add_certify(sub)
+    _add_announce(sub)
     _add_tick(sub)
     _add_mint(sub)
     _add_backpressure(sub)
@@ -331,6 +354,169 @@ def _add_certify_common(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument("--item", type=int, required=True, help="work item issue number")
     p.add_argument("--ledger-dir", help="ledger directory (default: <checkout>/ledger)")
+
+
+def _add_announce(sub) -> None:
+    """``announce`` — a run says, at its own boundary, what it needs said.
+
+    The push half of ``spec/features/continuous-engineering.md``. Every
+    subcommand here both *records* a durable, addressed event and *delivers* it —
+    the addressed dispatch comes out of this command, with no reconciler pass
+    anywhere in the causal chain. Which transport carries that output onward is
+    an installation's, declared with its executors; that it is pushed is not.
+
+    ``--no-dispatch`` records without delivering, for a run whose transport will
+    collect the record itself. The next tick delivers whatever is still pending,
+    because a missed delivery costs latency and never correctness.
+    """
+    a = sub.add_parser(
+        "announce",
+        help="record an addressed event and dispatch the role it names",
+        description=(
+            "A run announces at its boundary — it has finished, or it is blocked "
+            "and has stopped — and the announcement is what dispatches the role it "
+            "names. Nothing here opens a channel into a running agent: the record "
+            "lands in the repository, and what travels is the news that it is "
+            "there. Exits 2 when the event cannot be addressed to a role this "
+            "installation declares."
+        ),
+    )
+    announce_sub = a.add_subparsers(dest="announce_command", required=True)
+
+    def _common(p: argparse.ArgumentParser) -> None:
+        p.add_argument("checkout", help="the intent repo checkout")
+        p.add_argument("--ledger-dir",
+                       help="ledger directory (default: <checkout>/ledger)")
+        p.add_argument("--json", action="store_true",
+                       help="emit the actions as JSON on stdout")
+        p.add_argument("--no-dispatch", action="store_true",
+                       help="record the announcement without delivering it; a "
+                            "transport or the next tick delivers what is pending")
+
+    hand = announce_sub.add_parser(
+        "handoff",
+        help="record a blocked run's handoff and dispatch the role it names",
+        description=(
+            "A unit of work that cannot proceed because the change belongs to "
+            "another role records a handoff: who it is for, what it asks for, and "
+            "the evidence that produced it — what was tried, what was observed, "
+            "what was proven. The sender proposes and the role that holds the tree "
+            "writes; nothing here grants the sender reach it did not declare. The "
+            "addressee is read off the installation's write_boundaries when --to "
+            "is absent, and a tree with no declared holder, or two, is refused "
+            "rather than guessed."
+        ),
+    )
+    _common(hand)
+    hand.add_argument("--version", required=True,
+                      help="spec version: the record the work item belongs to")
+    hand.add_argument("--item", type=int, required=True,
+                      help="the work item this handoff unblocks")
+    hand.add_argument("--from", dest="sender", required=True,
+                      help="the role raising it; a handoff addressed back to its "
+                           "sender is refused")
+    hand.add_argument("--asks", required=True,
+                      help="the one thing that would unblock this unit of work")
+    hand.add_argument("--tried", default="", help="what this run tried")
+    hand.add_argument("--observed", default="", help="what it observed")
+    hand.add_argument("--proved", default="", help="what it proved")
+    hand.add_argument("--path", action="append", default=[], dest="paths",
+                      help="a path the proposed change lies in; repeatable. Read "
+                           "for the addressee when --to is absent")
+    hand.add_argument("--to", help="the role it is addressed to (default: the "
+                                   "declared holder of the proposed change's tree)")
+    hand.add_argument("--now", help="the moment recorded on the handoff, ISO 8601")
+
+    fin = announce_sub.add_parser(
+        "finished",
+        help="announce a run's end and dispatch the role that must act",
+        description=(
+            "A run's last act is to say so. Records a finished announcement "
+            "against the work item and dispatches the role it names. `ledger "
+            "advance --pr` records the same announcement — reporting a pull "
+            "request is the report — and delivers it the same way."
+        ),
+    )
+    _common(fin)
+    fin.add_argument("--version", required=True, help="spec version")
+    fin.add_argument("--item", type=int, required=True, help="the work item")
+    fin.add_argument("--pr", type=int, help="the pull request the run left")
+    fin.add_argument("--to", help="the role it is addressed to (default: the "
+                                  "declared holder of the ledger); must be a "
+                                  "declared role")
+    fin.add_argument("--from", dest="sender", default="",
+                      help="the role reporting this (optional). If it equals "
+                           "the addressee, the announcement is recorded but "
+                           "not dispatched — a role has nothing to learn from "
+                           "dispatching itself")
+
+    direction = announce_sub.add_parser(
+        "direction",
+        help="record the owner's direction and dispatch the role that must act",
+        description=(
+            "Records new direction on a work item's briefing and dispatches "
+            "the role that must act on it, in the same act — so an owner-review "
+            "webhook does not need a full `vellum tick` to make it real. `vellum "
+            "tick` still records and delivers direction it is told about through "
+            "--observed, as the fallback."
+        ),
+    )
+    _common(direction)
+    direction.add_argument("--version", required=True, help="spec version")
+    direction.add_argument("--item", type=int, required=True, help="the work item")
+    direction.add_argument("--briefing", required=True,
+                           help="the owner's own words: what changed")
+    direction.add_argument("--to", help="the role it is addressed to (default: "
+                                        "the declared holder of the ledger); "
+                                        "must be a declared role")
+
+    deliver = announce_sub.add_parser(
+        "deliver",
+        help="dispatch whatever has been announced and not yet dispatched",
+        description=(
+            "The entry point a transport calls when it receives the news that a "
+            "record exists: it emits the addressed dispatch for every pending "
+            "announcement and marks it dispatched, so the receiver runs once. A "
+            "handoff the addressed role has already answered dispatches nobody."
+        ),
+    )
+    deliver.add_argument("checkout", help="the intent repo checkout")
+    deliver.add_argument("--ledger-dir",
+                         help="ledger directory (default: <checkout>/ledger)")
+    deliver.add_argument("--version", help="deliver only this record's")
+    deliver.add_argument("--item", type=int, help="deliver only this work item's")
+    deliver.add_argument("--handoff", help="deliver only the announcement this "
+                                           "handoff record raised")
+    deliver.add_argument("--json", action="store_true", help="actions as JSON")
+
+    answer = announce_sub.add_parser(
+        "answer",
+        help="record that the addressed role has acted on a handoff",
+        description=(
+            "Marks a handoff answered. An answered handoff dispatches nobody, "
+            "which is what makes dispatch terminate: the same handoff arriving "
+            "again runs its receiver no further times."
+        ),
+    )
+    answer.add_argument("checkout", help="the intent repo checkout")
+    answer.add_argument("--ledger-dir",
+                        help="ledger directory (default: <checkout>/ledger)")
+    answer.add_argument("--handoff", required=True, help="the handoff record's name")
+    answer.add_argument("--by", default=None,
+                        help="the role recording the answer (default: the "
+                             "handoff's own addressee). Given explicitly, it "
+                             "must be the addressee or the role that holds "
+                             "the ledger, and never the handoff's own sender")
+    answer.add_argument("--now", help="the moment it was answered, ISO 8601")
+
+    listing = announce_sub.add_parser(
+        "list",
+        help="read back the handoffs and announcements this checkout records",
+    )
+    listing.add_argument("checkout", help="the intent repo checkout")
+    listing.add_argument("--ledger-dir",
+                         help="ledger directory (default: <checkout>/ledger)")
+    listing.add_argument("--json", action="store_true", help="as JSON")
 
 
 def _add_tick(sub) -> None:
@@ -1008,6 +1194,170 @@ def _add_install_common(p: argparse.ArgumentParser) -> None:
     )
 
 
+def _ledger_of(args) -> tuple[Path, Path]:
+    """``(checkout, ledger dir)`` for an ``announce`` subcommand."""
+    checkout = Path(args.checkout)
+    return checkout, Path(args.ledger_dir) if args.ledger_dir else checkout / "ledger"
+
+
+def _dispatch_actions(sent) -> list[dict]:
+    """Deliveries as the action shape a tick emits, so one reader serves both.
+
+    ``reconcile.Action`` is where that shape is defined and this borrows it
+    rather than spelling it again: a transport reading `announce --json` and a
+    caller reading `tick --json` must not have to know which produced the
+    dispatch they are acting on.
+    """
+    return [Action("dispatch", d.version, d.item, d.detail, d.role).to_dict()
+            for d in sent]
+
+
+def _announce(args) -> int:
+    from vellum.announce import (
+        Delivery,
+        addressee_for_ledger,
+        answer_handoff,
+        deliver,
+        deliveries,
+        finished_announcement_id,
+        handoffs,
+        new_announcement,
+        record_announcement,
+        record_direction,
+        record_handoff,
+        require_role,
+    )
+
+    checkout, ledger_dir = _ledger_of(args)
+
+    if args.announce_command == "answer":
+        path = answer_handoff(ledger_dir, checkout, args.handoff, args.by, at=args.now)
+        print(path)
+        return 0
+
+    if args.announce_command == "list":
+        recorded = [h.to_dict() for h in handoffs(ledger_dir)]
+        pending = [
+            {"version": d.version, "item": d.item, "to": d.role,
+             "asks": d.detail, "withheld": d.withheld}
+            for d in deliveries(ledger_dir)
+        ]
+        if args.json:
+            print(json.dumps({"handoffs": recorded, "pending": pending}, indent=1))
+            return 0
+        print(f"{len(recorded)} handoff(s) in {ledger_dir / 'handoffs'}")
+        for entry in recorded:
+            mark = "answered" if entry["answered"] else "open"
+            print(f"  {entry['name']}  to {entry['to']}  item {entry['item']}  ({mark})")
+        print(f"{len(pending)} announcement(s) awaiting dispatch")
+        for entry in pending:
+            why = f" — withheld: {entry['withheld']}" if entry["withheld"] else ""
+            print(f"  item {entry['item']}  to {entry['to']}: {entry['asks']}{why}")
+        return 0
+
+    if args.announce_command == "deliver":
+        sent, held = deliver(ledger_dir, item=args.item, handoff=args.handoff,
+                             version=args.version)
+        return _report_dispatches(args, sent, held, ledger_dir)
+
+    # `handoff`, `finished` and `direction`: record the event, then deliver it
+    # in the same act. That is the push — the dispatch is the announcement's
+    # own consequence and no reconciler pass is in the chain.
+    if args.announce_command == "handoff":
+        handoff_notes: list[str] = []
+        path, handoff = record_handoff(
+            ledger_dir, checkout, args.version, args.item, args.sender,
+            asks=args.asks, tried=args.tried, observed=args.observed,
+            proved=args.proved, paths=args.paths, to=args.to, at=args.now,
+            notes=handoff_notes,
+        )
+        for note in handoff_notes:
+            print(f"vellum: {note}", file=sys.stderr)
+        if handoff.is_answered:
+            # B1: replaying the arrival of an already-answered handoff reuses
+            # the record and dispatches nobody — the arrival is idempotent,
+            # and an answered handoff dispatches nobody either way. Reported
+            # through the same `withheld` shape every other withheld delivery
+            # uses, so a reader of this command's --json does not need a
+            # second shape for this one case.
+            who = handoff.answered_by or handoff.to
+            note = f"already answered by {who} at {handoff.answered}"
+            held = [Delivery(args.version, args.item, handoff.to, handoff.asks,
+                             withheld=note)]
+            return _report_dispatches(args, [], held, ledger_dir,
+                                      recorded=f"{path} (to {handoff.to})")
+        recorded = f"{path} (to {handoff.to})"
+    elif args.announce_command == "direction":
+        direction_notes: list[str] = []
+        path, item, to = record_direction(
+            ledger_dir, checkout, args.version, args.item, args.briefing,
+            to=args.to, notes=direction_notes,
+        )
+        for note in direction_notes:
+            print(f"vellum: {note}", file=sys.stderr)
+        recorded = f"{path} (to {to})"
+    else:
+        to = args.to or addressee_for_ledger(checkout, ledger_dir)
+        to = require_role(checkout, to, "--to")
+        sender = (getattr(args, "sender", "") or "").strip()
+        if sender:
+            sender = require_role(checkout, sender, "--from")
+        pr = f" and reported pull request {args.pr}" if args.pr is not None else ""
+        detail = f"work item {args.item} has finished{pr}; the wave's next part begins"
+        self_dispatch = bool(sender) and sender == to
+        # K5: settled at birth, not merely postponed. A `dispatched: false`
+        # entry with nobody withholding it in the reader's own act is exactly
+        # what a later `deliver`/`tick` picks up and dispatches anyway — a
+        # role has nothing to learn from dispatching itself, permanently, not
+        # just this one time.
+        announcement = new_announcement(
+            finished_announcement_id(args.pr), "finished", to, detail,
+            dispatched=self_dispatch, settled="self" if self_dispatch else None,
+        )
+        path, _ = record_announcement(ledger_dir, args.version, args.item, announcement)
+        recorded = f"{path} (to {to})"
+        if self_dispatch:
+            held = [Delivery(
+                args.version, args.item, to, detail,
+                withheld=(
+                    f"{sender} both raised and would receive this "
+                    f"announcement; recorded, settled, not dispatched"
+                ),
+            )]
+            return _report_dispatches(args, [], held, ledger_dir, recorded=recorded)
+
+    if args.no_dispatch:
+        sent, held = [], []
+    else:
+        # S5: narrow to this record — without --version, an item number that
+        # happens to repeat across two versions' work plans would also
+        # dispatch the other version's pending announcement for it.
+        sent, held = deliver(ledger_dir, item=args.item, version=args.version)
+    return _report_dispatches(args, sent, held, ledger_dir, recorded=recorded)
+
+
+def _report_dispatches(args, sent, held, ledger_dir, recorded: str = "") -> int:
+    """Print what was recorded and what it dispatched, as prose or as JSON."""
+    if args.json:
+        print(json.dumps({
+            "ledger": str(ledger_dir),
+            "recorded": recorded,
+            "actions": _dispatch_actions(sent),
+            "withheld": [{"item": d.item, "role": d.role, "reason": d.withheld}
+                         for d in held],
+        }, indent=1))
+        return 0
+    if recorded:
+        print(recorded)
+    for delivery in sent:
+        print(f"dispatched to {delivery.role}: item {delivery.item} — {delivery.detail}")
+    for delivery in held:
+        print(f"dispatched nobody for item {delivery.item}: {delivery.withheld}")
+    if not sent and not held:
+        print("nothing was pending; nobody was dispatched")
+    return 0
+
+
 def _add_common_ledger_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--version",
@@ -1028,6 +1378,8 @@ def main(argv: list[str] | None = None) -> int:
             return _ledger(args)
         if args.command == "certify":
             return _certify(args)
+        if args.command == "announce":
+            return _announce(args)
         if args.command == "tick":
             return _tick(args)
         if args.command == "mint":
@@ -1115,9 +1467,9 @@ def main(argv: list[str] | None = None) -> int:
     # wheel carries no harness skeleton cannot seed one, which is a command that
     # could not answer rather than a finding about anybody's spec — and reaching
     # a caller as a traceback would make it look like a crash in the seed.
-    except (BoundaryError, ChainError, BudgetError, DependencyError, ExitDutyError,
-            InstallError, ManifestError, ProvisionError, SeedsMissing, TagError,
-            TickError, ReleaseError, UpgradeError) as exc:
+    except (AnnounceError, BoundaryError, ChainError, BudgetError, DependencyError,
+            ExitDutyError, InstallError, ManifestError, ProvisionError, SeedsMissing,
+            TagError, TickError, ReleaseError, UpgradeError) as exc:
         print(f"vellum: {exc}", file=sys.stderr)
         return 2
     # A cut that cannot be made, a pointer that would move backwards, a shallow
@@ -1370,9 +1722,14 @@ def _ledger(args: argparse.Namespace) -> int:
         return 0
 
     plan = load_plan(args.plan) if args.plan else None
+    notes: list[str] = []
+    # `advance()`'s own default (checkout=None) is the git work tree
+    # containing --ledger-dir — never this process's cwd. `--checkout`
+    # overrides it; passed through as-is, including None.
     path = advance(
         args.ledger_dir,
         sha,
+        checkout=args.checkout,
         state=args.state,
         release=args.release,
         plan=plan,
@@ -1387,8 +1744,33 @@ def _ledger(args: argparse.Namespace) -> int:
         tokens=args.tokens,
         usd=args.usd,
         executor=args.executor,
+        notes=notes,
     )
+    if args.json:
+        # K3: deliver whatever --pr just announced (or was already pending)
+        # in the same act, and report it the way `announce finished --json`
+        # does — the opt-in half of "delivers in the same act", since marking
+        # `dispatched` without emitting a dispatch anywhere would lose the
+        # event.
+        from vellum.announce import deliver as announce_deliver
+
+        sent, held = announce_deliver(args.ledger_dir, item=args.item, version=sha)
+        print(json.dumps({
+            "ledger": str(args.ledger_dir),
+            "recorded": str(path),
+            "actions": _dispatch_actions(sent),
+            "withheld": [{"item": d.item, "role": d.role, "reason": d.withheld}
+                         for d in held],
+        }, indent=1))
+        for note in notes:
+            print(note, file=sys.stderr)
+        return 0
     print(path)
+    # Said rather than silent: a run reporting a pull request has announced its
+    # end, and whether that news reached a party — or could not be addressed to
+    # one — is the thing this wave exists to make visible.
+    for note in notes:
+        print(note, file=sys.stderr)
     return 0
 
 

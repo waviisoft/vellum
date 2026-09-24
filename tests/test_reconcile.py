@@ -492,6 +492,105 @@ class TestSteeringIsAFreshRun(TickCase):
         self.assertEqual(record_path(self.ledger, self.newer).read_bytes(), before)
 
 
+# --------------------------------------------------------------------- S-4
+
+
+class DirectionsScrubCredentialsBeforeStoringOrDispatching(TickCase):
+    """S-4: a credential pasted into an owner's forge comment and observed as
+    direction is scrubbed before it is compared against the item's existing
+    briefing or written to the ledger — the same rule
+    ``announce.record_direction`` applies to the explicit CLI path, now
+    applied to the tick's own automatic ingestion of observed direction too.
+    """
+
+    def test_a_bearer_token_in_a_direction_is_not_written_to_the_ledger(self):
+        self.record(self.newer, items=[self.item(1)])
+        observed = self.observed(
+            issues=[1],
+            directions=[{
+                "version": self.newer, "item": 1,
+                "briefing": "retry with Authorization: Bearer SECRET-TOKEN-1",
+            }],
+        )
+        self.tick(observed=observed, executor="ex")
+        briefing = self.items_of(self.newer)[0]["briefing"]
+        self.assertNotIn("SECRET-TOKEN-1", briefing)
+        self.assertNotIn("SECRET-TOKEN-1", record_path(self.ledger, self.newer).read_text())
+
+    def test_a_control_character_in_a_direction_holds_that_item_only(self):
+        """A stray control character refuses that one item's direction rather
+        than the whole tick — other items still converge."""
+        self.record(self.newer, items=[self.item(1), self.item(2)])
+        observed = self.observed(
+            issues=[1, 2],
+            directions=[{
+                "version": self.newer, "item": 1,
+                "briefing": "carries a bell\x07character",
+            }],
+        )
+        tick = self.tick(observed=observed, executor="ex")
+        self.assertEqual(self.items_of(self.newer)[0]["briefing"], None)
+        self.assertTrue(any("not recorded" in n for n in tick.notes), tick.notes)
+        # Item 2, unaffected, still gets its ordinary dispatch.
+        self.assertIn(2, [a.item for a in tick.of_kind("dispatch")])
+
+
+# --------------------------------------------------------------------- B-1
+
+
+class ReconcileLocksItsWholeReadModifyWriteCycle(TickCase):
+    """B-1: a tick holds the shared ledger lock across the whole pass — the
+    read, every decision, and the write — the same lock every other
+    read-modify-write of a ledger record holds (``announce.record_handoff``,
+    ``.deliver``, ``ledger.advance``), so a tick and a concurrent writer must
+    serialize rather than one silently dropping the other's change.
+    """
+
+    def test_a_concurrent_writer_blocks_until_the_tick_finishes(self):
+        import threading
+
+        from vellum.ledger import locked
+
+        self.record(self.newer, items=[self.item(1)])
+        entered = threading.Event()
+        release = threading.Event()
+
+        import vellum.reconcile as reconcile_mod
+
+        original = reconcile_mod._read_records
+
+        def _blocking_read_records(ledger):
+            entered.set()
+            release.wait(timeout=5)
+            return original(ledger)
+
+        reconcile_mod._read_records = _blocking_read_records
+        try:
+            thread = threading.Thread(target=lambda: self.tick(executor="ex"))
+            thread.start()
+            self.assertTrue(entered.wait(timeout=5), "tick never entered its locked section")
+            # The tick is inside `with locked(ledger):` right now (blocked on
+            # `release`, mid read). A second, independent acquisition of the
+            # same lock from this thread must block until the tick's `with`
+            # block exits — proven by timing out on a short, bounded attempt.
+            acquired = []
+
+            def _try_acquire():
+                with locked(self.ledger):
+                    acquired.append(True)
+
+            waiter = threading.Thread(target=_try_acquire)
+            waiter.start()
+            waiter.join(timeout=0.3)
+            self.assertFalse(acquired, "a concurrent lock acquisition was not blocked by the tick")
+            release.set()
+            waiter.join(timeout=5)
+            thread.join(timeout=5)
+            self.assertTrue(acquired, "the waiter never acquired the lock after the tick finished")
+        finally:
+            reconcile_mod._read_records = original
+
+
 # ======================================================  @id:corpus-answer-bounces
 
 

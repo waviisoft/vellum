@@ -78,12 +78,13 @@ from vellum.ledger import (
     FULL_SHA_RE,
     SHA_RE,
     LedgerError,
-    dump,
     find_record,
     load,
+    locked as _ledger_locked,
     ordered as _ordered,
     parse_time,
     parse_version,
+    write as _ledger_write,
 )
 from vellum.ledger import now as ledger_now
 from vellum.suite import DroppedScenarios, extract, to_dict
@@ -706,19 +707,20 @@ def cut(
         else:
             cuts[existing_index] = record_entry
         data["cuts"] = cuts
-        if promote:
-            entry["spec_conformed"] = conformed_after
-            for wave_path, record, sha, _ in resolved:
-                if str(record.get("state") or "").strip() == "shipped":
-                    continue
-                record["state"] = "shipped"
-                record["release"] = cut_id
-                wave_path.write_text(dump(record), encoding="utf-8")
-                shipped.append(wave_path.name)
-        path.write_text(
-            yaml.safe_dump(_ordered(data, RELEASES_KEYS), sort_keys=False, width=100),
-            encoding="utf-8",
-        )
+        with _ledger_locked(ledger):
+            if promote:
+                entry["spec_conformed"] = conformed_after
+                for wave_path, record, sha, _ in resolved:
+                    if str(record.get("state") or "").strip() == "shipped":
+                        continue
+                    record["state"] = "shipped"
+                    record["release"] = cut_id
+                    _ledger_write(wave_path, record)
+                    shipped.append(wave_path.name)
+            path.write_text(
+                yaml.safe_dump(_ordered(data, RELEASES_KEYS), sort_keys=False, width=100),
+                encoding="utf-8",
+            )
 
     return Cut(
         ledger=ledger,
