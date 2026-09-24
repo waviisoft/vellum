@@ -84,10 +84,9 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import errno
-import fcntl
+import hashlib
 import os
 import re
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -100,8 +99,10 @@ from vellum.ledger import (
     find_item,
     find_record,
     load,
+    locked as ledger_locked,
     now as ledger_now,
     ordered,
+    parse_time,
     write,
 )
 from vellum.product import ProductFileError, role_trees, under
@@ -118,13 +119,6 @@ class AnnounceError(Exception):
 #: it was dispatched about.
 HANDOFF_DIRNAME = "handoffs"
 
-#: The lock file a delivery holds for its whole read-modify-write cycle
-#: (SS6). ``dispatched`` is authoritative only once it is *committed* — a
-#: reader between two concurrent deliveries' read and write sees a record that
-#: has not been written yet, and without this lock both would see "pending"
-#: and both would dispatch.
-LOCK_NAME = ".announce.lock"
-
 #: The three kinds of event that carry an addressee
 #: (``spec/features/continuous-engineering.md``): a run finishes, a run blocks
 #: and hands off, and the owner says something.
@@ -140,21 +134,27 @@ ANNOUNCED_KEYS = ("kind", "to", "asks", "handoff", "dispatched")
 #: ``to`` is first because the addressee is what makes the record deliverable at
 #: all, and ``from`` is beside it because a handoff addressed back to its sender
 #: is the stall this feature exists to end.
-HANDOFF_KEYS = ("to", "from", "version", "item", "paths", "asks", "recorded",
-                "answered", "answered_by")
+HANDOFF_KEYS = ("to", "from", "version", "item", "paths", "asks", "asks_sha256",
+                "recorded", "answered", "answered_by")
 
 #: ``ledger/handoffs/0001-a-slug.md``. Numbered so the tree reads in the order
 #: the handoffs were raised, and slugged so a reader knows what one is about
 #: before opening it.
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
-_NAME_RE = re.compile(r"^(\d{4})-")
+# `\d{4,}` (S3), not `\d{4}`: names are rendered `:04d`, so the 10000th
+# handoff is five digits. A four-digit-only pattern does not match a longer
+# number's *prefix* either — `\d{4}` is exactly four, so `re.match` fails
+# outright on "10000-x.md" — which would make `_next_number` stop counting
+# past 9999 and collide, and `valid_handoff_name` refuse every handoff
+# already past it as if it did not exist.
+_NAME_RE = re.compile(r"^(\d{4,})-")
 
 #: A handoff record's own name shape (SB2). Accepted only in exactly this form
 #: — never an absolute path, never one carrying a ``/`` of its own — because a
 #: name reaches a filesystem join (``handoff_dir(ledger_dir) / name``) and a
 #: string like ``../../spec/0001-fix-it.md`` is not a handoff's name, it is a
 #: traversal wearing one.
-HANDOFF_NAME_RE = re.compile(r"^\d{4}-[a-z0-9-]+\.md$")
+HANDOFF_NAME_RE = re.compile(r"^\d{4,}-[a-z0-9-]+\.md$")
 
 #: A handoff record, read whole, capped well above three evidence fields at
 #: their own cap plus the markdown this module wraps them in (SS7). A cap
@@ -169,11 +169,17 @@ MAX_HANDOFF_FILE_BYTES = 1 << 20  # 1 MiB
 MAX_EVIDENCE_BYTES = 64 * 1024
 
 #: Control characters this module refuses in text that reaches a terminal or a
-#: CI log (SN1). ``\n`` and ``\t`` are carved out for the evidence bodies —
-#: prose needs a line break — and everything else in this range is the family
-#: ``\x1b[2J`` belongs to: cursor moves, screen clears, OSC sequences a
-#: terminal or a log viewer executes rather than displays.
-_BAD_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+#: CI log (SN1, S6). ``\n`` and ``\t`` are carved out for the evidence bodies —
+#: prose needs a line break — and everything else refused here is a character
+#: that changes how a terminal or a reader displays what follows rather than
+#: being displayed itself: ``\x1b[2J`` and the rest of the C0 range (``\r``
+#: included — a bare carriage return repaints the current line) are cursor
+#: moves and screen clears; ``\x7f``-``\x9f`` adds DEL and the C1 controls,
+#: which are ordinary bytes in a terminal's own escape sequences; and the
+#: bidi embedding/override/isolate characters (U+202A-202E, U+2066-2069) are
+#: how "right-to-left override" attacks make a filename or a line of code
+#: display in an order it is not stored in.
+_BAD_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f‪-‮⁦-⁩]")
 
 #: A URL-shaped substring inside a larger piece of prose (SN2) — as opposed to
 #: ``ledger.clean_run_reference``, which reads a whole value as one URL. An
@@ -210,20 +216,62 @@ def _cap_evidence(argname: str, text) -> str:
     return value
 
 
-def _scrub_credentials(argname: str, text: str, notes: list[str]) -> str:
-    """Strip ``user:token@`` from any URL inside *text* (SN2)."""
+#: A credential-shaped query parameter, wherever it sits — inside a URL this
+#: module already found, or bare in prose (S7). ``clean_run_reference``'s own
+#: "userinfo" signal says nothing about a token riding in the query string
+#: instead, which is the ordinary shape a CI system hands one out in.
+_QUERY_TOKEN_RE = re.compile(
+    r"(?i)\b((?:access_)?token|api[_-]?key|secret)=([^&\s]+)"
+)
 
-    def repl(match: re.Match) -> str:
+#: An ``Authorization: Bearer <token>`` value, however it is introduced.
+_BEARER_RE = re.compile(r"(?i)\bBearer\s+([A-Za-z0-9._~+/-]+=*)")
+
+#: A shell-style ``SOMETHING_TOKEN=``/``_SECRET=``/``_KEY=`` assignment, the
+#: shape a copy-pasted environment or CI log line carries a credential in.
+_ASSIGNMENT_RE = re.compile(r"\b([A-Z][A-Z0-9_]*(?:_TOKEN|_SECRET|_KEY))=(\S+)")
+
+
+def _scrub_credentials(argname: str, text: str, notes: list[str]) -> str:
+    """Strip a credential from *text* wherever one of these shapes finds it
+    (SN2, S7): ``user:token@`` in a URL's userinfo, a token-shaped query
+    parameter, a ``Bearer`` value, or a ``*_TOKEN``/``*_SECRET``/``*_KEY``
+    assignment. Applied to every evidence field and to ``--asks``/
+    ``--briefing`` alike — a run's own words are exactly where a credential
+    it used along the way ends up quoted.
+    """
+    changed = False
+
+    def url_repl(match: re.Match) -> str:
+        nonlocal changed
         cleaned, removed = clean_run_reference(match.group(0))
         if "userinfo" in removed:
-            notes.append(
-                f"--{argname} carried a URL with a credential in its userinfo; "
-                f"stripped it before recording — rotate that credential."
-            )
+            changed = True
             return cleaned or match.group(0)
         return match.group(0)
 
-    return _URL_RE.sub(repl, text)
+    def redact(label: str, group: int = 1):
+        def repl(match: re.Match) -> str:
+            nonlocal changed
+            changed = True
+            return f"{match.group(group)}=[redacted]"
+        return repl
+
+    def bearer_repl(match: re.Match) -> str:
+        nonlocal changed
+        changed = True
+        return "Bearer [redacted]"
+
+    text = _URL_RE.sub(url_repl, text)
+    text = _QUERY_TOKEN_RE.sub(redact("query"), text)
+    text = _BEARER_RE.sub(bearer_repl, text)
+    text = _ASSIGNMENT_RE.sub(redact("assignment"), text)
+    if changed:
+        notes.append(
+            f"--{argname} carried what looks like a credential; stripped it "
+            f"before recording — rotate it."
+        )
+    return text
 
 
 def _check_evidence_path(value: str) -> str:
@@ -254,6 +302,27 @@ def _check_evidence_path(value: str) -> str:
             f"content"
         )
     return text
+
+
+def canonical_time(value: str | None, argname: str = "--now") -> str | None:
+    """*value* as the canonical ISO instant this project writes (K1), or None
+    when *value* is absent.
+
+    Never the raw string: ``--now`` reaches a record's frontmatter, and a
+    value like ``$'2026-01-17T01:00:00Z\\nanswered: 2026-01-01T00:00:00Z'``
+    written verbatim forges a second frontmatter line. Parsed the same way
+    ``vellum tick`` parses a moment (``ledger.parse_time``) and re-emitted in
+    the one shape this project ever writes, so what lands in the file is
+    never anything the caller typed.
+    """
+    if value is None:
+        return None
+    moment = parse_time(value)
+    if moment is None:
+        raise AnnounceError(
+            f"{argname} {one_line(str(value))!r} is not a parseable ISO 8601 moment"
+        )
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _slug(text: str, limit: int = 48) -> str:
@@ -475,6 +544,12 @@ def set_announcement(item: dict, announcement: dict) -> bool:
     if (standing is not None and not standing.get("dispatched")
             and str(standing.get("to") or "") != str(announcement.get("to") or "")):
         pending = item.setdefault("announced_pending", [])
+        # S4: at most one pending entry per addressee — a newer announcement
+        # queued for the same role *that is still waiting in the pending
+        # queue* replaces it rather than piling up beside it, which is what
+        # let alternating announcements grow the queue without bound.
+        standing_to = str(standing.get("to") or "")
+        pending[:] = [p for p in pending if str(p.get("to") or "") != standing_to]
         pending.append(standing)
     item["announced"] = announcement
     return True
@@ -503,6 +578,10 @@ class Handoff:
     item: int | None
     paths: list[str] = field(default_factory=list)
     asks: str = ""
+    #: sha256 of the full, untruncated ask (S2) — identity compares this, not
+    #: `asks`, which `one_line(..., 200)` truncates and two different asks
+    #: sharing that prefix would otherwise collide on.
+    asks_sha256: str = ""
     recorded: str = ""
     answered: str = ""
     answered_by: str = ""
@@ -543,6 +622,32 @@ def _next_number(tree: Path) -> int:
     return (max(seen) + 1) if seen else 1
 
 
+#: The shortest fence this ever renders (K2). Longer only when the content
+#: itself contains a run of backticks that long or longer — never shorter,
+#: so a fence is always at least a real markdown code fence.
+_MIN_FENCE = "```"
+
+
+def _fence_for(text: str) -> str:
+    """A backtick fence *text* cannot contain, and so cannot close early.
+
+    A run of backticks inside evidence — a person's own fenced snippet quoted
+    back, or an attempt to forge a section boundary — is measured, and the
+    fence is one backtick longer than the longest run found. Markdown fencing
+    rules already give this property to nested fences; this is the same rule
+    applied to a fence chosen at render time rather than by a human eye.
+    """
+    longest = 0
+    for run in re.findall(r"`+", text):
+        longest = max(longest, len(run))
+    return "`" * max(len(_MIN_FENCE), longest + 1)
+
+
+def _fenced_block(heading: str, text: str) -> list[str]:
+    fence = _fence_for(text)
+    return [f"## {heading}", "", fence, text, fence, ""]
+
+
 def render_handoff(handoff: Handoff) -> str:
     """The record, as YAML frontmatter over the evidence in the run's own words.
 
@@ -551,6 +656,12 @@ def render_handoff(handoff: Handoff) -> str:
     because the evidence is prose: "what was tried, what was observed, and what
     was proven, in the words of the run that found it". The forge renders it, a
     person reads it, and ``read_handoff`` reads it back.
+
+    Each evidence field sits inside a fence chosen so its own content cannot
+    close it (K2): parsing this back reads by fence, never by searching for
+    the next ``## `` — evidence that itself contains a heading or a shorter
+    fence must not be able to truncate the real content or forge a different
+    section when the record is read.
     """
     lines = ["---", f"to: {handoff.to}", f"from: {handoff.sender}"]
     if handoff.version:
@@ -561,6 +672,7 @@ def render_handoff(handoff: Handoff) -> str:
     for path in handoff.paths:
         lines.append(f"  - {path}")
     lines.append(f"asks: {handoff.asks}")
+    lines.append(f"asks_sha256: {handoff.asks_sha256}".rstrip())
     lines.append(f"recorded: {handoff.recorded}")
     # `answered:` with nothing after it rather than `answered: `, so an
     # unanswered handoff carries no trailing whitespace — a byte a reviewer's
@@ -581,11 +693,11 @@ def render_handoff(handoff: Handoff) -> str:
         "its sender reach it did not declare "
         "(spec/behaviors/write-boundaries.md).",
         "",
-        "## What was tried", "", handoff.tried, "",
-        "## What was observed", "", handoff.observed, "",
-        "## What was proved", "", handoff.proved, "",
-        "## The change this asks for", "",
     ]
+    lines += _fenced_block("What was tried", handoff.tried)
+    lines += _fenced_block("What was observed", handoff.observed)
+    lines += _fenced_block("What was proved", handoff.proved)
+    lines += ["## The change this asks for", ""]
     lines += [f"- `{path}`" for path in handoff.paths] or ["- (no path named)"]
     lines.append("")
     return "\n".join(lines)
@@ -621,11 +733,53 @@ def _frontmatter(text: str) -> dict[str, object]:
     return found
 
 
-def _section(text: str, heading: str) -> str:
-    """One ``## heading`` section's body, as one paragraph."""
-    found = re.search(rf"(?m)^## {re.escape(heading)}\n(.*?)(?=\n## |\Z)", text,
-                      flags=re.DOTALL)
-    return found.group(1).strip() if found else ""
+#: A fence line on its own: three or more backticks and nothing else (K2).
+_FENCE_LINE_RE = re.compile(r"^`{3,}$")
+
+#: The evidence headings, in the fixed order ``render_handoff`` emits them.
+_EVIDENCE_HEADINGS = ("What was tried", "What was observed", "What was proved")
+
+
+def _evidence_sections(text: str) -> dict[str, str]:
+    """``{heading: body}`` for every evidence section, read in one sequential
+    pass (K2) rather than as three independent searches.
+
+    Sequential on purpose: each section's real fence consumes its *entire*
+    body before the scan resumes looking for the next heading. A ``## What
+    was proved`` (or a fence-looking line) an attacker embedded inside
+    ``tried``'s own content is skipped over as part of what ``tried``
+    consumed — the scan for ``proved`` never begins until after ``tried``'s
+    true closing fence, so it cannot be fooled by anything that appeared
+    before that point. A search that instead looked for each heading
+    independently, anywhere in the whole text, would find the *first* match
+    for ``proved`` even when that match sits inside ``tried``'s body — which
+    is exactly the forgery this guards against.
+    """
+    lines = text.split("\n")
+    found: dict[str, str] = {}
+    pos = 0
+    for heading in _EVIDENCE_HEADINGS:
+        heading_line = f"## {heading}"
+        idx = next((i for i in range(pos, len(lines)) if lines[i] == heading_line), None)
+        if idx is None:
+            found[heading] = ""
+            continue
+        j = idx + 1
+        while j < len(lines) and lines[j] == "":
+            j += 1
+        if j >= len(lines) or not _FENCE_LINE_RE.match(lines[j]):
+            found[heading] = ""
+            pos = idx + 1
+            continue
+        fence = lines[j]
+        body = []
+        k = j + 1
+        while k < len(lines) and lines[k] != fence:
+            body.append(lines[k])
+            k += 1
+        found[heading] = "\n".join(body)
+        pos = k + 1
+    return found
 
 
 def valid_handoff_name(name: object) -> bool:
@@ -643,27 +797,50 @@ def valid_handoff_name(name: object) -> bool:
 def read_handoff(path: Path) -> Handoff:
     """Read one handoff record.
 
-    Capped (SS7): a handoff over ``MAX_HANDOFF_FILE_BYTES`` and one that is
-    not valid UTF-8 both refuse rather than read, as ``AnnounceError`` — never
-    a raw ``OSError`` or ``UnicodeDecodeError`` an uninvolved caller (``vellum
-    tick``, reading every handoff a wave's items name) is not written to
-    expect.
+    Opened with ``O_NOFOLLOW`` (R1/S1): whatever validated this path is safe
+    to read, this never follows a symlink at the last moment regardless — a
+    file that changed under a caller between listing and reading is refused,
+    not silently read through. Size is checked with ``fstat`` *before* any
+    content is read, and the read itself is bounded to that size, so a
+    symlink (or a legitimate file) driving this to read an arbitrarily large
+    target cannot inflate memory past what the cap already refuses on paper —
+    the check happens before the cost, not after. Capped (SS7): over
+    ``MAX_HANDOFF_FILE_BYTES``, or not valid UTF-8, both raise
+    ``AnnounceError`` — never a raw ``OSError`` or ``UnicodeDecodeError`` an
+    uninvolved caller (``vellum tick``, reading every handoff a wave's items
+    name) is not written to expect.
     """
     try:
-        raw = path.read_bytes()
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     except OSError as exc:
         raise AnnounceError(f"{path}: cannot read handoff record: {exc}") from exc
-    if len(raw) > MAX_HANDOFF_FILE_BYTES:
-        raise AnnounceError(
-            f"{path}: {len(raw)} bytes, over the {MAX_HANDOFF_FILE_BYTES}-byte "
-            f"cap on a handoff record; refused rather than read"
-        )
+    try:
+        size = os.fstat(fd).st_size
+        if size > MAX_HANDOFF_FILE_BYTES:
+            raise AnnounceError(
+                f"{path}: {size} bytes, over the {MAX_HANDOFF_FILE_BYTES}-byte "
+                f"cap on a handoff record; refused rather than read"
+            )
+        chunks = []
+        remaining = size
+        while remaining > 0:
+            chunk = os.read(fd, min(1 << 16, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+    except OSError as exc:
+        raise AnnounceError(f"{path}: cannot read handoff record: {exc}") from exc
+    finally:
+        os.close(fd)
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise AnnounceError(f"{path}: not valid UTF-8: {exc}") from exc
     front = _frontmatter(text)
     raw_item = str(front.get("item") or "").strip()
+    sections = _evidence_sections(text)
     return Handoff(
         name=path.name,
         to=str(front.get("to") or ""),
@@ -675,21 +852,58 @@ def read_handoff(path: Path) -> Handoff:
         item=int(raw_item) if raw_item.isdecimal() else None,
         paths=list(front.get("paths") or []),
         asks=str(front.get("asks") or ""),
+        asks_sha256=str(front.get("asks_sha256") or ""),
         recorded=str(front.get("recorded") or ""),
         answered=str(front.get("answered") or ""),
         answered_by=str(front.get("answered_by") or ""),
-        tried=_section(text, "What was tried"),
-        observed=_section(text, "What was observed"),
-        proved=_section(text, "What was proved"),
+        tried=sections["What was tried"],
+        observed=sections["What was observed"],
+        proved=sections["What was proved"],
     )
 
 
-def handoffs(ledger_dir: str | Path) -> list[Handoff]:
-    """Every handoff this checkout records, in name order."""
+def _handoff_paths(ledger_dir: str | Path) -> list[Path]:
+    """Every legitimate handoff path in ``handoffs/``, in name order (R1/S1).
+
+    ``lstat``-checked (``Path.is_symlink()``) rather than the ``is_file()``
+    a naive ``iterdir()`` filter would use — ``is_file()`` follows a symlink
+    and would happily admit ``0001-x.md -> /etc/shadow``, which is exactly
+    the read this exists to refuse before ``read_handoff`` ever opens
+    anything. Also filtered to the name shape ``valid_handoff_name`` accepts,
+    for the same reason ``find_handoff`` filters it: a name this did not
+    write is not a record this reads.
+    """
     tree = handoff_dir(ledger_dir)
     if not tree.is_dir():
         return []
-    return [read_handoff(path) for path in sorted(tree.iterdir()) if path.is_file()]
+    found = []
+    for entry in tree.iterdir():
+        if not valid_handoff_name(entry.name):
+            continue
+        try:
+            if entry.is_symlink() or not entry.is_file():
+                continue
+        except OSError:
+            continue
+        found.append(entry)
+    return sorted(found, key=lambda p: p.name)
+
+
+def handoffs(ledger_dir: str | Path) -> list[Handoff]:
+    """Every handoff this checkout records, in name order.
+
+    A record that fails to read — corrupt, oversized, or reached only
+    through something ``_handoff_paths`` already excluded — is skipped
+    rather than raised (R1/S1): one bad file in ``handoffs/`` must not make
+    every command that lists or scans them fail.
+    """
+    found = []
+    for path in _handoff_paths(ledger_dir):
+        try:
+            found.append(read_handoff(path))
+        except AnnounceError:
+            continue
+    return found
 
 
 def find_handoff(ledger_dir: str | Path, name: str) -> Handoff | None:
@@ -776,13 +990,52 @@ def _create_handoff(ledger_dir: str | Path, checkout: str | Path, base: Handoff)
     raise AnnounceError(f"{tree}: no free handoff number found after 10000 tries")
 
 
+#: The two frontmatter lines ``answer`` may ever change (K2).
+_ANSWER_LINE_RE = re.compile(r"^(answered|answered_by):")
+
+
+def _patch_answer(text: str, answered: str, answered_by: str) -> str:
+    """*text* with only its ``answered:``/``answered_by:`` frontmatter lines
+    replaced (K2) — never a re-render from parsed evidence, which would trust
+    ``_section``'s read of a body a hand edit or a crafted ``--tried`` could
+    have made say something the file's own bytes do not.
+    """
+    lines = text.split("\n")
+    out = []
+    in_frontmatter = False
+    seen_open = False
+    for line in lines:
+        if line == "---" and not seen_open:
+            seen_open = True
+            in_frontmatter = True
+            out.append(line)
+            continue
+        if line == "---" and in_frontmatter:
+            in_frontmatter = False
+            out.append(line)
+            continue
+        if in_frontmatter and line.startswith("answered:"):
+            out.append(f"answered: {answered}".rstrip())
+            continue
+        if in_frontmatter and line.startswith("answered_by:"):
+            out.append(f"answered_by: {answered_by}".rstrip())
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
 def write_handoff(ledger_dir: str | Path, handoff: Handoff, checkout: str | Path) -> Path:
-    """Rewrite an *existing* handoff record in place — ``answer``'s write.
+    """Patch an *existing* handoff record's answer in place — ``answer``'s
+    write, and the only write this ever performs on a record it did not just
+    create.
 
     Refuses a symlinked record outright rather than writing through it
-    (SB1): an existing record this did not just create is only ever rewritten
-    to add an answer, and a name that resolves to something outside
-    ``handoffs/`` is not this record any more, whatever wrote it there.
+    (SB1). Patches the raw text (K2) rather than re-rendering from
+    ``handoff``'s parsed fields: a full re-render trusts the parser's read of
+    the evidence bodies, and evidence a run supplied is not something this
+    module re-derives a file from a second time. Only ``answered:`` and
+    ``answered_by:`` ever change; every other byte, including the fences and
+    bodies of the evidence sections, is copied through untouched.
     """
     tree = handoff_dir(ledger_dir)
     path = tree / handoff.name
@@ -794,8 +1047,17 @@ def write_handoff(ledger_dir: str | Path, handoff: Handoff, checkout: str | Path
     refusal = _handoff_dir_refusal(checkout, ledger_dir)
     if refusal is not None:
         raise AnnounceError(f"{path}: refused — {refusal}")
-    content = render_handoff(handoff).encode("utf-8")
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise AnnounceError(f"{path}: cannot read handoff record: {exc}") from exc
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise AnnounceError(f"{path}: not valid UTF-8: {exc}") from exc
+    patched = _patch_answer(text, handoff.answered, handoff.answered_by)
+    content = patched.encode("utf-8")
+    fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW, 0o644)
     try:
         os.ftruncate(fd, 0)
         os.write(fd, content)
@@ -854,7 +1116,7 @@ def answer_handoff(
             )
         recorded_by = by
     if not handoff.is_answered:
-        handoff.answered = at or ledger_now()
+        handoff.answered = canonical_time(at) or ledger_now()
         handoff.answered_by = recorded_by
         write_handoff(ledger_dir, handoff, checkout)
     return handoff_dir(ledger_dir) / name
@@ -883,18 +1145,25 @@ def record_announcement(
     item: int,
     announcement: dict,
 ) -> tuple[Path, dict]:
-    """Put *announcement* on a work item, and write the record if it moved."""
-    path, record = _record_for(ledger_dir, version)
-    found = find_item(record, item)
-    if found is None:
-        raise AnnounceError(
-            f"{path.name} has no work item {item}; an announcement is about a unit "
-            f"of work, and this record's items are "
-            f"{', '.join(str(i.get('issue')) for i in record.get('work_items') or []) or '(none)'}"
-        )
-    if set_announcement(found, announcement):
-        write(path, record)
-    return path, found
+    """Put *announcement* on a work item, and write the record if it moved.
+
+    The whole read-modify-write holds the shared ledger lock (K4): two
+    concurrent announcements against different items in the same record must
+    serialize, or the second writer's read (taken before the first's write
+    lands) silently drops the first's change.
+    """
+    with _locked(ledger_dir):
+        path, record = _record_for(ledger_dir, version)
+        found = find_item(record, item)
+        if found is None:
+            raise AnnounceError(
+                f"{path.name} has no work item {item}; an announcement is about a unit "
+                f"of work, and this record's items are "
+                f"{', '.join(str(i.get('issue')) for i in record.get('work_items') or []) or '(none)'}"
+            )
+        if set_announcement(found, announcement):
+            write(path, record)
+        return path, found
 
 
 def mark_dispatched(ledger_dir: str | Path, version: str, item: int) -> bool:
@@ -945,98 +1214,120 @@ def record_handoff(
 
     Validated before anything is written (SS2): version and item are resolved
     against the ledger first, so a refusal after that point never leaves an
-    orphan record behind.
+    orphan record behind. The whole call — validation, the identity check,
+    and the create-or-reuse it decides between — holds the shared ledger lock
+    (K4): two concurrent handoffs must not both see "no match" and both
+    create a record, and a replay that finds a match still repairs the
+    announcement below rather than trusting it is already there.
     """
-    path, record = _record_for(ledger_dir, version)
-    found = find_item(record, item)
-    if found is None:
-        raise AnnounceError(
-            f"{path.name} has no work item {item}; an announcement is about a unit "
-            f"of work, and this record's items are "
-            f"{', '.join(str(i.get('issue')) for i in record.get('work_items') or []) or '(none)'}"
-        )
-
-    declared = declared_boundaries(checkout)
-    sender = require_role(checkout, sender, "--from")
-
-    _refuse_controls("asks", asks)
-    _refuse_controls("tried", tried)
-    _refuse_controls("observed", observed)
-    _refuse_controls("proved", proved)
-    if not str(tried or "").strip() or not str(proved or "").strip():
-        raise AnnounceError(
-            "a handoff carries what was tried and what was proved — the "
-            "evidence a receiver verifies rather than rediscovers. An ask with "
-            "none of that is a question, and goes by the question protocol "
-            "instead (spec/features/question-protocol.md)"
-        )
-    tried = _cap_evidence("tried", tried)
-    observed = _cap_evidence("observed", observed)
-    proved = _cap_evidence("proved", proved)
-    local_notes: list[str] = []
-    tried = _scrub_credentials("tried", tried, local_notes)
-    observed = _scrub_credentials("observed", observed, local_notes)
-    proved = _scrub_credentials("proved", proved, local_notes)
-    if notes is not None:
-        notes.extend(local_notes)
-
-    proposed = [_check_evidence_path(p) for p in (paths or []) if str(p).strip()]
-
-    if to is None:
-        if not proposed:
+    with _locked(ledger_dir):
+        path, record = _record_for(ledger_dir, version)
+        found = find_item(record, item)
+        if found is None:
             raise AnnounceError(
-                "a handoff proposes a change, so it needs --path (the change it is "
-                "about) to read a holder off, or --to (the role it is for). "
-                "Without either there is nothing to address it to"
+                f"{path.name} has no work item {item}; an announcement is about a unit "
+                f"of work, and this record's items are "
+                f"{', '.join(str(i.get('issue')) for i in record.get('work_items') or []) or '(none)'}"
             )
-        wanted = {addressee(checkout, p) for p in proposed}
-        if len(wanted) > 1:
-            raise AnnounceError(
-                f"the proposed change reaches trees held by {', '.join(sorted(wanted))}. "
-                f"A handoff asks for the one thing that unblocks one unit of work, so "
-                f"it is addressed to one role — split it, or name the addressee with --to"
-            )
-        to = wanted.pop()
-    else:
-        to = require_role(checkout, to, "--to")
+        # S2: identity is pinned to the record's own full spec version, never
+        # an abbreviation — a short sha typed twice must not mint two records.
+        full_version = str(record.get("spec_version") or version)
 
-    if to == sender:
-        raise AnnounceError(
-            f"a handoff addressed back to {sender}, the role that raised it, asks "
-            f"the blocked run to unblock itself — which is the stall this record "
-            f"exists to end. Address it to the role that holds the tree"
-        )
-    if not declared.get(to):
-        raise AnnounceError(
-            f"write_boundaries.{to} declares no tree; an addressee must hold at "
-            f"least one tree to receive a handoff about a change "
-            f"(spec/behaviors/write-boundaries.md)"
-        )
-    for p in proposed:
-        if to not in holders(checkout, p):
+        declared = declared_boundaries(checkout)
+        sender = require_role(checkout, sender, "--from")
+
+        _refuse_controls("asks", asks)
+        _refuse_controls("tried", tried)
+        _refuse_controls("observed", observed)
+        _refuse_controls("proved", proved)
+        if not str(tried or "").strip() or not str(proved or "").strip():
             raise AnnounceError(
-                f"{to!r} does not hold {p}; a handoff addressed to {to} must be "
-                f"the declared holder of every path it proposes "
+                "a handoff carries what was tried and what was proved — the "
+                "evidence a receiver verifies rather than rediscovers. An ask with "
+                "none of that is a question, and goes by the question protocol "
+                "instead (spec/features/question-protocol.md)"
+            )
+        tried = _cap_evidence("tried", tried)
+        observed = _cap_evidence("observed", observed)
+        proved = _cap_evidence("proved", proved)
+        local_notes: list[str] = []
+        tried = _scrub_credentials("tried", tried, local_notes)
+        observed = _scrub_credentials("observed", observed, local_notes)
+        proved = _scrub_credentials("proved", proved, local_notes)
+        asks = _scrub_credentials("asks", asks, local_notes)
+        if notes is not None:
+            notes.extend(local_notes)
+
+        proposed = [_check_evidence_path(p) for p in (paths or []) if str(p).strip()]
+
+        if to is None:
+            if not proposed:
+                raise AnnounceError(
+                    "a handoff proposes a change, so it needs --path (the change it is "
+                    "about) to read a holder off, or --to (the role it is for). "
+                    "Without either there is nothing to address it to"
+                )
+            wanted = {addressee(checkout, p) for p in proposed}
+            if len(wanted) > 1:
+                raise AnnounceError(
+                    f"the proposed change reaches trees held by {', '.join(sorted(wanted))}. "
+                    f"A handoff asks for the one thing that unblocks one unit of work, so "
+                    f"it is addressed to one role — split it, or name the addressee with --to"
+                )
+            to = wanted.pop()
+        else:
+            to = require_role(checkout, to, "--to")
+
+        if to == sender:
+            raise AnnounceError(
+                f"a handoff addressed back to {sender}, the role that raised it, asks "
+                f"the blocked run to unblock itself — which is the stall this record "
+                f"exists to end. Address it to the role that holds the tree"
+            )
+        if not declared.get(to):
+            raise AnnounceError(
+                f"write_boundaries.{to} declares no tree; an addressee must hold at "
+                f"least one tree to receive a handoff about a change "
                 f"(spec/behaviors/write-boundaries.md)"
             )
+        for p in proposed:
+            if to not in holders(checkout, p):
+                raise AnnounceError(
+                    f"{to!r} does not hold {p}; a handoff addressed to {to} must be "
+                    f"the declared holder of every path it proposes "
+                    f"(spec/behaviors/write-boundaries.md)"
+                )
 
-    asks_norm = one_line(asks, 200)
-    identity_paths = tuple(sorted(proposed))
-    existing = _matching_handoff(ledger_dir, version, item, to, asks_norm, identity_paths)
-    if existing is not None:
-        return handoff_dir(ledger_dir) / existing.name, existing
+        asks_norm = one_line(asks, 200)
+        # S2: the FULL asks text, hashed — `asks_norm` truncates at 200
+        # characters, so two asks sharing that prefix would otherwise collide
+        # and the second one's evidence would silently vanish into the first
+        # one's record.
+        asks_hash = hashlib.sha256(str(asks or "").encode("utf-8")).hexdigest()
+        identity_paths = tuple(sorted(proposed))
+        existing = _matching_handoff(ledger_dir, full_version, item, to, asks_hash, identity_paths)
+        if existing is not None:
+            # K4: still idempotent — but a replay also repairs an
+            # announcement a prior crash or lost update left missing, rather
+            # than trusting the record is already right.
+            record_announcement(
+                ledger_dir, full_version, item,
+                new_announcement("handoff", to, existing.asks, handoff=existing.name),
+            )
+            return handoff_dir(ledger_dir) / existing.name, existing
 
-    template = Handoff(
-        name="", to=to, sender=sender, version=version, item=item, paths=proposed,
-        asks=asks_norm, recorded=at or ledger_now(), answered="", answered_by="",
-        tried=tried, observed=observed, proved=proved,
-    )
-    handoff = _create_handoff(ledger_dir, checkout, template)
-    record_announcement(
-        ledger_dir, version, item,
-        new_announcement("handoff", to, handoff.asks, handoff=handoff.name),
-    )
-    return handoff_dir(ledger_dir) / handoff.name, handoff
+        template = Handoff(
+            name="", to=to, sender=sender, version=full_version, item=item, paths=proposed,
+            asks=asks_norm, asks_sha256=asks_hash,
+            recorded=canonical_time(at) or ledger_now(), answered="", answered_by="",
+            tried=tried, observed=observed, proved=proved,
+        )
+        handoff = _create_handoff(ledger_dir, checkout, template)
+        record_announcement(
+            ledger_dir, full_version, item,
+            new_announcement("handoff", to, handoff.asks, handoff=handoff.name),
+        )
+        return handoff_dir(ledger_dir) / handoff.name, handoff
 
 
 def _matching_handoff(
@@ -1044,15 +1335,27 @@ def _matching_handoff(
     version: str,
     item: int,
     to: str,
-    asks_norm: str,
+    asks_hash: str,
     paths_norm: tuple[str, ...],
 ) -> Handoff | None:
-    """An existing handoff with this exact identity, or None (B1)."""
-    wanted = (str(version), item, to, asks_norm, paths_norm)
-    for existing in handoffs(ledger_dir):
+    """An existing handoff with this exact identity, or None (B1).
+
+    Each record is read independently, and one that fails to read (SS7's cap,
+    a decode error, a corrupt frontmatter) is skipped with the failure
+    swallowed rather than raised: one bad file in ``handoffs/`` must not
+    break every future ``announce handoff`` call that happens to scan past
+    it looking for a match.
+    """
+    wanted = (str(version), item, to, asks_hash, paths_norm)
+    for path in _handoff_paths(ledger_dir):
+        try:
+            existing = read_handoff(path)
+        except AnnounceError:
+            continue
         found = (
             str(existing.version), existing.item, existing.to,
-            one_line(existing.asks, 200), tuple(sorted(existing.paths)),
+            existing.asks_sha256 or hashlib.sha256(existing.asks.encode("utf-8")).hexdigest(),
+            tuple(sorted(existing.paths)),
         )
         if found == wanted:
             return existing
@@ -1067,6 +1370,7 @@ def record_direction(
     briefing: str,
     to: str | None = None,
     at: str | None = None,
+    notes: list[str] | None = None,
 ) -> tuple[Path, dict]:
     """Record the owner's direction against a work item, and announce it.
 
@@ -1074,24 +1378,32 @@ def record_direction(
     field, updated only when it actually changed — so a webhook can record and
     deliver direction in one act (S2) without waiting for a tick, and the tick
     path stays exactly what it was for the installations that still poll it as
-    a fallback.
+    a fallback. The whole read-modify-write holds the shared ledger lock (K4).
     """
-    path, record = _record_for(ledger_dir, version)
-    found = find_item(record, item)
-    if found is None:
-        raise AnnounceError(
-            f"{path.name} has no work item {item}; an announcement is about a unit "
-            f"of work, and this record's items are "
-            f"{', '.join(str(i.get('issue')) for i in record.get('work_items') or []) or '(none)'}"
-        )
-    role = require_role(checkout, to, "--to") if to else addressee_for_ledger(checkout, ledger_dir)
-    changed_briefing = found.get("briefing") != briefing
-    if changed_briefing:
-        found["briefing"] = briefing
-    changed_announcement = set_announcement(found, new_announcement("direction", role, briefing))
-    if changed_briefing or changed_announcement:
-        write(path, record)
-    return path, found
+    with _locked(ledger_dir):
+        path, record = _record_for(ledger_dir, version)
+        found = find_item(record, item)
+        if found is None:
+            raise AnnounceError(
+                f"{path.name} has no work item {item}; an announcement is about a unit "
+                f"of work, and this record's items are "
+                f"{', '.join(str(i.get('issue')) for i in record.get('work_items') or []) or '(none)'}"
+            )
+        role = require_role(checkout, to, "--to") if to else addressee_for_ledger(checkout, ledger_dir)
+        # S6: the owner's own words reach a briefing an agent reads, and from
+        # there a terminal or a log the same way any other evidence would.
+        _refuse_controls("briefing", briefing)
+        local_notes: list[str] = []
+        briefing = _scrub_credentials("briefing", briefing, local_notes)
+        if notes is not None:
+            notes.extend(local_notes)
+        changed_briefing = found.get("briefing") != briefing
+        if changed_briefing:
+            found["briefing"] = briefing
+        changed_announcement = set_announcement(found, new_announcement("direction", role, briefing))
+        if changed_briefing or changed_announcement:
+            write(path, record)
+        return path, found
 
 
 # ------------------------------------------------------------------ delivery
@@ -1143,8 +1455,13 @@ def _withheld_reason(ledger_dir: str | Path, slot: dict) -> str:
         return ""
     try:
         recorded = find_handoff(ledger_dir, name)
-    except AnnounceError:
-        return ""
+    except AnnounceError as exc:
+        # A handoff this cannot read says nothing about whether it was
+        # answered — the safe reading is to hold it, not to dispatch on a
+        # guess (nit: this used to return "" here, which `deliver` reads as
+        # "not withheld" and dispatches anyway; `reconcile._dispatch_one`
+        # already holds in the equivalent case, and this now matches it).
+        return f"handoff {name} could not be read, so it is held rather than dispatched: {exc}"
     if recorded is not None and recorded.is_answered:
         return (
             f"handoff {name} was answered on {recorded.answered}; a handoff "
@@ -1200,25 +1517,11 @@ def deliveries(
     return found
 
 
-@contextmanager
-def _locked(ledger_dir: str | Path):
-    """Hold an exclusive lock over one delivery's whole read-modify-write cycle.
-
-    SS6: two concurrent ``announce deliver`` runs both read "pending" before
-    either writes "dispatched", and both then dispatch. ``dispatched`` is
-    authoritative only once it is *committed* to the record — this is what
-    makes that true in the presence of a second process doing the same read.
-    """
-    tree = Path(ledger_dir)
-    tree.mkdir(parents=True, exist_ok=True)
-    lock_path = tree / LOCK_NAME
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
+#: Kept as an alias: ``ledger.locked`` is the one lock every read-modify-write
+#: of a ledger record holds now (K4) — ``record_handoff``, ``record_announcement``,
+#: ``record_direction``, ``deliver``, and ``ledger.advance``/``open_record`` all
+#: share it, relocated out of the tracked ledger tree (R2).
+_locked = ledger_locked
 
 
 def deliver(
@@ -1256,6 +1559,20 @@ def deliver(
                 touched[path] = record
             sent.append(delivery)
         for path, record in touched.items():
+            # S4: prune every now-dispatched `announced_pending` entry before
+            # writing — otherwise a slot marked dispatched above stays in the
+            # list forever, and the queue grows without bound.
+            for entry in record.get("work_items") or []:
+                if not isinstance(entry, dict):
+                    continue
+                pending = entry.get("announced_pending")
+                if not isinstance(pending, list):
+                    continue
+                kept = [p for p in pending if isinstance(p, dict) and not p.get("dispatched")]
+                if kept:
+                    entry["announced_pending"] = kept
+                else:
+                    entry.pop("announced_pending", None)
             write(path, record)
     return sent, held
 

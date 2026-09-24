@@ -33,8 +33,15 @@ defaults and the serialiser only ever reorders what it was handed.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
+import fcntl
+import hashlib
+import os
 import re
+import subprocess
+import tempfile
+import threading
 import urllib.parse
 from pathlib import Path
 
@@ -339,8 +346,132 @@ def load(path: Path) -> dict:
 
 
 def write(path: Path, record: dict) -> None:
+    """Write *record*, atomically (K4): a reader never observes a half-written
+    file. A temp file in the same directory (so the rename is on one
+    filesystem) is written and fsynced, then ``os.replace`` swaps it in —
+    ``os.replace`` is atomic on POSIX and on Windows alike, unlike
+    ``Path.write_text``'s truncate-then-write.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(dump(record), encoding="utf-8")
+    content = dump(record)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+
+
+#: The lock file's name, wherever it lands (R2/S8): never inside a tracked
+#: ledger tree, so a workflow that commits ``ledger/`` never commits it, and
+#: `vellum verify boundaries` never counts it as a crossing.
+LOCK_NAME = "vellum-announce.lock"
+
+#: Lock paths this thread currently holds, for ``locked()``'s reentrancy.
+_lock_state = threading.local()
+
+
+def _git_dir(ledger_dir: Path) -> Path | None:
+    """The ``.git`` directory of the work tree containing *ledger_dir*, or
+    None when there is none (not a git checkout, or git is unavailable).
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(ledger_dir), "rev-parse", "--git-dir"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    raw = proc.stdout.strip()
+    if not raw:
+        return None
+    found = Path(raw)
+    return found if found.is_absolute() else Path(ledger_dir) / found
+
+
+def git_toplevel(path: str | Path) -> str | None:
+    """The git work tree containing *path*, or None (no guessed fallback).
+
+    The default checkout ``ledger advance`` addresses against (corrected
+    ruling, superseding the first cut of S4): neither the process's current
+    directory nor ``ledger_dir``'s textual parent, which is not obliged to be
+    a checkout at all — the work tree git itself resolves *is*.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    found = proc.stdout.strip()
+    return found or None
+
+
+def _lock_path(ledger_dir: str | Path) -> Path:
+    """Where the cross-process ledger lock lives (R2).
+
+    Inside git's own directory when the ledger sits in a work tree — content
+    nothing ever stages, so a workflow that commits ``ledger/`` never commits
+    the lock and a boundary guard diffing a commit never sees it. A tempdir
+    entry keyed by the ledger's own resolved path otherwise, for a ledger this
+    cannot place in a git checkout at all (still exclusive across processes
+    naming the same ledger directory, just not repository-local).
+    """
+    git_dir = _git_dir(Path(ledger_dir))
+    if git_dir is not None:
+        return git_dir / LOCK_NAME
+    key = hashlib.sha256(str(Path(ledger_dir).resolve()).encode()).hexdigest()[:24]
+    return Path(tempfile.gettempdir()) / f"{LOCK_NAME}.{key}"
+
+
+@contextlib.contextmanager
+def locked(ledger_dir: str | Path):
+    """Hold an exclusive lock over a whole read-modify-write cycle on
+    *ledger_dir*'s records (K4).
+
+    One lock per ledger directory, shared by every writer — ``ledger
+    open``/``advance``, ``announce``'s record and deliver paths — so two
+    concurrent writers touching different work items in the same record (or
+    different records under the same ledger) serialize rather than one
+    clobbering the other's read. Opened with ``O_NOFOLLOW`` (S8): the lock
+    file is never written through a symlink either.
+
+    Reentrant within one thread: ``record_handoff`` holds this while it also
+    calls ``record_announcement``, which holds it too, and ``flock`` treats
+    two file descriptors on the same file — even from one process — as
+    independent, so a naive second acquisition here would deadlock against
+    the first. A thread-local set of currently-held lock paths makes the
+    second (and any further nested) acquisition a no-op; a genuinely
+    different thread or process still blocks on the real ``flock``.
+    """
+    path = _lock_path(ledger_dir)
+    key = str(path)
+    held = getattr(_lock_state, "paths", None)
+    if held is None:
+        held = _lock_state.paths = set()
+    if key in held:
+        yield
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o644)
+    held.add(key)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        held.discard(key)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 def open_record(
@@ -361,12 +492,13 @@ def open_record(
     minting workflow needs now that there is no version to arithmetic and no
     tag to check — the record either exists for this commit or it does not.
     """
-    existing = find_record(ledger_dir, sha)
-    if existing is not None:
-        return existing, False
-    path = record_path(ledger_dir, sha)
-    write(path, new_record(sha, spec_pr, baseline, labels, line, approved, name))
-    return path, True
+    with locked(ledger_dir):
+        existing = find_record(ledger_dir, sha)
+        if existing is not None:
+            return existing, False
+        path = record_path(ledger_dir, sha)
+        write(path, new_record(sha, spec_pr, baseline, labels, line, approved, name))
+        return path, True
 
 
 def find_item(record: dict, issue: int) -> dict | None:
@@ -378,7 +510,7 @@ def find_item(record: dict, issue: int) -> dict | None:
 def advance(
     ledger_dir: str | Path,
     sha: str,
-    checkout: str | Path = ".",
+    checkout: str | Path | None = None,
     state: str | None = None,
     release: str | None = None,
     plan: list[dict] | None = None,
@@ -403,148 +535,143 @@ def advance(
     to what is there rather than replacing it. ``--executor`` names the most
     recent one.
 
-    **A pull request reaching a work item announces the run's end, and
-    delivers it in the same act** — the same push ``vellum announce finished``
-    makes, so a fresh commit here dispatches its addressee without waiting for
-    a tick. What it writes is an ``announced:`` block naming the role the news
-    is for. Only a number that is new announces, so replaying a report
-    announces nothing and dispatches nothing a second time (S3).
+    **A pull request reaching a work item announces the run's end.**
+    ``spec/features/continuous-engineering.md``: "a run's last act is to say
+    so", and this is the act. What it writes is an ``announced:`` block naming
+    the role the news is for, left undelivered (``dispatched: false``) here —
+    ``vellum tick`` or ``vellum announce deliver`` performs the actual
+    dispatch and reports it, and this command reports one itself only when
+    called with ``--json`` (K3): marking dispatched without emitting a dispatch
+    anywhere loses the event, since nothing ever reads it back out.
 
-    *checkout* names the installation whose ``write_boundaries`` decide the
-    addressee (S4) — never guessed from ``ledger_dir``'s parent, which is not
-    obliged to be the checkout at all. When no role can be addressed, the
-    item's own state (its PR, its cost) is still written, but this then exits
-    by raising ``AnnounceError`` rather than merely noting it in *notes* and
-    returning 0: a run that finished and could not be addressed to anybody is
-    something the caller needs to see, not a line it can leave on stderr.
+    *checkout* overrides the addressee's source. Left unnamed, it defaults to
+    the git work tree containing *ledger_dir* (corrected S4 ruling,
+    superseding the first cut: neither the process's current directory nor
+    ``ledger_dir``'s textual parent, since a ``--ledger-dir`` is not obliged to
+    be either). When no addressee can be found at all — not in a git work
+    tree, no ``write_boundaries``, no unique holder — the item's own state (its
+    PR, its cost) is still recorded, the announcement is recorded too but with
+    an empty ``to`` so it dispatches nobody, a warning lands in *notes*, and
+    this still returns normally: an implicit announcement inside ordinary
+    ledger bookkeeping must never fail a state change over an address it could
+    not compute. ``vellum announce finished`` — the explicit command — keeps
+    refusing outright in the same situation; only this implicit path softens.
     ``announce=False`` turns the whole of it off for a caller repairing a
     record rather than reporting a run.
     """
-    path = find_record(ledger_dir, sha)
-    if path is None:
-        raise LedgerError(
-            f"{record_path(ledger_dir, sha)}: no ledger record for {sha}; open it first"
-        )
-    record = load(path)
-
-    if state is not None:
-        if state not in RECORD_STATES:
+    with locked(ledger_dir):
+        path = find_record(ledger_dir, sha)
+        if path is None:
             raise LedgerError(
-                f"{state!r} is not a record state ({', '.join(RECORD_STATES)})"
+                f"{record_path(ledger_dir, sha)}: no ledger record for {sha}; open it first"
             )
-        record["state"] = state
-    if release is not None:
-        record["release"] = release
+        record = load(path)
 
-    if plan is not None:
-        for entry in plan:
-            _upsert_planned(record, entry)
-
-    pending_error = None
-    if issue is not None:
-        item = find_item(record, issue)
-        if item is None:
-            if title is None or repo is None:
+        if state is not None:
+            if state not in RECORD_STATES:
                 raise LedgerError(
-                    f"work item {issue} is not in {path.name}; "
-                    f"--title and --repo are required to add it"
+                    f"{state!r} is not a record state ({', '.join(RECORD_STATES)})"
                 )
-            item = new_item(issue, title, repo, satisfies, briefing=briefing)
-            record.setdefault("work_items", []).append(item)
-        else:
-            if title is not None:
-                item["title"] = title
-            if repo is not None:
-                item["repo"] = repo
-            if satisfies:
-                item["satisfies"] = list(satisfies)
-            if briefing is not None:
-                item["briefing"] = briefing
-        if item_state is not None:
-            if item_state not in ITEM_STATES:
-                raise LedgerError(
-                    f"{item_state!r} is not a work-item state ({', '.join(ITEM_STATES)})"
-                )
-            item["state"] = item_state
-        if pr is not None:
-            reported = item.get("pr") != pr
-            item["pr"] = pr
-            if reported and announce:
-                pending_error = _announce_finish(checkout, ledger_dir, sha, item, issue, pr, notes)
-        cost = item.setdefault("cost", new_cost())
-        cost["attempts"] = (cost.get("attempts") or 0) + attempts
-        cost["tokens"] = (cost.get("tokens") or 0) + tokens
-        cost["usd"] = round((cost.get("usd") or 0.0) + usd, 6)
-        if executor is not None:
-            cost["executor"] = executor
-    elif any((title, repo, satisfies, item_state, pr, briefing, attempts, tokens, usd, executor)):
-        raise LedgerError("work-item options require --item <issue>")
+            record["state"] = state
+        if release is not None:
+            record["release"] = release
 
-    write(path, record)
-    if pending_error is not None:
-        raise pending_error
-    return path
+        if plan is not None:
+            for entry in plan:
+                _upsert_planned(record, entry)
+
+        if issue is not None:
+            item = find_item(record, issue)
+            if item is None:
+                if title is None or repo is None:
+                    raise LedgerError(
+                        f"work item {issue} is not in {path.name}; "
+                        f"--title and --repo are required to add it"
+                    )
+                item = new_item(issue, title, repo, satisfies, briefing=briefing)
+                record.setdefault("work_items", []).append(item)
+            else:
+                if title is not None:
+                    item["title"] = title
+                if repo is not None:
+                    item["repo"] = repo
+                if satisfies:
+                    item["satisfies"] = list(satisfies)
+                if briefing is not None:
+                    item["briefing"] = briefing
+            if item_state is not None:
+                if item_state not in ITEM_STATES:
+                    raise LedgerError(
+                        f"{item_state!r} is not a work-item state ({', '.join(ITEM_STATES)})"
+                    )
+                item["state"] = item_state
+            if pr is not None:
+                item["pr"] = pr
+                if announce:
+                    # K3: based on the announcement's own state, not on
+                    # whether the number changed — a retry after an
+                    # unaddressed attempt must still get a chance to address
+                    # it, and `set_announcement`'s own comparison (sans
+                    # `dispatched`) is what actually decides whether anything
+                    # changed.
+                    _announce_finish(checkout, ledger_dir, item, issue, pr, notes)
+            cost = item.setdefault("cost", new_cost())
+            cost["attempts"] = (cost.get("attempts") or 0) + attempts
+            cost["tokens"] = (cost.get("tokens") or 0) + tokens
+            cost["usd"] = round((cost.get("usd") or 0.0) + usd, 6)
+            if executor is not None:
+                cost["executor"] = executor
+        elif any((title, repo, satisfies, item_state, pr, briefing, attempts, tokens, usd, executor)):
+            raise LedgerError("work-item options require --item <issue>")
+
+        write(path, record)
+        return path
 
 
-def _announce_finish(checkout, ledger_dir, sha: str, item: dict, issue: int, pr: int,
-                     notes: list[str] | None):
-    """Put a ``finished`` announcement on *item*, and deliver it (S3).
-
-    Returns the ``AnnounceError`` that should be raised once the record has
-    been written (S4), or None. The item's own state is written regardless —
-    a run that finished has finished whether or not this installation has
-    declared an address space yet — but the caller must still exit non-zero,
-    which raising after the write achieves without losing that state.
+def _announce_finish(checkout, ledger_dir, item: dict, issue: int, pr: int,
+                     notes: list[str] | None) -> None:
+    """Put a ``finished`` announcement on *item*. Never raises, never marks
+    ``dispatched`` (K3, and the corrected S4 ruling): recording a run's end is
+    unconditional, and only ``deliver``/``tick`` (or this command's own
+    ``--json``, in the CLI layer) ever flips that bit.
     """
-    from vellum.announce import (
-        AnnounceError,
-        addressee_for_ledger,
-        new_announcement,
-        set_announcement,
-    )
+    from vellum.announce import AnnounceError, addressee_for_ledger, new_announcement, set_announcement
     from vellum.config import config_path as _config_path
 
-    try:
-        to = addressee_for_ledger(checkout, ledger_dir)
-    except AnnounceError as exc:
+    resolved = checkout if checkout is not None else git_toplevel(ledger_dir)
+    to = ""
+    if resolved is None:
         if notes is not None:
             notes.append(
-                f"Work item {issue} reported pull request {pr} and nothing was "
-                f"addressed: {exc} Nothing is dispatched for it until an addressee "
-                f"can be read (spec/features/continuous-engineering.md)."
+                f"Work item {issue} reported pull request {pr}, but "
+                f"{ledger_dir} is not inside a git work tree and no --checkout "
+                f"was given, so nothing could be addressed. The announcement "
+                f"is recorded as undelivered; `vellum tick` and `announce "
+                f"list` will surface it."
             )
-        # S4 exits non-zero on a *declared but incomplete* role graph — a
-        # checkout that named its roles and still leaves this tree unheld, or
-        # two roles claiming it. A checkout with no `.vellum/config.yaml` at
-        # all has not declared anything, which is not the same fact: it has
-        # not opted into continuous engineering, and `ledger advance --pr`
-        # must keep recording a run's end for it exactly as it always has,
-        # rather than gate ordinary ledger bookkeeping behind a feature
-        # nobody turned on.
+    else:
         try:
-            configured = _config_path(checkout).is_file()
-        except OSError:
-            configured = False
-        if not configured:
-            return None
-        return exc
+            to = addressee_for_ledger(resolved, ledger_dir)
+        except AnnounceError as exc:
+            if notes is not None:
+                notes.append(
+                    f"Work item {issue} reported pull request {pr} and nothing "
+                    f"was addressed: {exc} The announcement is recorded as "
+                    f"undelivered; `vellum tick` and `announce list` will "
+                    f"surface it."
+                )
     changed = set_announcement(item, new_announcement(
         "finished", to,
         f"work item {issue} has finished and reported pull request {pr}; "
         f"the wave's next part begins",
     ))
-    if changed:
-        # Deliver in the same act (S3): the same push `vellum announce
-        # finished` makes, so this needs no transport or tick to reach `to`.
-        standing = item.get("announced") or {}
-        standing["dispatched"] = True
-    if notes is not None:
+    if notes is not None and to:
         notes.append(
-            f"Work item {issue}'s run announced its end to {to} and dispatched it."
+            f"Work item {issue}'s run announced its end to {to}; `deliver` or "
+            f"`tick` will dispatch it."
             if changed else
-            f"Work item {issue} already announced its end to {to}; not redispatched."
+            f"Work item {issue} already announced its end to {to}; not re-announced."
         )
-    return None
 
 
 def _upsert_planned(record: dict, entry: dict) -> None:

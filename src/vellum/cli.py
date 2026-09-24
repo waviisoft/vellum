@@ -212,9 +212,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--checkout", default=None,
         help="the intent checkout to read installation config from, for "
              "addressing a finished announcement when --pr is given "
-             "(default: --ledger-dir's parent, the ordinary <checkout>/ledger "
-             "shape). Name it explicitly whenever the ledger directory is not "
-             "a direct child of the checkout",
+             "(default: the git work tree containing --ledger-dir). Name it "
+             "explicitly when the ledger is not in a git checkout, or is in "
+             "the wrong one",
     )
     adv.add_argument("--state", help="record state")
     adv.add_argument("--release", help="the cut that shipped this version")
@@ -231,9 +231,10 @@ def build_parser() -> argparse.ArgumentParser:
     adv.add_argument("--usd", type=float, default=0.0, help="usd to add to cost")
     adv.add_argument("--executor", help="executor that performed the work")
     adv.add_argument(
-        "--no-announce", dest="announce", action="store_false", default=True,
-        help="record --pr without announcing or dispatching; for a caller "
-             "repairing a record rather than reporting a run",
+        "--json", action="store_true",
+        help="also deliver whatever --pr just announced and print the "
+             "dispatch as JSON, the way `announce finished --json` does "
+             "(default: record only; `deliver`/`tick` dispatch it later)",
     )
 
     ver = ledger_sub.add_parser(
@@ -1286,10 +1287,13 @@ def _announce(args) -> int:
                                       recorded=f"{path} (to {handoff.to})")
         recorded = f"{path} (to {handoff.to})"
     elif args.announce_command == "direction":
+        direction_notes: list[str] = []
         path, item = record_direction(
             ledger_dir, checkout, args.version, args.item, args.briefing,
-            to=args.to,
+            to=args.to, notes=direction_notes,
         )
+        for note in direction_notes:
+            print(f"vellum: {note}", file=sys.stderr)
         to = ((item.get("announced") or {}).get("to")) or ""
         recorded = f"{path} (to {to})"
     else:
@@ -1300,19 +1304,24 @@ def _announce(args) -> int:
             sender = require_role(checkout, sender, "--from")
         pr = f" and reported pull request {args.pr}" if args.pr is not None else ""
         detail = f"work item {args.item} has finished{pr}; the wave's next part begins"
-        path, _ = record_announcement(
-            ledger_dir, args.version, args.item,
-            new_announcement("finished", to, detail),
-        )
+        announcement = new_announcement("finished", to, detail)
+        self_dispatch = bool(sender) and sender == to
+        if self_dispatch:
+            # K5: settled at birth, not merely postponed. A `dispatched:
+            # false` record with nobody withholding it in the reader's own
+            # act is exactly what a later `deliver`/`tick` picks up and
+            # dispatches anyway — a role has nothing to learn from
+            # dispatching itself, permanently, not just this one time.
+            announcement["dispatched"] = True
+            announcement["settled"] = "self"
+        path, _ = record_announcement(ledger_dir, args.version, args.item, announcement)
         recorded = f"{path} (to {to})"
-        if sender and sender == to:
-            # SB3: a role has nothing to learn from dispatching itself.
-            # Recorded above; not delivered.
+        if self_dispatch:
             held = [Delivery(
                 args.version, args.item, to, detail,
                 withheld=(
                     f"{sender} both raised and would receive this "
-                    f"announcement; recorded, not dispatched"
+                    f"announcement; recorded, settled, not dispatched"
                 ),
             )]
             return _report_dispatches(args, [], held, ledger_dir, recorded=recorded)
@@ -1320,7 +1329,10 @@ def _announce(args) -> int:
     if args.no_dispatch:
         sent, held = [], []
     else:
-        sent, held = deliver(ledger_dir, item=args.item)
+        # S5: narrow to this record — without --version, an item number that
+        # happens to repeat across two versions' work plans would also
+        # dispatch the other version's pending announcement for it.
+        sent, held = deliver(ledger_dir, item=args.item, version=args.version)
     return _report_dispatches(args, sent, held, ledger_dir, recorded=recorded)
 
 
@@ -1711,17 +1723,13 @@ def _ledger(args: argparse.Namespace) -> int:
 
     plan = load_plan(args.plan) if args.plan else None
     notes: list[str] = []
-    # `advance()` itself never guesses a checkout (S4) — it always takes one
-    # explicitly. This is the CLI's own default for callers that do not name
-    # `--checkout`: the ordinary shape, where the ledger directory is a direct
-    # child of the checkout. A `--ledger-dir` that is not shaped that way
-    # needs `--checkout` named explicitly, and gets a real refusal (not a
-    # silent wrong guess) if it is not.
-    checkout = args.checkout if args.checkout is not None else str(Path(args.ledger_dir).parent)
+    # `advance()`'s own default (checkout=None) is the git work tree
+    # containing --ledger-dir — never this process's cwd. `--checkout`
+    # overrides it; passed through as-is, including None.
     path = advance(
         args.ledger_dir,
         sha,
-        checkout=checkout,
+        checkout=args.checkout,
         state=args.state,
         release=args.release,
         plan=plan,
@@ -1736,9 +1744,27 @@ def _ledger(args: argparse.Namespace) -> int:
         tokens=args.tokens,
         usd=args.usd,
         executor=args.executor,
-        announce=args.announce,
         notes=notes,
     )
+    if args.json:
+        # K3: deliver whatever --pr just announced (or was already pending)
+        # in the same act, and report it the way `announce finished --json`
+        # does — the opt-in half of "delivers in the same act", since marking
+        # `dispatched` without emitting a dispatch anywhere would lose the
+        # event.
+        from vellum.announce import deliver as announce_deliver
+
+        sent, held = announce_deliver(args.ledger_dir, item=args.item, version=sha)
+        print(json.dumps({
+            "ledger": str(args.ledger_dir),
+            "recorded": str(path),
+            "actions": _dispatch_actions(sent),
+            "withheld": [{"item": d.item, "role": d.role, "reason": d.withheld}
+                         for d in held],
+        }, indent=1))
+        for note in notes:
+            print(note, file=sys.stderr)
+        return 0
     print(path)
     # Said rather than silent: a run reporting a pull request has announced its
     # end, and whether that news reached a party — or could not be addressed to
