@@ -807,6 +807,56 @@ class LedgerAdvanceAddressesExplicitly(unittest.TestCase):
             # The item's own state is still recorded despite the refusal.
             self.assertEqual(_item(repo)["pr"], 7)
 
+    def test_a_checkout_with_no_config_at_all_keeps_pr_reporting_working(self):
+        """Found running the intent repo's own acceptance suite against this
+        fix round: certification, chain-resolution and release scenarios all
+        call `ledger advance --pr` against sandboxes that carry no
+        `.vellum/config.yaml` at all, because they have nothing to do with
+        continuous engineering. S4's exit-non-zero is for an installation that
+        *declared* roles and still leaves a tree unheld or doubly held — not
+        for one that has not adopted roles at all, which must keep recording a
+        run's end exactly as it always could.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "intent"
+            repo.mkdir()
+            git(repo, "init", "-q", "-b", "main", ".")
+            commit_files(repo, {"README.md": "no .vellum/ at all\n"}, "start")
+            self.assertFalse((repo / ".vellum").exists())
+            code, _ = run_cli(["ledger", "open", "--version", VERSION,
+                               "--ledger-dir", str(repo / "ledger"),
+                               "--approved", NOW])
+            self.assertEqual(code, 0)
+            code, said = run_cli([
+                "ledger", "advance", "--version", VERSION, "--ledger-dir",
+                str(repo / "ledger"), "--item", str(SUBJECT), "--title", "t",
+                "--repo", "app", "--item-state", "planned",
+            ])
+            self.assertEqual(code, 0, said)
+            code, said = run_cli([
+                "ledger", "advance", "--version", VERSION, "--ledger-dir",
+                str(repo / "ledger"), "--item", str(SUBJECT), "--pr", "7",
+            ])
+            self.assertEqual(code, 0, said)
+            self.assertEqual(_item(repo)["pr"], 7)
+            self.assertIsNone(_item(repo).get("announced"))
+
+    def test_no_checkout_flag_defaults_to_the_ledger_dirs_parent(self):
+        """The CLI's own convenience default for callers that never pass
+        `--checkout` at all — the harness among them — so the ordinary
+        `<checkout>/ledger` shape keeps working exactly as before, while
+        `advance()` itself (the library call) never guesses internally.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            code, said = run_cli([
+                "ledger", "advance", "--version", VERSION, "--ledger-dir",
+                str(repo / "ledger"), "--item", str(SUBJECT), "--pr", "7",
+            ])
+            self.assertEqual(code, 0, said)
+            self.assertEqual(_item(repo)["announced"]["to"], "librarian")
+            self.assertIs(_item(repo)["announced"]["dispatched"], True)
+
     def test_the_checkout_is_never_guessed_from_the_ledger_dirs_parent(self):
         """The old code guessed the checkout as `ledger_dir`'s own parent —
         right by accident whenever the ledger sits directly under the

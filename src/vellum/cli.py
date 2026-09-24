@@ -209,10 +209,12 @@ def build_parser() -> argparse.ArgumentParser:
     adv = ledger_sub.add_parser("advance", help="advance a record, or update a work item")
     _add_common_ledger_args(adv)
     adv.add_argument(
-        "--checkout", default=".",
+        "--checkout", default=None,
         help="the intent checkout to read installation config from, for "
              "addressing a finished announcement when --pr is given "
-             "(default: current directory). Never guessed from --ledger-dir",
+             "(default: --ledger-dir's parent, the ordinary <checkout>/ledger "
+             "shape). Name it explicitly whenever the ledger directory is not "
+             "a direct child of the checkout",
     )
     adv.add_argument("--state", help="record state")
     adv.add_argument("--release", help="the cut that shipped this version")
@@ -1709,10 +1711,17 @@ def _ledger(args: argparse.Namespace) -> int:
 
     plan = load_plan(args.plan) if args.plan else None
     notes: list[str] = []
+    # `advance()` itself never guesses a checkout (S4) — it always takes one
+    # explicitly. This is the CLI's own default for callers that do not name
+    # `--checkout`: the ordinary shape, where the ledger directory is a direct
+    # child of the checkout. A `--ledger-dir` that is not shaped that way
+    # needs `--checkout` named explicitly, and gets a real refusal (not a
+    # silent wrong guess) if it is not.
+    checkout = args.checkout if args.checkout is not None else str(Path(args.ledger_dir).parent)
     path = advance(
         args.ledger_dir,
         sha,
-        checkout=args.checkout,
+        checkout=checkout,
         state=args.state,
         release=args.release,
         plan=plan,

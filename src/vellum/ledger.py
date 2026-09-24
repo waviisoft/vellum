@@ -502,6 +502,7 @@ def _announce_finish(checkout, ledger_dir, sha: str, item: dict, issue: int, pr:
         new_announcement,
         set_announcement,
     )
+    from vellum.config import config_path as _config_path
 
     try:
         to = addressee_for_ledger(checkout, ledger_dir)
@@ -512,6 +513,20 @@ def _announce_finish(checkout, ledger_dir, sha: str, item: dict, issue: int, pr:
                 f"addressed: {exc} Nothing is dispatched for it until an addressee "
                 f"can be read (spec/features/continuous-engineering.md)."
             )
+        # S4 exits non-zero on a *declared but incomplete* role graph — a
+        # checkout that named its roles and still leaves this tree unheld, or
+        # two roles claiming it. A checkout with no `.vellum/config.yaml` at
+        # all has not declared anything, which is not the same fact: it has
+        # not opted into continuous engineering, and `ledger advance --pr`
+        # must keep recording a run's end for it exactly as it always has,
+        # rather than gate ordinary ledger bookkeeping behind a feature
+        # nobody turned on.
+        try:
+            configured = _config_path(checkout).is_file()
+        except OSError:
+            configured = False
+        if not configured:
+            return None
         return exc
     changed = set_announcement(item, new_announcement(
         "finished", to,
