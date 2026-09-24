@@ -38,9 +38,11 @@ class ChainCase(unittest.TestCase):
         return sha
 
     def item(self, sha, issue=1, pr=None, satisfies=("scenario:billing",), **kwargs):
+        # announce=False: this fixture declares no write_boundaries, and the
+        # chain is the subject here, not who a finished run addresses.
         advance(
             self.ledger, sha, issue=issue, title=f"Implement {issue}", repo="app",
-            satisfies=list(satisfies), pr=pr, **kwargs
+            satisfies=list(satisfies), pr=pr, announce=False, **kwargs
         )
 
     def kinds(self, chain):
