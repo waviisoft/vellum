@@ -62,6 +62,11 @@ from vellum.specfile import (
 #: gone — it was always the commit extracted at, which is now ``spec_version``.
 SUITE_SCHEMA = 2
 
+#: ``vellum suite extract --format``. ``vellum`` is ``suite.json``'s own shape
+#: (the default, unchanged by this); ``covsel`` is covsel's inventory contract
+#: (waviisoft/vellum#31 item 1) — see ``to_covsel_dict``.
+SUITE_FORMATS = ("vellum", "covsel")
+
 
 @dataclass
 class SuiteEntry:
@@ -128,6 +133,13 @@ class Suite:
     names: dict[str, str] = field(default_factory=dict)
     #: True when the clone's history is truncated, so dating may be wrong.
     shallow: bool = False
+    #: The spec tree's path within its repo, e.g. ``spec`` — empty when the
+    #: spec tree is the repo root, empty too when the tree has no readable git
+    #: history (``prefix_of`` needs a repo root, same as dating does). Every
+    #: entry's ``relpath`` is relative to this; a consumer resolving files
+    #: against the repo rather than the spec tree, as covsel does, joins the
+    #: two — see ``to_covsel_dict``.
+    prefix: str = ""
 
 
 @dataclass
@@ -397,10 +409,12 @@ def extract(spec_dir: str | Path) -> Suite:
     head = None
     decorations: dict[str, str] = {}
     shallow = False
+    prefix = ""
     try:
         repo = repo_root(root)
+        prefix = prefix_of(repo, root)
         head = head_commit(repo)
-        history = version_history(repo, prefix_of(repo, root), ref=head or "HEAD")
+        history = version_history(repo, prefix, ref=head or "HEAD")
         decorations = names(repo)
         shallow = is_shallow(repo)
     except (GitUnavailable, ValueError):
@@ -433,6 +447,7 @@ def extract(spec_dir: str | Path) -> Suite:
             if sha in decorations
         },
         shallow=shallow,
+        prefix=prefix,
     )
 
 
@@ -481,7 +496,49 @@ def to_dict(suite: Suite) -> dict:
     }
 
 
-def run(spec_dir: str, out_path: str = "suite.json", out=None) -> int:
+def to_covsel_dict(suite: Suite) -> dict:
+    """*suite* in covsel's inventory shape (waviisoft/vellum#31 item 1):
+
+    ``{"source": <harness commit>, "entries": [{"id": {"file", "name"},
+    "version"}, …]}``.
+
+    ``source`` is the checkout's HEAD (``suite.spec_version``): in an intent
+    checkout the harness and the spec share a repository, so HEAD is the
+    harness commit covsel asks for, and it is None exactly when
+    ``suite.json``'s own ``spec_version`` would be — a tree with no readable
+    git history. A dirty working tree still has a HEAD, and that commit is
+    what is reported; an uncommitted *new* scenario has no ``version`` at all
+    and is emitted pending, below.
+
+    ``file`` is ``suite.prefix`` joined to the entry's spec-relative path, so
+    it reads ``spec/features/agenda.md`` — relative to the checkout covsel
+    resolves entries against — rather than ``suite.json``'s own
+    ``features/agenda.md``, relative to the spec tree alone.
+
+    A pending entry (``suite.json``'s ``pending: true``, no committed
+    version) is emitted with no ``version`` key at all, so covsel always
+    selects it, per the issue. An entry with no ``@id:`` has no stable name
+    to key it by — ``extract`` tolerates a missing id where lint (GH005/GH006)
+    would refuse it, see ``scan_file`` — and is left out rather than emitted
+    with ``name: null``.
+    """
+    return {
+        "source": suite.spec_version,
+        "entries": [
+            {
+                "id": {
+                    "file": f"{suite.prefix}/{e.relpath}" if suite.prefix else e.relpath,
+                    "name": e.id,
+                },
+                **({} if e.pending else {"version": e.version}),
+            }
+            for e in suite.entries
+            if e.id
+        ],
+    }
+
+
+def run(spec_dir: str, out_path: str = "suite.json", out=None, fmt: str = "vellum") -> int:
     """Write ``suite.json`` (or stdout when *out_path* is ``-``).
 
     Exits 1 without writing anything when a block in the tree would drop
@@ -491,7 +548,15 @@ def run(spec_dir: str, out_path: str = "suite.json", out=None) -> int:
     Every word of a refusal goes to stderr, including when *out_path* is ``-``:
     stdout carries the suite and nothing else, so ``extract … -o - | jq`` sees
     an empty stream rather than diagnostics parsed as JSON.
+
+    *fmt* is ``suite.json``'s own shape by default; ``"covsel"`` emits
+    ``to_covsel_dict`` instead (``SUITE_FORMATS``). Checked here too, not
+    carried by the CLI's ``--format`` choices alone — a caller of the library
+    gets the same refusal a bad invocation would.
     """
+    if fmt not in SUITE_FORMATS:
+        raise ValueError(f"unknown suite format {fmt!r}; choose one of {SUITE_FORMATS}")
+
     try:
         suite = extract(spec_dir)
     except DroppedScenarios as exc:
@@ -507,7 +572,8 @@ def run(spec_dir: str, out_path: str = "suite.json", out=None) -> int:
         )
         return 1
 
-    payload = json.dumps(to_dict(suite), indent=2) + "\n"
+    body = to_covsel_dict(suite) if fmt == "covsel" else to_dict(suite)
+    payload = json.dumps(body, indent=2) + "\n"
     if out_path == "-":
         (out or sys.stdout).write(payload)
     else:

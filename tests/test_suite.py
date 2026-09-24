@@ -26,10 +26,12 @@ from vellum.gherkin_blocks import Step, parse_block, split_documents
 from vellum.lint import lint_tree
 from vellum.specfile import find_fences
 from vellum.suite import (
+    SUITE_SCHEMA,
     DroppedScenarios,
     extract,
     fingerprint,
     scenarios_in,
+    to_covsel_dict,
     to_dict,
 )
 
@@ -991,6 +993,162 @@ class TestPinnedSpecTree(unittest.TestCase):
 
     def test_suite_is_json_serialisable(self):
         json.loads(json.dumps(self.suite))
+
+    def test_the_covsel_format_extracts_against_the_pinned_tree_too(self):
+        # A smoke test against the real intent checkout, not a re-assertion of
+        # the shape — TestCovselFormat below covers that against throwaway
+        # repos it controls. This just proves `to_covsel_dict` survives the
+        # tree `--format covsel` will actually be pointed at in CI.
+        covsel = to_covsel_dict(extract(intent_checkout()))
+        self.assertEqual(covsel["source"], pinned_commit())
+        self.assertEqual(len(covsel["entries"]), self.suite["scenario_count"])
+        for entry in covsel["entries"]:
+            self.assertTrue(entry["id"]["file"].startswith("spec/"))
+            self.assertIn("version", entry)  # nothing is pending at the pin
+
+
+class TestCovselFormat(unittest.TestCase):
+    """``--format covsel`` — waviisoft/vellum#31 item 1: covsel's inventory shape.
+
+    ``vellum suite extract <intent-checkout> --format covsel`` emits
+    ``{"source": <harness commit>, "entries": [{"id": {"file", "name"},
+    "version"}, …]}``. covsel#123's own contract text (waviisoft/covsel) was
+    not reachable from this session — its issue tracker is outside this
+    session's GitHub scope, and its repository code does not yet reflect
+    #122/#123/#125, which are still open — so this is built to the shape
+    waviisoft/vellum#31 itself gives, reusing ``suite.json``'s own
+    ``id``/``version``/``pending`` rather than re-deriving anything.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = make_spec_repo(Path(self.tmp.name))
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_a_committed_scenario_carries_its_id_file_and_version(self):
+        first = commit_area(self.repo, ONE)
+        covsel = to_covsel_dict(extract(self.repo / "spec"))
+        self.assertEqual(covsel["source"], first)
+        self.assertEqual(
+            covsel["entries"],
+            [
+                {
+                    "id": {
+                        "file": "spec/features/auth.md",
+                        "name": "login-good-password",
+                    },
+                    "version": first,
+                }
+            ],
+        )
+
+    def test_a_pending_scenario_is_emitted_without_a_version_key(self):
+        commit_area(self.repo, ONE)
+        write_area(
+            self.repo,
+            ONE + "\n\n  @id:login-locked-out\n  Scenario: Locked out\n"
+                  "    Given five failures\n    Then they are locked",
+        )
+        covsel = to_covsel_dict(extract(self.repo / "spec"))
+        pending = next(e for e in covsel["entries"] if e["id"]["name"] == "login-locked-out")
+        self.assertNotIn("version", pending)
+        # The already-committed sibling is unaffected: it still carries one.
+        committed = next(e for e in covsel["entries"] if e["id"]["name"] == "login-good-password")
+        self.assertIn("version", committed)
+
+    def test_source_is_the_checkouts_head_even_with_a_dirty_tree(self):
+        # A dirty tree still has a HEAD, and that commit is what `source`
+        # reports — the issue's "harness commit", read from the checkout
+        # `extract` was pointed at. An uncommitted *new* scenario has no
+        # version and is emitted pending regardless (previous test). An
+        # uncommitted *edit to an already-committed* scenario's steps is a
+        # pre-existing suite.py limitation, not something this change touches:
+        # `history.by_id` matches by scenario id and hands back the last
+        # *committed* version without comparing it against the working tree's
+        # current fingerprint, so such an edit keeps its old version rather
+        # than turning pending. `to_covsel_dict` only ever reports whatever
+        # `extract()` already decided.
+        first = commit_area(self.repo, ONE)
+        write_area(self.repo, ONE.replace("the dashboard", "the dashboard, fast"))
+        suite = extract(self.repo / "spec")
+        covsel = to_covsel_dict(suite)
+        self.assertEqual(covsel["source"], first)
+        self.assertFalse(suite.entries[0].pending)
+        self.assertEqual(covsel["entries"][0]["version"], first)
+
+    def test_file_is_relative_to_the_checkout_not_the_spec_tree(self):
+        # suite.json's own `file` is spec-relative ("features/auth.md");
+        # covsel#123's own example is checkout-relative
+        # ("spec/features/agenda.md"). covsel resolves entries against the
+        # harness checkout it is pointed at, where the spec lives under
+        # `spec/`, so the prefix is put back on here.
+        commit_area(self.repo, ONE)
+        suite = extract(self.repo / "spec")
+        self.assertEqual(suite.entries[0].relpath, "features/auth.md")
+        covsel = to_covsel_dict(suite)
+        self.assertEqual(covsel["entries"][0]["id"]["file"], "spec/features/auth.md")
+
+    def test_an_id_less_scenario_has_no_stable_name_and_is_left_out(self):
+        # extract() tolerates a missing `@id:` — lint (GH005/GH006) refuses
+        # it, extract is deliberately not a second lint (see scan_file). A
+        # covsel entry needs a stable name to key it by, so such a scenario is
+        # left out of the inventory rather than emitted with `name: null`.
+        commit_area(self.repo, "Feature: F\n  Scenario: No id\n    Given a")
+        covsel = to_covsel_dict(extract(self.repo / "spec"))
+        self.assertEqual(covsel["entries"], [])
+
+    def test_the_default_vellum_format_is_unchanged(self):
+        commit_area(self.repo, ONE)
+        code, out = run_cli(["suite", "extract", str(self.repo / "spec"), "-o", "-"])
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        self.assertEqual(payload["schema"], SUITE_SCHEMA)
+        self.assertEqual(payload["scenarios"][0]["file"], "features/auth.md")
+        self.assertNotIn("source", payload)
+        self.assertNotIn("entries", payload)
+
+    def test_the_cli_emits_the_covsel_shape_with_format_covsel(self):
+        first = commit_area(self.repo, ONE)
+        code, out = run_cli(
+            ["suite", "extract", str(self.repo / "spec"), "--format", "covsel", "-o", "-"]
+        )
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        self.assertEqual(payload, {
+            "source": first,
+            "entries": [
+                {
+                    "id": {"file": "spec/features/auth.md", "name": "login-good-password"},
+                    "version": first,
+                }
+            ],
+        })
+
+    def test_the_cli_refuses_an_unknown_format(self):
+        # argparse refuses the choice and exits 2 itself — the same code a
+        # bad invocation gets elsewhere in this CLI.
+        with self.assertRaises(SystemExit) as caught:
+            run_cli(["suite", "extract", str(self.repo / "spec"), "--format", "yaml", "-o", "-"])
+        self.assertEqual(caught.exception.code, 2)
+
+    def test_the_library_refuses_an_unknown_format_too(self):
+        # The same rule below the CLI, so it is not carried by `choices` alone.
+        from vellum.suite import run as suite_run
+
+        commit_area(self.repo, ONE)
+        with self.assertRaises(ValueError):
+            suite_run(str(self.repo / "spec"), "-", fmt="yaml")
+
+    def test_a_refusal_writes_nothing_in_covsel_format_either(self):
+        # DroppedScenarios is format-agnostic: a tree that would drop
+        # scenarios refuses before either shape is built.
+        code, out, err = run_cli_streams(
+            ["suite", "extract", str(FIXTURES / "bad-gherkin-mixed"),
+             "--format", "covsel", "-o", "-"]
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("features/mixed.md", err)
 
 
 if __name__ == "__main__":

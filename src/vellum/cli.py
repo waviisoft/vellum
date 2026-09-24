@@ -132,6 +132,7 @@ from vellum.tag import TagError, TagRefused
 from vellum.tag import run_tag
 from vellum.reconcile import run as tick_run
 from vellum.specfile import SpecTreeError
+from vellum.suite import SUITE_FORMATS
 from vellum.suite import run as suite_run
 
 
@@ -157,6 +158,13 @@ def build_parser() -> argparse.ArgumentParser:
     extract.add_argument("spec_dir", help="the spec tree, or the intent repo containing it")
     extract.add_argument(
         "-o", "--output", default="suite.json", help="output path, or - for stdout"
+    )
+    extract.add_argument(
+        "--format",
+        choices=SUITE_FORMATS,
+        default="vellum",
+        help="output shape: suite.json's own (default), or covsel's inventory "
+             "contract (waviisoft/vellum#31)",
     )
     part = suite_sub.add_parser(
         "partition",
@@ -1605,7 +1613,7 @@ def _suite(args: argparse.Namespace) -> int:
             suite_path=args.suite_path,
             as_json=args.json,
         )
-    return suite_run(args.spec_dir, args.output)
+    return suite_run(args.spec_dir, args.output, fmt=args.format)
 
 
 def _release(args: argparse.Namespace) -> int:
