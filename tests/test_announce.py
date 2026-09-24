@@ -294,19 +294,21 @@ class FinishingAnnounces(unittest.TestCase):
             self.assertIsNotNone(announced, _item(repo))
             self.assertEqual(announced["kind"], "finished")
             self.assertEqual(announced["to"], "librarian")
-            # S3: `ledger advance --pr` delivers in the same act `announce
-            # finished` does — no tick or transport needed to reach `to`.
-            self.assertIs(announced["dispatched"], True)
+            # K3: `ledger advance --pr` records and addresses it, but leaves
+            # `dispatched: false` by default — `deliver`/`tick` (or --json)
+            # perform and report the actual dispatch, so the event is never
+            # marked delivered without anything emitting it.
+            self.assertIs(announced["dispatched"], False)
             self.assertIn("7", announced["asks"])
 
-    def test_reporting_a_pull_request_says_it_dispatched_in_its_note(self):
-        """S3: the printed note is accurate about what actually happened."""
+    def test_reporting_a_pull_request_says_so_accurately_in_its_note(self):
+        """The printed note is accurate about what actually happened (S3)."""
         with tempfile.TemporaryDirectory() as tmp:
             repo = _intent(Path(tmp))
             code, said = _finish(repo)
             self.assertEqual(code, 0, said)
-            self.assertIn("dispatched", said)
             self.assertIn("librarian", said)
+            self.assertIn("deliver", said.lower())
 
     def test_an_item_that_did_not_finish_announces_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -409,7 +411,7 @@ class DirectionAnnounces(unittest.TestCase):
             code, said = _finish(repo)
             self.assertEqual(code, 0, said)
             self.assertEqual(_item(repo)["announced"]["kind"], "finished")
-            self.assertIs(_item(repo)["announced"]["dispatched"], True)
+            self.assertIs(_item(repo)["announced"]["dispatched"], False)
             observed = self._observed(root, directions=[
                 {"version": VERSION, "item": SUBJECT, "briefing": OWNER_REVIEW}])
             payload = _tick(repo, "--observed", str(observed))
@@ -719,21 +721,22 @@ class AnnouncementsToDifferentRolesBothDeliver(unittest.TestCase):
             _record_handoff(repo, "--no-dispatch")
             self.assertIs(_item(repo)["announced"]["dispatched"], False)
             self.assertEqual(_item(repo)["announced"]["to"], "harness-engineer")
-            # The same item also reports a pull request (to librarian), which
-            # `ledger advance --pr` delivers immediately (S3).
+            # The same item also reports a pull request (to librarian).
             code, said = _finish(repo)
             self.assertEqual(code, 0, said)
             self.assertEqual(_item(repo)["announced"]["to"], "librarian")
-            self.assertIs(_item(repo)["announced"]["dispatched"], True)
+            self.assertIs(_item(repo)["announced"]["dispatched"], False)
             # The handoff must not have been lost: it is still there, pending.
             pending = _item(repo).get("announced_pending") or []
             self.assertEqual(len(pending), 1, _item(repo))
             self.assertEqual(pending[0]["to"], "harness-engineer")
             self.assertIs(pending[0]["dispatched"], False)
-            # A tick delivers it — both roles end up dispatched.
+            # A tick delivers both — the finished announcement and the
+            # queued, previously-undelivered handoff.
             payload = _tick(repo)
             addressed = {a["role"] for a in _addressed(payload, SUBJECT)}
-            self.assertEqual(addressed, {"harness-engineer"}, payload["actions"])
+            self.assertEqual(addressed, {"harness-engineer", "librarian"},
+                             payload["actions"])
 
     def test_the_pending_queue_is_cleared_once_delivered(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -781,11 +784,15 @@ class DirectionRecordsAndDeliversInOneAct(unittest.TestCase):
 
 
 class LedgerAdvanceAddressesExplicitly(unittest.TestCase):
-    """S4: the addressee comes from an explicitly named checkout, never a
-    guess at `--ledger-dir`'s parent; S3: it delivers in the same act.
+    """Corrected S4 ruling: the default checkout is the git work tree
+    containing --ledger-dir (never cwd, never a textual parent guess); when
+    still no addressee can be found, `ledger advance --pr` records the state
+    change and an undelivered announcement, warns, and exits 0 — it must
+    never fail a state change over an address it could not compute. Only the
+    explicit `announce finished` keeps refusing outright.
     """
 
-    def test_no_declared_holder_exits_non_zero_rather_than_a_stderr_note(self):
+    def test_no_declared_holder_records_undelivered_and_exits_zero(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = make_git_intent_repo(Path(tmp), boundaries={})
             open_code, _ = run_cli(["ledger", "open", "--version", VERSION,
@@ -803,19 +810,19 @@ class LedgerAdvanceAddressesExplicitly(unittest.TestCase):
                 str(repo / "ledger"), "--checkout", str(repo), "--item",
                 str(SUBJECT), "--pr", "7",
             ])
-            self.assertNotEqual(code, 0, said)
-            # The item's own state is still recorded despite the refusal.
+            self.assertEqual(code, 0, said)
+            self.assertIn("undelivered", said)
             self.assertEqual(_item(repo)["pr"], 7)
+            announced = _item(repo)["announced"]
+            self.assertEqual(announced["to"], "")
+            self.assertIs(announced["dispatched"], False)
 
     def test_a_checkout_with_no_config_at_all_keeps_pr_reporting_working(self):
         """Found running the intent repo's own acceptance suite against this
         fix round: certification, chain-resolution and release scenarios all
         call `ledger advance --pr` against sandboxes that carry no
         `.vellum/config.yaml` at all, because they have nothing to do with
-        continuous engineering. S4's exit-non-zero is for an installation that
-        *declared* roles and still leaves a tree unheld or doubly held — not
-        for one that has not adopted roles at all, which must keep recording a
-        run's end exactly as it always could.
+        continuous engineering.
         """
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "intent"
@@ -839,37 +846,13 @@ class LedgerAdvanceAddressesExplicitly(unittest.TestCase):
             ])
             self.assertEqual(code, 0, said)
             self.assertEqual(_item(repo)["pr"], 7)
-            self.assertIsNone(_item(repo).get("announced"))
+            self.assertEqual(_item(repo)["announced"]["to"], "")
 
-    def test_no_checkout_flag_defaults_to_the_ledger_dirs_parent(self):
-        """The CLI's own convenience default for callers that never pass
-        `--checkout` at all — the harness among them — so the ordinary
-        `<checkout>/ledger` shape keeps working exactly as before, while
-        `advance()` itself (the library call) never guesses internally.
-        """
+    def test_a_ledger_dir_outside_any_git_work_tree_also_softens(self):
         with tempfile.TemporaryDirectory() as tmp:
-            repo = _intent(Path(tmp))
-            code, said = run_cli([
-                "ledger", "advance", "--version", VERSION, "--ledger-dir",
-                str(repo / "ledger"), "--item", str(SUBJECT), "--pr", "7",
-            ])
-            self.assertEqual(code, 0, said)
-            self.assertEqual(_item(repo)["announced"]["to"], "librarian")
-            self.assertIs(_item(repo)["announced"]["dispatched"], True)
-
-    def test_the_checkout_is_never_guessed_from_the_ledger_dirs_parent(self):
-        """The old code guessed the checkout as `ledger_dir`'s own parent —
-        right by accident whenever the ledger sits directly under the
-        checkout, and wrong the moment it does not: `ledger_dir`'s parent here
-        (`<repo>/shared`) carries no installation config at all, and only
-        naming the real checkout explicitly with `--checkout` resolves it.
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = make_git_intent_repo(Path(tmp), boundaries={
-                "harness-engineer": ["harness"],
-                "librarian": ["shared/ledger", ".vellum/memory"],
-            })
-            ledger_dir = repo / "shared" / "ledger"
+            # Not a git repo at all — `git -C <ledger_dir> rev-parse
+            # --show-toplevel` fails outright.
+            ledger_dir = Path(tmp) / "loose" / "ledger"
             code, _ = run_cli(["ledger", "open", "--version", VERSION,
                                "--ledger-dir", str(ledger_dir), "--approved", NOW])
             self.assertEqual(code, 0)
@@ -881,14 +864,162 @@ class LedgerAdvanceAddressesExplicitly(unittest.TestCase):
             self.assertEqual(code, 0, said)
             code, said = run_cli([
                 "ledger", "advance", "--version", VERSION, "--ledger-dir",
-                str(ledger_dir), "--checkout", str(repo), "--item",
+                str(ledger_dir), "--item", str(SUBJECT), "--pr", "7",
+            ])
+            self.assertEqual(code, 0, said)
+            self.assertIn("not inside a git work tree", said)
+            record = load(record_path(ledger_dir, VERSION))
+            item = find_item(record, SUBJECT)
+            self.assertEqual(item["pr"], 7)
+            self.assertEqual(item["announced"]["to"], "")
+
+    def test_no_checkout_flag_defaults_to_the_git_toplevel(self):
+        """The corrected default — the git work tree containing --ledger-dir
+        — so the harness's own call (no `--checkout` at all) keeps working.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            code, said = run_cli([
+                "ledger", "advance", "--version", VERSION, "--ledger-dir",
+                str(repo / "ledger"), "--item", str(SUBJECT), "--pr", "7",
+            ])
+            self.assertEqual(code, 0, said)
+            self.assertEqual(_item(repo)["announced"]["to"], "librarian")
+
+    def test_checkout_flag_overrides_the_git_toplevel_default(self):
+        """`ledger_dir` here sits inside `outer/nested`, a plain directory
+        with its own installation config but no git history of its own — the
+        *git* work tree containing it is `outer`, which declares nothing.
+        Only naming `--checkout outer/nested` explicitly resolves it.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            from support import write_intent_config
+
+            outer = Path(tmp) / "outer"
+            outer.mkdir(parents=True)
+            git(outer, "init", "-q", "-b", "main", ".")
+            nested = outer / "nested"
+            write_intent_config(nested, boundaries={
+                "harness-engineer": ["harness"],
+                "librarian": ["ledger", ".vellum/memory"],
+            })
+            commit_files(outer, {}, "start")
+            ledger_dir = nested / "ledger"
+            code, _ = run_cli(["ledger", "open", "--version", VERSION,
+                               "--ledger-dir", str(ledger_dir), "--approved", NOW])
+            self.assertEqual(code, 0)
+            code, said = run_cli([
+                "ledger", "advance", "--version", VERSION, "--ledger-dir",
+                str(ledger_dir), "--item", str(SUBJECT), "--title", "t",
+                "--repo", "app", "--item-state", "planned",
+            ])
+            self.assertEqual(code, 0, said)
+            # Without --checkout: the git toplevel is `outer`, which declares
+            # no roles at all, so the announcement is recorded undelivered.
+            code, said = run_cli([
+                "ledger", "advance", "--version", VERSION, "--ledger-dir",
+                str(ledger_dir), "--item", str(SUBJECT), "--pr", "7",
+            ])
+            self.assertEqual(code, 0, said)
+            record = load(record_path(ledger_dir, VERSION))
+            self.assertEqual(find_item(record, SUBJECT)["announced"]["to"], "")
+            # With --checkout naming `nested` explicitly: resolves.
+            code, said = run_cli([
+                "ledger", "advance", "--version", VERSION, "--ledger-dir",
+                str(ledger_dir), "--checkout", str(nested), "--item",
                 str(SUBJECT), "--pr", "7",
             ])
             self.assertEqual(code, 0, said)
             record = load(record_path(ledger_dir, VERSION))
-            item = find_item(record, SUBJECT)
-            self.assertEqual(item["announced"]["to"], "librarian")
-            self.assertIs(item["announced"]["dispatched"], True)
+            self.assertEqual(find_item(record, SUBJECT)["announced"]["to"], "librarian")
+
+    def test_json_delivers_in_the_same_act(self):
+        """K3: `--json` is the opt-in for eager delivery — reporting the
+        dispatch the way `announce finished --json` does — because marking
+        `dispatched` with nothing printed anywhere would lose the event.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            code, out, err = run_cli_streams([
+                "ledger", "advance", "--version", VERSION, "--ledger-dir",
+                str(repo / "ledger"), "--item", str(SUBJECT), "--pr", "7",
+                "--json",
+            ])
+            self.assertEqual(code, 0, out + err)
+            payload = json.loads(out)
+            addressed = _addressed(payload, SUBJECT)
+            self.assertEqual(len(addressed), 1, payload)
+            self.assertEqual(addressed[0]["role"], "librarian")
+            self.assertIs(_item(repo)["announced"]["dispatched"], True)
+
+    def test_without_json_dispatched_stays_false_for_tick_to_deliver(self):
+        """The default: recorded, left pending, and a following `vellum tick`
+        — not `ledger advance` itself — is what shows the addressed dispatch.
+        This is the exact shape waviisoft/vellum-intent's
+        `a-finished-run-dispatches-who-commissioned-it` scenario drives.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            code, said = run_cli([
+                "ledger", "advance", "--version", VERSION, "--ledger-dir",
+                str(repo / "ledger"), "--item", str(SUBJECT), "--pr", "7",
+            ])
+            self.assertEqual(code, 0, said)
+            self.assertIs(_item(repo)["announced"]["dispatched"], False)
+            payload = _tick(repo)
+            addressed = _addressed(payload, SUBJECT)
+            self.assertEqual(len(addressed), 1, payload["actions"])
+            self.assertEqual(addressed[0]["role"], "librarian")
+
+    def test_announce_finished_still_refuses_outright_with_no_addressee(self):
+        """Only the implicit announcement inside `ledger advance` softens —
+        the explicit `announce finished` command keeps exiting non-zero.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_git_intent_repo(Path(tmp), boundaries={})
+            run_cli(["ledger", "open", "--version", VERSION, "--ledger-dir",
+                     str(repo / "ledger"), "--approved", NOW])
+            run_cli(["ledger", "advance", "--version", VERSION, "--ledger-dir",
+                     str(repo / "ledger"), "--item", str(SUBJECT), "--title",
+                     "t", "--repo", "app", "--item-state", "planned"])
+            code, out, err = run_cli_streams(
+                ["announce", "finished", str(repo), "--version", VERSION,
+                 "--ledger-dir", str(repo / "ledger"), "--item", str(SUBJECT),
+                 "--pr", "7"])
+            self.assertNotEqual(code, 0, out + err)
+
+    def test_a_retry_after_fixing_the_config_still_announces(self):
+        """K3: the decision to (re-)attempt addressing is based on the
+        announcement's own state, not on whether --pr's number changed — a
+        second call with the *same* pr, now that config declares a holder,
+        must still succeed.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_git_intent_repo(Path(tmp), boundaries={})
+            run_cli(["ledger", "open", "--version", VERSION, "--ledger-dir",
+                     str(repo / "ledger"), "--approved", NOW])
+            run_cli(["ledger", "advance", "--version", VERSION, "--ledger-dir",
+                     str(repo / "ledger"), "--item", str(SUBJECT), "--title",
+                     "t", "--repo", "app", "--item-state", "planned"])
+            code, said = run_cli(["ledger", "advance", "--version", VERSION,
+                                  "--ledger-dir", str(repo / "ledger"),
+                                  "--checkout", str(repo), "--item",
+                                  str(SUBJECT), "--pr", "7"])
+            self.assertEqual(code, 0, said)
+            self.assertEqual(_item(repo)["announced"]["to"], "")
+
+            from support import write_intent_config
+
+            write_intent_config(repo, boundaries={
+                "librarian": ["ledger", ".vellum/memory"],
+            })
+            commit_files(repo, {}, "declare roles")
+            code, said = run_cli(["ledger", "advance", "--version", VERSION,
+                                  "--ledger-dir", str(repo / "ledger"),
+                                  "--checkout", str(repo), "--item",
+                                  str(SUBJECT), "--pr", "7"])
+            self.assertEqual(code, 0, said)
+            self.assertEqual(_item(repo)["announced"]["to"], "librarian")
 
 
 # --------------------------------------------------------------------- S5
@@ -1291,6 +1422,26 @@ class FinishedToIsValidatedAndNeverSelfDispatches(unittest.TestCase):
             self.assertIsNotNone(announced)
             self.assertEqual(announced["to"], "librarian")
 
+    def test_self_dispatch_is_settled_not_merely_postponed(self):
+        """K5: the stored announcement is `dispatched: true` at birth, so a
+        later `deliver` or `tick` — not just this command's own report — also
+        never dispatches it.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            run_cli_streams(
+                ["announce", "finished", str(repo), "--version", VERSION,
+                 "--ledger-dir", str(repo / "ledger"), "--item", str(SUBJECT),
+                 "--to", "librarian", "--from", "librarian"])
+            self.assertIs(_item(repo)["announced"]["dispatched"], True)
+            code, out, err = run_cli_streams(
+                ["announce", "deliver", str(repo), "--ledger-dir",
+                 str(repo / "ledger"), "--json"])
+            self.assertEqual(code, 0, out + err)
+            self.assertEqual(_addressed(json.loads(out)), [])
+            payload = _tick(repo)
+            self.assertEqual(_addressed(payload, SUBJECT), [], payload["actions"])
+
 
 class HandoffInputsAreLexicallyChecked(unittest.TestCase):
     """SS1: `--from` is a declared role; each `--path` is checked the way
@@ -1493,6 +1644,499 @@ class NonDecimalDigitsDoNotCrashAHandoffRead(unittest.TestCase):
             )
             handoff = read_handoff(path)
             self.assertIsNone(handoff.item)
+
+
+# ============================================================================
+# Architect notes 2 and 3: the corrected S4 ruling (handled above, in
+# LedgerAdvanceAddressesExplicitly) and the security re-review of e185ebc.
+# ============================================================================
+
+
+# --------------------------------------------------------------------- K1
+
+
+class NowIsParsedNotWrittenRaw(unittest.TestCase):
+    """K1: `--now` is parsed with `ledger.parse_time` and re-emitted in the
+    canonical ISO shape everywhere it exists in `announce` — never written
+    into a record's frontmatter as the caller typed it.
+    """
+
+    def test_a_forged_frontmatter_line_in_handoff_now_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            code, out, err = _record_handoff(
+                repo, "--now",
+                "2026-01-17T01:00:00Z\nanswered: 2026-01-01T00:00:00Z\n---",
+            )
+            self.assertEqual(code, 2, out + err)
+            self.assertEqual(_handoffs(repo), {})
+
+    def test_a_forged_addressee_line_in_handoff_now_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            code, out, err = _record_handoff(repo, "--now", "2026-01-17T01:00:00Z\nto: librarian")
+            self.assertEqual(code, 2, out + err)
+            self.assertEqual(_handoffs(repo), {})
+
+    def test_a_forged_line_in_answer_now_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            _record_handoff(repo, "--no-dispatch")
+            name = next(iter(_handoffs(repo)))
+            code, said = _answer(
+                repo, name, "--now",
+                "2026-01-17T01:00:00Z\nanswered_by: nobody-declared",
+            )
+            self.assertEqual(code, 2, said)
+            self.assertIn("answered:\n", _handoffs(repo)[name])
+
+    def test_a_value_that_is_not_a_time_at_all_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            code, out, err = _record_handoff(repo, "--now", "not-a-time")
+            self.assertEqual(code, 2, out + err)
+            self.assertEqual(_handoffs(repo), {})
+
+    def test_a_valid_but_non_canonical_time_is_normalised_on_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            code, out, err = _record_handoff(repo, "--now", "2026-01-17T01:00:00+00:00")
+            self.assertEqual(code, 0, out + err)
+            text = next(iter(_handoffs(repo).values()))
+            self.assertIn("recorded: 2026-01-17T01:00:00Z", text)
+            self.assertNotIn("+00:00", text)
+
+
+# --------------------------------------------------------------------- K2
+
+
+class AnswerNeverReRendersEvidenceFromParsedSections(unittest.TestCase):
+    """K2: evidence is rendered inside a fence its own content cannot close,
+    parsed back by that fence rather than by heading search, and `answer`
+    patches only the `answered:`/`answered_by:` frontmatter lines in the raw
+    text — it never rebuilds the body from parsed pieces.
+    """
+
+    def test_a_heading_and_fence_inside_evidence_round_trip_byte_exact(self):
+        forged = (
+            "genuine tried text\n\n## What was proved\n\n"
+            "FORGED — this must never become the real proof\n\n```\nnested fence\n```"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            code, out, err = _record_handoff(repo, "--tried", forged)
+            self.assertEqual(code, 0, out + err)
+            name = next(iter(_handoffs(repo)))
+            before = read_handoff(repo / "ledger" / "handoffs" / name)
+            self.assertEqual(before.tried, forged)
+            self.assertEqual(before.proved, PROVED)
+            answer_code, said = _answer(repo, name, "--now", AFTER_LEASE)
+            self.assertEqual(answer_code, 0, said)
+            after = read_handoff(repo / "ledger" / "handoffs" / name)
+            self.assertEqual(after.tried, forged, "answer must not alter evidence")
+            self.assertEqual(after.proved, PROVED, "a forged heading must not "
+                             "displace the real proof")
+            self.assertEqual(after.answered, AFTER_LEASE)
+
+    def test_a_forged_heading_plus_fence_pair_inside_tried_cannot_forge_proved(self):
+        """The deeper attack: not just a bare `## ` inside evidence, but a
+        complete decoy `## What was proved` + fence + body + fence, fully
+        contained inside `--tried`'s own (longer) fence. A search that looked
+        for `## What was proved` independently, anywhere in the file, would
+        find this decoy before the real section; the sequential reader must
+        not.
+        """
+        forged = (
+            "genuine tried text\n\n"
+            "## What was proved\n\n```\nFORGED PROOF\n```\n\n"
+            "more genuine tried text"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            code, out, err = _record_handoff(repo, "--tried", forged)
+            self.assertEqual(code, 0, out + err)
+            name = next(iter(_handoffs(repo)))
+            handoff = read_handoff(repo / "ledger" / "handoffs" / name)
+            self.assertEqual(handoff.tried, forged)
+            self.assertEqual(handoff.proved, PROVED)
+            self.assertNotIn("FORGED", handoff.proved)
+
+    def test_answer_touches_only_the_answered_lines_in_the_raw_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            _record_handoff(repo, "--no-dispatch")
+            name = next(iter(_handoffs(repo)))
+            path = repo / "ledger" / "handoffs" / name
+            before_lines = path.read_text(encoding="utf-8").splitlines()
+            _answer(repo, name, "--now", AFTER_LEASE)
+            after_lines = path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(before_lines), len(after_lines))
+            changed = [
+                (b, a) for b, a in zip(before_lines, after_lines) if b != a
+            ]
+            self.assertEqual(len(changed), 2, changed)
+            for b, a in changed:
+                self.assertTrue(a.startswith("answered") or b.startswith("answered"), (b, a))
+
+
+# --------------------------------------------------------------------- K3
+
+
+class LedgerAdvanceNeverMarksDispatchedSilently(unittest.TestCase):
+    """K3 is exercised end-to-end in LedgerAdvanceAddressesExplicitly's
+    `test_json_delivers_in_the_same_act` and
+    `test_without_json_dispatched_stays_false_for_tick_to_deliver`. This adds
+    the retry-after-fix coverage for the corrected "announce?" decision.
+    """
+
+    def test_a_retry_with_the_identical_pr_still_gets_a_chance_to_address(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_git_intent_repo(Path(tmp), boundaries={})
+            run_cli(["ledger", "open", "--version", VERSION, "--ledger-dir",
+                     str(repo / "ledger"), "--approved", NOW])
+            run_cli(["ledger", "advance", "--version", VERSION, "--ledger-dir",
+                     str(repo / "ledger"), "--item", str(SUBJECT), "--title",
+                     "t", "--repo", "app", "--item-state", "planned"])
+            run_cli(["ledger", "advance", "--version", VERSION, "--ledger-dir",
+                     str(repo / "ledger"), "--checkout", str(repo), "--item",
+                     str(SUBJECT), "--pr", "7"])
+            self.assertEqual(_item(repo)["announced"]["to"], "")
+            from support import write_intent_config
+
+            write_intent_config(repo, boundaries={
+                "librarian": ["ledger", ".vellum/memory"],
+            })
+            commit_files(repo, {}, "declare roles")
+            # Same --pr 7 again — the old `reported = item.get("pr") != pr`
+            # gate would have skipped announcing entirely here.
+            code, said = run_cli(["ledger", "advance", "--version", VERSION,
+                                  "--ledger-dir", str(repo / "ledger"),
+                                  "--checkout", str(repo), "--item",
+                                  str(SUBJECT), "--pr", "7"])
+            self.assertEqual(code, 0, said)
+            self.assertEqual(_item(repo)["announced"]["to"], "librarian")
+
+
+# --------------------------------------------------------------------- K5
+
+
+# (see FinishedToIsValidatedAndNeverSelfDispatches.test_self_dispatch_is_settled_not_merely_postponed)
+
+
+# --------------------------------------------------------------------- K4
+
+
+class LedgerWritesAreLockedAndAtomic(unittest.TestCase):
+    """K4: every read-modify-write of a ledger record holds the shared lock,
+    and B1's replay repairs a lost update rather than trusting the record.
+    """
+
+    def test_concurrent_handoffs_on_different_items_lose_neither(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp), boundaries={
+                "harness-engineer": ["harness"],
+                "librarian": ["ledger", ".vellum/memory"],
+            })
+
+            def _raise(item, path):
+                return run_cli_streams(
+                    ["announce", "handoff", str(repo), "--version", VERSION,
+                     "--ledger-dir", str(repo / "ledger"), "--item", str(item),
+                     "--from", "librarian", "--asks", f"fix item {item}",
+                     "--tried", TRIED, "--observed", OBSERVED, "--proved", PROVED,
+                     "--path", path, "--no-dispatch"])
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(
+                    lambda pair: _raise(*pair),
+                    [(SUBJECT, "harness/steps.py"), (CONTROL, "harness/other.py")],
+                ))
+            for code, out, err in results:
+                self.assertEqual(code, 0, out + err)
+            self.assertIsNotNone(_item(repo, SUBJECT).get("announced"),
+                                 "item 1's announcement was lost to a concurrent write")
+            self.assertIsNotNone(_item(repo, CONTROL).get("announced"),
+                                 "item 2's announcement was lost to a concurrent write")
+
+    def test_a_replay_repairs_an_announcement_a_lost_update_dropped(self):
+        """The B1 early-return used to skip `record_announcement` entirely on
+        a match; now a replay still calls it, so a record whose `announced:`
+        was lost some other way (a hand edit, a lost update elsewhere) is
+        repaired by the next identical arrival rather than staying lost.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            _record_handoff(repo, "--no-dispatch")
+            path = record_path(repo / "ledger", VERSION)
+            record = load(path)
+            item = find_item(record, SUBJECT)
+            del item["announced"]
+            write(path, record)
+            self.assertIsNone(_item(repo).get("announced"))
+            code, out, err = _record_handoff(repo, "--no-dispatch")
+            self.assertEqual(code, 0, out + err)
+            self.assertIsNotNone(_item(repo)["announced"])
+            self.assertEqual(_item(repo)["announced"]["to"], "harness-engineer")
+
+    def test_ledger_write_leaves_no_temp_file_behind(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            _finish(repo)
+            names = [p.name for p in (repo / "ledger").iterdir()]
+            leftovers = [n for n in names if n.startswith(".") and VERSION in n]
+            self.assertEqual(leftovers, [], names)
+
+
+# --------------------------------------------------------------------- R2
+
+
+class LockFileNeverEntersTrackedLedgerTree(unittest.TestCase):
+    """R2: the lock lives under git's own directory, never inside the
+    tracked `ledger/` tree — a workflow that commits `ledger/` must never
+    pick it up, and `verify boundaries` must never count it as a crossing.
+    """
+
+    def test_git_status_is_clean_of_lock_files_after_a_deliver(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            run_cli(["announce", "finished", str(repo), "--version", VERSION,
+                     "--ledger-dir", str(repo / "ledger"), "--item", str(SUBJECT),
+                     "--to", "librarian", "--no-dispatch"])
+            code, out, err = run_cli_streams(
+                ["announce", "deliver", str(repo), "--ledger-dir",
+                 str(repo / "ledger"), "--json"])
+            self.assertEqual(code, 0, out + err)
+            status = git(repo, "status", "--porcelain")
+            self.assertNotIn("lock", status.lower())
+
+    def test_the_lock_is_not_inside_the_ledger_directory(self):
+        from vellum.ledger import _lock_path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            path = _lock_path(repo / "ledger")
+            self.assertNotEqual(path.parent.resolve(), (repo / "ledger").resolve())
+            self.assertIn(".git", path.parts)
+
+
+# --------------------------------------------------------------------- S2
+
+
+class HandoffIdentityUsesTheFullAsksAndVersion(unittest.TestCase):
+    """S2: identity hashes the full ask (not the 200-char truncation), and
+    resolves --version to the record's own full spec version first.
+    """
+
+    def test_two_asks_sharing_a_199_character_prefix_are_different_handoffs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            prefix = "x" * 199
+            code1, out1, err1 = _record_handoff(repo, "--asks", prefix + "A")
+            self.assertEqual(code1, 0, out1 + err1)
+            code2, out2, err2 = _record_handoff(repo, "--asks", prefix + "B")
+            self.assertEqual(code2, 0, out2 + err2)
+            self.assertEqual(len(_handoffs(repo)), 2, _handoffs(repo))
+
+    def test_an_abbreviated_version_does_not_mint_a_duplicate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            _record_handoff(repo)
+            argv_short = ["announce", "handoff", str(repo), "--version", VERSION[:10],
+                         "--ledger-dir", str(repo / "ledger"), "--item", str(SUBJECT),
+                         "--from", "librarian", "--asks", ASKS, "--tried", TRIED,
+                         "--observed", OBSERVED, "--proved", PROVED,
+                         "--path", "harness/steps.py", "--now", NOW]
+            code, out, err = run_cli_streams(argv_short)
+            self.assertEqual(code, 0, out + err)
+            self.assertEqual(len(_handoffs(repo)), 1, _handoffs(repo))
+
+
+# --------------------------------------------------------------------- S3
+
+
+class HandoffNumbersPastFourDigitsAreNotWedged(unittest.TestCase):
+    """S3: `\\d{4,}`, not `\\d{4}` — names are `:04d`, so the 10000th handoff
+    is five digits, and a four-digit-only pattern refuses it outright.
+    """
+
+    def test_a_five_digit_handoff_name_is_valid_and_findable(self):
+        from vellum.announce import valid_handoff_name
+
+        self.assertTrue(valid_handoff_name("10000-apply-a-fix.md"))
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            handoffs_dir = repo / "ledger" / "handoffs"
+            handoffs_dir.mkdir(parents=True)
+            (handoffs_dir / "10000-existing.md").write_text(
+                "---\nto: harness-engineer\nfrom: librarian\npaths:\nasks: x\n"
+                "recorded: 2026-01-01T00:00:00Z\nanswered:\nanswered_by:\n---\n",
+                encoding="utf-8",
+            )
+            code, out, err = _record_handoff(repo)
+            self.assertEqual(code, 0, out + err)
+            names = sorted(p.name for p in handoffs_dir.iterdir())
+            self.assertIn("10000-existing.md", names)
+            created = [n for n in names if n != "10000-existing.md"]
+            self.assertEqual(len(created), 1, names)
+            self.assertTrue(created[0].startswith("10001-"), names)
+
+
+# --------------------------------------------------------------------- S5
+
+
+class DeliverIsNarrowedToItsOwnVersion(unittest.TestCase):
+    """S5: the push-delivery path passes --version through, so a finished/
+    direction/handoff announcement on one version's item never also
+    dispatches another version's pending announcement for the same item
+    number.
+    """
+
+    def test_finishing_one_version_does_not_dispatch_another_versions_item(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            other = "b" * 40
+            run_cli(["ledger", "open", "--version", other, "--ledger-dir",
+                     str(repo / "ledger"), "--approved", NOW])
+            run_cli(["ledger", "advance", "--version", other, "--ledger-dir",
+                     str(repo / "ledger"), "--item", str(SUBJECT), "--title",
+                     "t", "--repo", "app", "--item-state", "planned"])
+            run_cli(["announce", "finished", str(repo), "--version", other,
+                     "--ledger-dir", str(repo / "ledger"), "--item", str(SUBJECT),
+                     "--to", "librarian", "--no-dispatch"])
+            code, out, err = run_cli_streams(
+                ["announce", "finished", str(repo), "--version", VERSION,
+                 "--ledger-dir", str(repo / "ledger"), "--item", str(SUBJECT),
+                 "--to", "librarian", "--json"])
+            self.assertEqual(code, 0, out + err)
+            payload = json.loads(out)
+            addressed = _addressed(payload)
+            self.assertEqual(len(addressed), 1, payload)
+            # Only this version's item was dispatched — the other version's
+            # item 1 must still be pending.
+            record = load(record_path(repo / "ledger", other))
+            self.assertIs(find_item(record, SUBJECT)["announced"]["dispatched"], False)
+
+
+# --------------------------------------------------------------------- S6
+
+
+class DirectionRefusesControlCharacters(unittest.TestCase):
+    """S6: `record_direction` runs the same control-character refusal every
+    other text field does, over the extended set (S6): `\\r`, C1 controls,
+    and bidi override/isolate characters, alongside the original ESC family.
+    """
+
+    def test_an_escape_sequence_in_briefing_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            code, out, err = run_cli_streams(
+                ["announce", "direction", str(repo), "--version", VERSION,
+                 "--ledger-dir", str(repo / "ledger"), "--item", str(SUBJECT),
+                 "--briefing", "clear \x1b[2J the screen"])
+            self.assertEqual(code, 2, out + err)
+            self.assertIsNone(_item(repo).get("announced"))
+
+    def test_a_bare_carriage_return_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            code, out, err = _record_handoff(repo, "--tried", "line one\rline two")
+            self.assertEqual(code, 2, out + err)
+
+    def test_a_bidi_override_character_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            code, out, err = _record_handoff(repo, "--asks", "safe‮evil")
+            self.assertEqual(code, 2, out + err)
+
+    def test_a_c1_control_character_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            code, out, err = _record_handoff(repo, "--tried", "prefix\x85suffix")
+            self.assertEqual(code, 2, out + err)
+
+
+# --------------------------------------------------------------------- S7
+
+
+class CredentialScrubbingCoversMoreShapes(unittest.TestCase):
+    """S7: beyond URL userinfo, a token-shaped query parameter, a Bearer
+    value, and a `*_TOKEN`/`*_SECRET`/`*_KEY` assignment are all stripped —
+    and the same scrubbing runs over `--asks` and `--briefing` too.
+    """
+
+    def test_a_query_string_access_token_is_redacted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            code, out, err = _record_handoff(
+                repo, "--tried", "ran https://ci.example/run/7?access_token=SECRET1")
+            self.assertEqual(code, 0, out + err)
+            self.assertIn("rotate", (out + err).lower())
+            text = next(iter(_handoffs(repo).values()))
+            self.assertNotIn("SECRET1", text)
+
+    def test_a_bearer_token_is_redacted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            code, out, err = _record_handoff(
+                repo, "--observed", "curl -H 'Authorization: Bearer SECRET2'")
+            self.assertEqual(code, 0, out + err)
+            text = next(iter(_handoffs(repo).values()))
+            self.assertNotIn("SECRET2", text)
+
+    def test_an_env_style_token_assignment_is_redacted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            code, out, err = _record_handoff(
+                repo, "--proved", "reproduced with GITHUB_TOKEN=SECRET3 set")
+            self.assertEqual(code, 0, out + err)
+            text = next(iter(_handoffs(repo).values()))
+            self.assertNotIn("SECRET3", text)
+
+    def test_a_credential_in_asks_is_also_scrubbed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            code, out, err = _record_handoff(
+                repo, "--asks", "rotate API_KEY=SECRET4 then retry")
+            self.assertEqual(code, 0, out + err)
+            text = next(iter(_handoffs(repo).values()))
+            self.assertNotIn("SECRET4", text)
+
+    def test_a_credential_in_briefing_is_also_scrubbed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            code, out, err = run_cli_streams(
+                ["announce", "direction", str(repo), "--version", VERSION,
+                 "--ledger-dir", str(repo / "ledger"), "--item", str(SUBJECT),
+                 "--briefing", "use AWS_SECRET=SECRET5 in the retry"])
+            self.assertEqual(code, 0, out + err)
+            self.assertIn("rotate", (out + err).lower())
+            self.assertNotIn("SECRET5", _item(repo)["briefing"])
+
+
+# --------------------------------------------------------------------- nit
+
+
+class DeliverHoldsRatherThanDispatchesOnAnUnreadableHandoff(unittest.TestCase):
+    """nit: an unreadable handoff must hold its announcement, matching
+    `reconcile`'s behavior, rather than reading the failure as "not
+    withheld" and dispatching anyway.
+    """
+
+    def test_deliver_holds_when_the_handoff_cannot_be_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _intent(Path(tmp))
+            _record_handoff(repo, "--no-dispatch")
+            name = next(iter(_handoffs(repo)))
+            path = repo / "ledger" / "handoffs" / name
+            with open(path, "ab") as handle:
+                handle.write(b"\xff\xfe")
+            code, out, err = run_cli_streams(
+                ["announce", "deliver", str(repo), "--ledger-dir",
+                 str(repo / "ledger"), "--json"])
+            self.assertEqual(code, 0, out + err)
+            payload = json.loads(out)
+            self.assertEqual(_addressed(payload), [], payload)
+            self.assertEqual(len(payload["withheld"]), 1, payload)
 
 
 class DeclaredBoundariesHasOneReader(unittest.TestCase):

@@ -148,10 +148,7 @@ class TestAdvance(LedgerCase):
     def test_work_item_is_added_then_updated_in_place(self):
         advance(self.dir, VERSION, issue=121, title="Session expiry", repo="app",
                 satisfies=["scenario:auth-idle-session-expires"])
-        # `announce=False`: this checkout declares no `write_boundaries`, and
-        # the subject here is the item's own fields, not who a finished run
-        # would be addressed to.
-        advance(self.dir, VERSION, issue=121, item_state="merged", pr=124, announce=False)
+        advance(self.dir, VERSION, issue=121, item_state="merged", pr=124)
         items = self.record()["work_items"]
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["state"], "merged")
@@ -559,8 +556,7 @@ class TestRoundTrip(LedgerCase):
         advance(self.dir, VERSION, issue=121, title="Session expiry", repo="app",
                 satisfies=["scenario:auth-idle-session-expires"])
         advance(self.dir, VERSION, issue=121, item_state="merged", pr=124,
-                attempts=2, tokens=412000, usd=3.10, executor="claude-actions",
-                announce=False)
+                attempts=2, tokens=412000, usd=3.10, executor="claude-actions")
         advance(self.dir, VERSION, state="shipped", release="r58")
         path = record_path(self.dir, VERSION)
         self.assertEqual(path.read_text(), dump(load(path)))
@@ -580,7 +576,7 @@ class TestCommandLine(LedgerCase):
                                   "--item", "121", "--title", "t", "--repo", "app",
                                   "--item-state", "merged", "--pr", "124",
                                   "--attempts", "2", "--tokens", "412000", "--usd", "3.10",
-                                  "--executor", "claude-actions", "--no-announce"] + base)[0], 0)
+                                  "--executor", "claude-actions"] + base)[0], 0)
         item = self.record()["work_items"][0]
         self.assertEqual(item["pr"], 124)
         self.assertEqual(item["cost"]["tokens"], 412000)

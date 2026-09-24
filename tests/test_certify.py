@@ -52,10 +52,7 @@ class CertifyCase(unittest.TestCase):
         self.checkout = Path(self.tmp.name)
         self.dir = self.checkout / "ledger"
         open_record(self.dir, VERSION)
-        # announce=False: this checkout declares no write_boundaries, and
-        # certification is the subject here, not who a finished run addresses.
-        advance(self.dir, VERSION, issue=ISSUE, title="Session expiry", repo="app",
-                pr=124, announce=False)
+        advance(self.dir, VERSION, issue=ISSUE, title="Session expiry", repo="app", pr=124)
 
     def item(self):
         return find_item(load(record_path(self.dir, VERSION)), ISSUE)
